@@ -22,7 +22,7 @@ function sha256(data) {
 }
 
 console.log('🔍 DomionNexus Deployment Verification')
-console.log('=' .repeat(50))
+console.log('='.repeat(50))
 
 // Check if dist exists
 const distPath = path.join(__dirname, '../dist')
@@ -115,7 +115,7 @@ for (const fn of requiredFunctions) {
   }
 }
 
-console.log('=' .repeat(50))
+console.log('='.repeat(50))
 console.log('🎉 Verification complete!')
 console.log('')
 console.log('Build Summary:')
