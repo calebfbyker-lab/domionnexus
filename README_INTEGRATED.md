@@ -144,10 +144,36 @@ The build process (`npm run build`):
 
 Once deployed, these endpoints are available:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/verify` | POST | ECCL license verification |
-| `/api/universal` | GET | Search universal codex |
+| Endpoint | Method | Description | Parameters | Auth Required |
+|----------|--------|-------------|------------|---------------|
+| `/api/verify` | POST | ECCL license verification | Body: `{header, token, jws}` | No |
+| `/api/universal` | GET | Search universal codex | `q` (search query), `limit` (max results) | No |
+
+### Example: ECCL License Verification
+
+```bash
+curl -X POST https://your-site.netlify.app/api/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "header": {
+      "license": "ECCL-1.0",
+      "subject_id_sha256": "2948fbc4...",
+      "artifact_sha256": "abc123..."
+    },
+    "token": {
+      "subject_id_sha256": "2948fbc4...",
+      "artifact_sha256": "abc123..."
+    }
+  }'
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "verified": false
+}
+```
 
 ### Example: Universal Search
 
