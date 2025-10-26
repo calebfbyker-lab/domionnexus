@@ -76,7 +76,11 @@ def verify_files(manifest: Dict, root_dir: str) -> Tuple[bool, List[str], List[s
     manifest_paths = {f["path"] for f in files}
     extra = []
     
-    exclude_patterns = [".git", "__pycache__", ".venv", "venv", "*.pyc", "*.log"]
+    exclude_patterns = [
+        ".git", "__pycache__", ".venv", "venv", "*.pyc", "*.log",
+        "audit.jsonl", "chain.jsonl", "sbom.json", "*.sig",
+        "manifest.v100.json", "manifest.continuum.json"
+    ]
     
     for filepath in root_path.rglob("*"):
         should_exclude = any(pattern in str(filepath) for pattern in exclude_patterns)
