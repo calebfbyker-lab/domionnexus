@@ -13,12 +13,12 @@ def walk(root):
             rel=os.path.relpath(os.path.join(d,n),root).replace('\\','/')
             yield rel
 ap=argparse.ArgumentParser(); ap.add_argument('--root',default='.');
-ap.add_argument('--out',default='codex/manifest.v94x.json'); a=ap.parse_args()
+ap.add_argument('--out',default='codex/manifest.v96.json'); a=ap.parse_args()
 items=[]; root=os.path.abspath(a.root)
 for rel in sorted(walk(root)):
     p=os.path.join(root,rel)
     if os.path.isfile(p): items.append({"path":rel,"size":os.path.getsize(p),"sha256":sha(p)})
-m={"title":"Codex v94.x — Integrity Manifest","subject_id_sha256":"__SUBJECT_SHA__","generated_utc":datetime.datetime.utcnow().isoformat()+"Z","items":items}
+m={"title":"Codex v96 — Integrity Manifest","subject_id_sha256":"__SUBJECT_SHA__","generated_utc":datetime.datetime.utcnow().isoformat()+"Z","items":items}
 os.makedirs(os.path.dirname(a.out), exist_ok=True)
 open(a.out,'w',encoding='utf-8').write(json.dumps(m, indent=2))
 print("wrote", len(items), "items to", a.out)

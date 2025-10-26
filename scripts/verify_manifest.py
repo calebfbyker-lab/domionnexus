@@ -6,7 +6,7 @@ def sha(p):
         for ch in iter(lambda:f.read(65536),b''): h.update(ch)
     return h.hexdigest()
 ap=argparse.ArgumentParser(); ap.add_argument('--root',default='.');
-ap.add_argument('--manifest',default='codex/manifest.v94x.json'); a=ap.parse_args()
+ap.add_argument('--manifest',default='codex/manifest.v96.json'); a=ap.parse_args()
 m=json.load(open(a.manifest)); errs=[]
 for it in m.get("items",[]):
     p=os.path.join(a.root,it["path"])
