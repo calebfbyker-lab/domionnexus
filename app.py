@@ -4,7 +4,7 @@ import subprocess, sys, json, hashlib, os, time, threading, yaml, hmac, base64, 
 from codex.merkle import leaves_hashes, merkle_root, proof_path, verify_inclusion
 from codex.redact import redact
 
-APP_VER = "Codex Continuum v99.x"
+APP_VER = "Codex Continuum v100 - Continuum Σ (Sigma)"
 IDENT_STR = "caleb fedor byker konev|1998-10-27"
 SUBJECT_SHA256 = "1f6e1f1ca3c4f3e1b1f6e2b317d7c1dff9b5d6d2b0d4e0f7b6a8c9e0f2a4b1c3"
 
