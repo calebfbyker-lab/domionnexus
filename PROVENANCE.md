@@ -1,0 +1,2 @@
+# PROVENANCE (append-only)
+- 2025-10-18T15:52:06Z  b840b443e74215eff9ff7444a32b6b034548f81b7789193493a18130a8b535a6  {"event":"bind","seal":"Solomon-001","actor":"CFBK","file":"seals/Solomon-001.canonical.json","workflow":"wf_68f362ed3e3881909a1fc894b213808902f495b1a750c22e"}
