@@ -1,3 +1,22 @@
+# Codex Immortal × Dominion Nexus — v94.x · Sentinel Prime
+
+Refines v94 with:
+- **HMAC request signing** for `/glyph` (`X-Codex-Sig`) in addition to API key and optional OIDC/JWKS.
+- **In-memory rate limiting** (token bucket) with env knobs.
+- **JWKS cache** with `kid` selection and TTL.
+- **Hot-reloadable glyph policy** (watch `policy/glyph.yaml` timestamp).
+- **Supply chain**: Syft/Grype gate, Rekor live/offline, provenance v4 with materials.
+- **XTGS/TSG/TGS** glyphs remain the control language.
+
+Authorship anchor
+subject: caleb fedor byker konev|1998-10-27
+subject_id_sha256: __SUBJECT_SHA__
+license: MIT + EUCLEA transparency clause
+
+python
+Always show details
+
+Copy code
 # domionnexus# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
 **Netlify Edition · ECCL-1.0 Licensed**
 

@@ -1,0 +1,36 @@
+name: v94x-release
+on:
+  push:
+    tags: ['v94.x*']
+permissions: { contents: write, id-token: write, packages: write }
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          pip install -r requirements.txt
+          python scripts/hash_all.py --root . --out codex/manifest.v94x.json
+          python scripts/verify_manifest.py --root . --manifest codex/manifest.v94x.json
+          python scripts/sbom_syft_stub.py
+          python scripts/vuln_gate.py --sbom sbom.json --severity high
+          python scripts/provenance_v4.py
+          python scripts/rekor_api.py --file codex/manifest.v94x.json
+      - name: Build & push container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/codex-v94x:latest
+      - name: Release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            codex/manifest.v94x.json
+            codex/identity.json
+            codex/LICENSE.spdx.json
+            transparency/rekor-ready.jsonl
+            sbom.json
+            provenance.v4.json
