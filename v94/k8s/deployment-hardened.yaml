@@ -1,0 +1,232 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codex-v94
+  labels:
+    name: codex-v94
+    security.istio.io/tlsMode: istio
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: codex-v94-sa
+  namespace: codex-v94
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-v94-sentinel
+  namespace: codex-v94
+  labels:
+    app: codex-v94
+    version: v94.0.0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: codex-v94
+  template:
+    metadata:
+      labels:
+        app: codex-v94
+        version: v94.0.0
+      annotations:
+        # Security annotations
+        container.apparmor.security.beta.kubernetes.io/codex: runtime/default
+    spec:
+      serviceAccountName: codex-v94-sa
+      automountServiceAccountToken: false
+      
+      # Security Context - Pod Level
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      
+      containers:
+      - name: codex
+        image: codex-v94:latest
+        imagePullPolicy: Always
+        
+        # Security Context - Container Level
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 10001
+          capabilities:
+            drop:
+              - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        
+        env:
+        - name: PORT
+          value: "8000"
+        - name: OIDC_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: codex-v94-config
+              key: oidc_enabled
+        - name: JWKS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: codex-v94-config
+              key: jwks_url
+              optional: true
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        # Liveness probe
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Readiness probe
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        
+        # Volume mounts for read-only root filesystem
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /.cache
+        - name: glyph-policy
+          mountPath: /app/glyph_policy.yaml
+          subPath: glyph_policy.yaml
+          readOnly: true
+      
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir: {}
+      - name: glyph-policy
+        configMap:
+          name: codex-v94-config
+          items:
+          - key: glyph_policy
+            path: glyph_policy.yaml
+      
+      # Pod anti-affinity for high availability
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - codex-v94
+              topologyKey: kubernetes.io/hostname
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codex-v94-service
+  namespace: codex-v94
+  labels:
+    app: codex-v94
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: codex-v94
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codex-v94-config
+  namespace: codex-v94
+data:
+  oidc_enabled: "false"
+  jwks_url: ""
+  glyph_policy: |
+    version: "v14"
+    strict_mode: true
+    max_glyph_length: 256
+    allowed_charsets:
+      - latin
+      - numeric
+      - symbolic
+    forbidden_patterns:
+      - "<script"
+      - "javascript:"
+      - "onerror="
+    entropy_threshold: 0.8
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: codex-v94-pdb
+  namespace: codex-v94
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: codex-v94
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: codex-v94-netpol
+  namespace: codex-v94
+spec:
+  podSelector:
+    matchLabels:
+      app: codex-v94
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: istio-system
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS for JWKS
+    - protocol: TCP
+      port: 53   # DNS
+    - protocol: UDP
+      port: 53   # DNS
