@@ -1,3 +1,31 @@
+# Codex Continuum — v99.x · Continuum Prime
+
+**Goal:** a GitHub-first, automation-ready synthesis with runners, redaction, drift detection, notary stubs, and webhook integration.
+Authorship anchor
+subject: caleb fedor byker konev|1998-10-27
+subject_id_sha256: 1f6e1f1ca3c4f3e1b1f6e2b317d7c1dff9b5d6d2b0d4e0f7b6a8c9e0f2a4b1c3
+license: MIT + EUCLEA transparency clause
+
+Canonical pipeline (unchanged):
+🌀 VERIFY → 🌞 INVOKE → 🧾 AUDIT → 🛡 SCAN → 🔮 ATTEST → 🛡‍🔥 SANCTIFY → 🚦 ROLLOUT → ⚖️ JUDGE → 🌈 DEPLOY → ♾ CONTINUUM
+
+New in v99.x
+- Runners (`/runners`) — pluggable action executors (local shell, Python function, or HTTP webhook).
+- GitHub integration — reusable workflow (`workflow_call`), webhook endpoint `/webhook/github` with HMAC check.
+- Config bundles — HMAC-signed config packs; `/config/verify` verifies bundle signature.
+- Redaction — PII-safe logging via `codex/redact.py` and `/redact/test`.
+- Drift detection — `scripts/drift.py` compares working tree to manifest; CI fails on drift.
+- Notary stub — `scripts/notary_stub.py` writes a notarization record for release artifacts.
+- Cost report — `scripts/cost_meter.py` estimates artifact footprint; `/cost/report` serves summary.
+- IPFS publish (stub) — `scripts/ipfs_publish.py` prepares content-addressed metadata.
+
+Quickstart:
+```
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+python scripts/hash_all.py --root . --out codex/manifest.continuum.json
+uvicorn app:app --reload --port 8000
+```
 # domionnexus# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
 **Netlify Edition · ECCL-1.0 Licensed**
 
