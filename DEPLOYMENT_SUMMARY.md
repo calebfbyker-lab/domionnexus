@@ -120,7 +120,7 @@ docker run -p 8000:8000 codex-v96
 The upgrade path from v94 to v96:
 1. ✅ All v94 scripts updated to v96
 2. ✅ Manifest paths changed from v94x to v96
-3. ✅ New glyph_guard_v18 replaces references to v18
+3. ✅ New glyph_guard_v18 created (app.py was already referencing it)
 4. ✅ Added sanctify action to glyph vocabulary
 5. ✅ CI/CD workflows updated
 6. ✅ Identity and license manifests updated
