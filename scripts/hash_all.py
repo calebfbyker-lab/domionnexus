@@ -9,6 +9,9 @@ for dirpath, dirnames, filenames in os.walk(root):
     for fn in filenames:
         if fn.endswith('.pyc'):
             continue
+        # Skip manifest.json itself to avoid self-reference
+        if fn == 'manifest.json':
+            continue
         path = os.path.join(dirpath, fn)
         try:
             with open(path, 'rb') as f:
