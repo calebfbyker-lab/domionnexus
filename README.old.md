@@ -1,4 +1,6 @@
-# domionnexus# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
+# domionnexus
+
+# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
 **Netlify Edition · ECCL-1.0 Licensed**
 
 > A cryptographically licensed, symbolically rich AI orchestration and research platform — integrating Enochian, Hermetic, Kabbalistic, and classical correspondences into a modern open-source knowledge system.
