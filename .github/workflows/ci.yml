@@ -1,0 +1,36 @@
+name: codex-ci
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  verify-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ephemeral sign manifest (demo)
+        run: python scripts/ci_ephemeral_sign.py
+
+      - name: Integrity, verify, SBOM, lineage, SPDX, transparency
+        env:
+          REKOR_URL: ${{ secrets.REKOR_URL }}
+        run: bash scripts/ci_integrity.sh
+
+      - name: Build & push container (GHCR)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/codex-v90x:latest
