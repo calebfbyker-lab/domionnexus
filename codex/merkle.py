@@ -4,7 +4,7 @@ def _h(b: bytes) -> bytes:
     return hashlib.sha256(b).digest()
 
 def leaves_hashes(lines):
-    return [_h(x if isinstance(x, bytes) else x.encode()) for x in lines]
+    return [_h(x if isinstance(x, (bytes, bytearray)) else x.encode()) for x in lines]
 
 def merkle_root(leaf_hashes):
     if not leaf_hashes:
