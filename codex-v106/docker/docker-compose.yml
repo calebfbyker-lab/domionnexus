@@ -1,0 +1,68 @@
+version: "3.9"
+services:
+  gateway:
+    build:
+      context: ../services/api
+      dockerfile: Dockerfile
+    container_name: codex-gateway
+    environment:
+      CODEX_ORCH_URL: ${CODEX_ORCH_URL}
+      CODEX_NEXUS_URL: ${CODEX_NEXUS_URL}
+    ports: ["8000:8000"]
+    depends_on: [orchestrator, nexus]
+
+  orchestrator:
+    build:
+      context: ../services/orchestrator
+      dockerfile: Dockerfile
+    container_name: codex-orchestrator
+    environment:
+      CODEX_NODE_ID: ${CODEX_NODE_ID}
+      CODEX_ORCH_URL: http://orchestrator:8010
+      CODEX_NEXUS_URL: ${CODEX_NEXUS_URL}
+    ports: ["8010:8010"]
+    depends_on: [nexus]
+
+  nexus:
+    build:
+      context: ../services/nexus
+      dockerfile: Dockerfile
+    container_name: codex-nexus
+    environment:
+      NEXUS_DB: ${NEXUS_DB}
+      NEXUS_TOKENS: ${NEXUS_TOKENS}
+      NEXUS_TOKENS_V2: ${NEXUS_TOKENS_V2}
+      NEXUS_KEY: ${NEXUS_KEY}
+      NEXUS_PUB: ${NEXUS_PUB}
+      NEXUS_IP_ALLOW: ${NEXUS_IP_ALLOW}
+      NEXUS_RPS: ${NEXUS_RPS}
+      NEXUS_RPS_WIN: ${NEXUS_RPS_WIN}
+    volumes:
+      - nexus-data:/var/lib/nexus
+    ports: ["8020:8020"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: codex-prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+    depends_on: [gateway, orchestrator, nexus]
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: codex-grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+volumes:
+  nexus-data:
+  grafana-data:

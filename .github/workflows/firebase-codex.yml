@@ -1,0 +1,58 @@
+name: codex-firebase-deploy
+on:
+  workflow_dispatch:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [closed]
+
+jobs:
+  deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       contains(github.event.comment.body, 'deploy codex')) ||
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+      FIREBASE_SITE_ID: ${{ secrets.FIREBASE_SITE_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Codex Seals
+        run: |
+          echo "Verifying Codex Seals..."
+          sha256sum -c <<'EOF'
+          7f37ca0e33beead36cdb58f23906d604f894ba276af4dc1dddd97ee85805063a  Codex_Immortal_333_Seals.pdf
+          9721a04ada590293ead5118e5f574dd44b2f613fdd0773ab85bf3123fc16b403  Codex_Immortal_333_Seals_Authenticated.pdf
+          6c0e60d144fe6f6f43f4120383d9acec6c0742a214b76573a81fd7f28b488303  Codex_Immortal_333_Seals_Provenance.pdf
+          EOF
+
+      - name: Set up Node & Firebase
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install -g firebase-tools
+
+      - name: Decode Firebase credentials
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" > /tmp/serviceAccount.json
+
+      - name: Build Codex (AI orchestrated)
+        run: |
+          echo "Running Codex AI build..."
+          npm run build || echo "No build script; skipping."
+
+      - name: Deploy to Firebase Hosting
+        run: |
+          firebase deploy --only hosting:${FIREBASE_SITE_ID} \
+          --project ${FIREBASE_PROJECT_ID} \
+          --token "$(firebase login:ci 2>/dev/null || echo '')" \
+          --non-interactive --force
