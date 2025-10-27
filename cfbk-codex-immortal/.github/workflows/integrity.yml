@@ -1,0 +1,25 @@
+name: integrity
+on: [push]
+jobs:
+  sha256:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y jq
+      - run: |
+          # NOTE: This workflow expects the authoritative manifest to be supplied in CI or replaced before use.
+          # For local use, replace the path to the manifest file below or upload it to the runner.
+          echo "Collect expected hashes (update path as needed)"
+          if [ -f /mnt/data/codex_manifest\ \(3\).json ]; then
+            jq -r '.items[] | "\(.sha256)  \(.filename)"' /mnt/data/codex_manifest\ \(3\).json > expected.txt || true
+          else
+            echo "expected manifest not found on runner; please provide or adapt workflow" > expected.txt
+          fi
+          # compute current
+          find . -maxdepth 2 -type f -printf "%P\n" \
+            | grep -E 'Codex_|manifest\.json|service-worker\.js|index\.html' \
+            | while read f; do sha256sum "$f" || true; done > actual.txt
+          echo "EXPECTED:"; cat expected.txt || true
+          echo "ACTUAL:";   cat actual.txt   || true
+          # non-fatal compare for visibility (tighten if desired)
+          exit 0

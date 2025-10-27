@@ -20,6 +20,20 @@ def push(ev):
 
 app=FastAPI(title=APP_VER)
 
+# optionally mount v131 if present
+try:
+  from .app_mount_v131 import mount_v131
+  mount_v131(app)
+except Exception:
+  pass
+
+# optionally mount neuro endpoints
+try:
+  from .v131_neuro import router as v131_neuro
+  app.include_router(v131_neuro)
+except Exception:
+  pass
+
 @app.get("/healthz")
 def healthz(): return {"ok":True,"ver":APP_VER}
 
