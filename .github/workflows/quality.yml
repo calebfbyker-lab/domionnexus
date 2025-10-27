@@ -1,0 +1,54 @@
+name: Code Quality
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-check:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Check for secrets
+        run: |
+          if grep -r "sk-[a-zA-Z0-9]\{32,\}" . --exclude-dir=node_modules --exclude-dir=.git; then
+            echo "❌ Potential secret found in codebase"
+            exit 1
+          fi
+          echo "✅ No secrets detected"
+      
+      - name: Verify file structure
+        run: |
+          for dir in lib netlify/functions public scripts data; do
+            if [ ! -d "$dir" ]; then
+              echo "⚠️  Missing directory: $dir"
+            else
+              echo "✅ Directory exists: $dir"
+            fi
+          done
+      
+      - name: Check ECCL binding
+        run: |
+          SUBJECT_ID="2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a"
+          if grep -r "$SUBJECT_ID" lib/ --include="*.js"; then
+            echo "✅ ECCL subject ID properly bound"
+          else
+            echo "❌ ECCL subject ID not found"
+            exit 1
+          fi
