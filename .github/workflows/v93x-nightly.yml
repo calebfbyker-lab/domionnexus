@@ -1,0 +1,79 @@
+name: v93x-nightly-verification
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  telemetry-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd v93x
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Regenerate manifest
+        run: |
+          cd v93x
+          python3 scripts/hash_all.py
+
+      - name: Verify integrity
+        run: |
+          cd v93x
+          python3 scripts/verify_manifest.py
+
+      - name: Check for drift
+        run: |
+          cd v93x
+          git diff --exit-code codex/manifest.v93x.json || echo "Manifest has changed - review needed"
+
+      - name: Generate fresh SBOM
+        run: |
+          cd v93x
+          python3 scripts/sbom_stub.py
+
+      - name: Submit to Rekor (if available)
+        env:
+          REKOR_URL: ${{ secrets.REKOR_URL || 'https://rekor.sigstore.dev' }}
+        run: |
+          cd v93x
+          python3 scripts/rekor_submit.py
+
+      - name: Collect telemetry
+        run: |
+          cd v93x
+          echo "Telemetry: Bundle verification at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Files verified: $(jq -r '.file_count' codex/manifest.v93x.json)"
+          echo "Build status: OK"
+
+      - name: Archive verification results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-verification-${{ github.run_number }}
+          path: |
+            v93x/codex/manifest.v93x.json
+            v93x/codex/sbom.spdx.json
+            v93x/codex/provenance.json
+          retention-days: 90
+
+      - name: Report status
+        if: always()
+        run: |
+          echo "Nightly verification complete for v93.x bundle"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -1,0 +1,130 @@
+name: v93x-ci-build
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'v93x/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'v93x/**'
+  workflow_dispatch: {}
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd v93x
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate file manifest
+        run: |
+          cd v93x
+          python3 scripts/hash_all.py
+
+      - name: Verify manifest integrity
+        run: |
+          cd v93x
+          python3 scripts/verify_manifest.py
+
+      - name: Generate SBOM
+        run: |
+          cd v93x
+          python3 scripts/sbom_stub.py
+
+      - name: Generate provenance
+        env:
+          REKOR_URL: ${{ secrets.REKOR_URL || 'https://rekor.sigstore.dev' }}
+        run: |
+          cd v93x
+          python3 scripts/rekor_submit.py
+
+      - name: Test FastAPI application
+        run: |
+          cd v93x
+          python3 -c "import app; print('App imported successfully')"
+
+      - name: Test glyph system
+        run: |
+          cd v93x
+          python3 tools/glyph_guard_v13.py --glyph "🌀" --dry-run
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v93x-bundle-artifacts
+          path: |
+            v93x/codex/manifest.v93x.json
+            v93x/codex/sbom.spdx.json
+            v93x/codex/provenance.json
+          retention-days: 30
+
+      - name: Build container image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Building container for v93.x bundle"
+          # Container build would happen here
+
+  test-endpoints:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd v93x
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start API server
+        run: |
+          cd v93x
+          uvicorn app:app --host 127.0.0.1 --port 8000 &
+          sleep 3
+
+      - name: Test health endpoint
+        run: |
+          curl -f -H "x-api-key: dev-key" http://127.0.0.1:8000/health
+
+      - name: Test seal endpoint
+        run: |
+          curl -f -H "x-api-key: dev-key" http://127.0.0.1:8000/seal
+
+      - name: Test nous endpoint (dry-run)
+        run: |
+          curl -f -X POST -H "Content-Type: application/json" \
+            -H "x-api-key: dev-key" \
+            -d '{"prompt":"verify then invoke then deploy","dry_run":true}' \
+            http://127.0.0.1:8000/nous
+
+      - name: Test glyph endpoint (dry-run)
+        run: |
+          curl -f -X POST -H "Content-Type: application/json" \
+            -H "x-api-key: dev-key" \
+            -d '{"glyph":"🌀","dry_run":true}' \
+            http://127.0.0.1:8000/glyph

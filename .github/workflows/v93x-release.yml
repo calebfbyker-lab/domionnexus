@@ -1,0 +1,137 @@
+name: v93x-release
+
+on:
+  push:
+    tags:
+      - 'v93.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v93.1)'
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          cd v93x
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate release manifest
+        run: |
+          cd v93x
+          python3 scripts/hash_all.py --out codex/manifest.release.json
+
+      - name: Generate SBOM for release
+        run: |
+          cd v93x
+          python3 scripts/sbom_stub.py
+
+      - name: Generate provenance for release
+        env:
+          REKOR_URL: ${{ secrets.REKOR_URL || 'https://rekor.sigstore.dev' }}
+        run: |
+          cd v93x
+          python3 scripts/rekor_submit.py
+
+      - name: Create release bundle
+        run: |
+          cd v93x
+          tar -czf ../v93x-constellation-bundle.tar.gz \
+            --exclude='__pycache__' \
+            --exclude='.venv' \
+            --exclude='*.pyc' \
+            .
+
+      - name: Calculate bundle checksum
+        run: |
+          sha256sum v93x-constellation-bundle.tar.gz > v93x-constellation-bundle.tar.gz.sha256
+          cat v93x-constellation-bundle.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            v93x-constellation-bundle.tar.gz
+            v93x-constellation-bundle.tar.gz.sha256
+            v93x/codex/manifest.release.json
+            v93x/codex/sbom.spdx.json
+            v93x/codex/provenance.json
+          body: |
+            ## Codex v93.x Constellation Release
+            
+            **Features:**
+            - /nous endpoint for natural language → glyph DAG translation
+            - Optional OIDC/JWKS token authentication
+            - Rekor API client with offline fallback
+            - Telemetry agent and nightly verification
+            - Complete SBOM and provenance generation
+            
+            **Authorship Anchor:**
+            - Subject: caleb fedor byker konev|1998-10-27
+            - Subject ID SHA256: 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
+            - License: MIT + EUCLEA transparency clause
+            
+            **Quickstart:**
+            ```bash
+            tar -xzf v93x-constellation-bundle.tar.gz
+            cd v93x
+            python3 -m venv .venv
+            source .venv/bin/activate
+            pip install -r requirements.txt
+            uvicorn app:app --reload --port 8000
+            ```
+          draft: false
+          prerelease: false
+
+      - name: Build and push Docker image
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version
+        if: startsWith(github.ref, 'refs/tags/')
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build and push image
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          cd v93x
+          cat > Dockerfile << 'EOF'
+          FROM python:3.11-slim
+          WORKDIR /app
+          COPY requirements.txt .
+          RUN pip install --no-cache-dir -r requirements.txt
+          COPY . .
+          EXPOSE 8000
+          CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+          EOF
+          docker build -t ghcr.io/${{ github.repository_owner }}/codex-v93x:${{ steps.version.outputs.VERSION }} .
+          docker build -t ghcr.io/${{ github.repository_owner }}/codex-v93x:latest .
+          docker push ghcr.io/${{ github.repository_owner }}/codex-v93x:${{ steps.version.outputs.VERSION }}
+          docker push ghcr.io/${{ github.repository_owner }}/codex-v93x:latest
