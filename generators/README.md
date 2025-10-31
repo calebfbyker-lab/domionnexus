@@ -30,7 +30,11 @@ The generator scripts are designed to create complete directory structures with 
 python3 generators/codex_automation_v3_generator.py
 ```
 
-**Note:** You may need to modify the `BASE` path in each script to control where files are generated.
+**Important Notes:**
+- These scripts were generated during chat sessions and may contain syntax issues (e.g., `file` instead of `__file__`, `name` instead of `__name__`)
+- You will need to review and fix any Python syntax errors before running
+- You may need to modify the `BASE` path in each script to control where files are generated
+- These are primarily historical/reference artifacts showing the design evolution
 
 ### Using JSON Schemas
 
