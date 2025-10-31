@@ -34,6 +34,7 @@ netlify/functions/ → serverless API functions
 data/ → JSON data sets (Codex + Star Seeds)
 scripts/ → build, import, and signing utilities
 lib/ → shared libraries (TSG parser, encodings, subject ID)
+generators/ → Python generator scripts and schemas from chat sessions
 netlify.toml → Netlify build + redirect configuration
 package.json → dependencies and scripts
 
