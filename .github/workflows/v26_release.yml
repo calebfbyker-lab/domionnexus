@@ -1,0 +1,252 @@
+name: Codex Immortal v26.0 Release
+
+on:
+  push:
+    tags:
+      - 'v26.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate-controls-contracts:
+    name: Controls & Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Check compliance controls
+        run: python3 scripts/compliance/check_controls.py
+      
+      - name: Evaluate constraints
+        run: python3 scripts/constraints/evaluate.py
+
+  validate-triune:
+    name: Triune Validation
+    runs-on: ubuntu-latest
+    needs: validate-controls-contracts
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run Triune validation
+        run: python3 scripts/triune_validate.py
+
+  validate-merkle:
+    name: Merkle Tree Integrity
+    runs-on: ubuntu-latest
+    needs: validate-triune
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Build Merkle tree
+        run: python3 scripts/merkle_build.py
+      
+      - name: Verify Merkle tree
+        run: python3 scripts/merkle_verify.py
+      
+      - name: Upload Merkle manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: merkle-manifest
+          path: trust/merkle_manifest.json
+
+  marketplace-self-check:
+    name: Marketplace Self-Check
+    runs-on: ubuntu-latest
+    needs: validate-merkle
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run marketplace app review
+        run: python3 scripts/marketplace/app_review.py
+      
+      - name: Verify webhook signatures
+        run: python3 scripts/webhooks/verify_stub.py
+
+  sdk-generation:
+    name: SDK Generation
+    runs-on: ubuntu-latest
+    needs: validate-merkle
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Generate SDK clients
+        run: python3 scripts/sdk/generate_clients_stub.py
+      
+      - name: Upload SDK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-clients
+          path: sdk/
+
+  i18n-check:
+    name: i18n Translation Check
+    runs-on: ubuntu-latest
+    needs: validate-triune
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Check i18n keys
+        run: python3 scripts/i18n/check_keys.py
+
+  canary-guard:
+    name: Canary Guard
+    runs-on: ubuntu-latest
+    needs: validate-merkle
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run canary guard
+        run: python3 scripts/feature/canary_guard.py
+
+  green-ops:
+    name: Green Operations
+    runs-on: ubuntu-latest
+    needs: validate-triune
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run green ops guard
+        run: python3 scripts/green/guard.py
+
+  model-eval-smoke:
+    name: Model Evaluation Smoke Tests
+    runs-on: ubuntu-latest
+    needs: validate-merkle
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run model smoke tests
+        run: python3 scripts/models/run_evals_stub.py
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - marketplace-self-check
+      - sdk-generation
+      - i18n-check
+      - canary-guard
+      - green-ops
+      - model-eval-smoke
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+      
+      - name: Create release notes
+        id: release_notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Codex Immortal v26.0 — Marketplace & SDKs
+          
+          ## 🎉 Features
+          
+          - **Marketplace**: Full marketplace with app review workflow
+          - **Signed Webhooks**: HMAC-SHA256 webhook signature verification
+          - **SDK Stubs**: Multi-language SDK client generators (Python, TypeScript, Go, Java)
+          - **Feature Flags**: Canary deployment support with percentage rollouts
+          - **Model Registry**: AI model registration with schema validation
+          - **Green Operations**: Carbon-aware workload scheduling
+          - **i18n Support**: English and Spanish translations
+          - **Data Residency**: GDPR, CCPA, and PDPA compliance enforcement
+          
+          ## 🔒 Security
+          
+          - No private keys or secrets committed
+          - All stubs are placeholders for KMS/Vault integration
+          - Webhook signature verification required
+          - Data residency enforcement for regulated regions
+          
+          ## ✅ Validation
+          
+          All validation gates passed:
+          - Controls & Contracts ✅
+          - Triune Validation ✅
+          - Merkle Tree Integrity ✅
+          - Marketplace Self-Check ✅
+          - SDK Generation ✅
+          - i18n Check ✅
+          - Canary Guard ✅
+          - Green Operations ✅
+          - Model Eval Smoke Tests ✅
+          
+          ## 📦 Artifacts
+          
+          - Merkle manifest (integrity verification)
+          - SDK client stubs
+          
+          ## ⚠️ Important Notes
+          
+          **This release contains stubs and templates.** Before deploying to production:
+          
+          1. Wire webhook signing to your KMS/Vault
+          2. Integrate SDK generator with OpenAPI Generator
+          3. Connect green ops to Electricity Map or WattTime API
+          4. Configure data residency rules for your cloud provider
+          5. Set up model evaluation framework (HELM, LM Eval Harness)
+          6. Review and enable auto-merge only after testing
+          
+          See `trust/overview.json` for complete security notes.
+          EOF
+          
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          body_path: release_notes.md
+          files: |
+            trust/merkle_manifest.json
+            trust/overview.json
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
