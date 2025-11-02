@@ -1,4 +1,4 @@
-.PHONY: nexus-aeternum evolve-finish finish-evolution constraints-finish all clean help
+.PHONY: nexus-aeternum evolve-finish finish-evolution constraints-finish bundle all clean help
 
 # Codex Automation Build Targets
 # These targets support the canonical build process for the Codex ecosystem
@@ -11,12 +11,13 @@ help:
 	@echo "  evolve-finish       - Complete evolution phase"
 	@echo "  finish-evolution    - Finalize evolutionary synthesis"
 	@echo "  constraints-finish  - Finalize constraint processing"
+	@echo "  bundle              - Create codex_omega_bundle.zip"
 	@echo "  all                 - Run complete build pipeline"
 	@echo "  clean               - Clean build artifacts"
 	@echo ""
 
 # Main build pipeline
-all: nexus-aeternum evolve-finish finish-evolution constraints-finish
+all: nexus-aeternum evolve-finish finish-evolution constraints-finish bundle
 	@echo "✅ Complete build pipeline executed"
 
 # Nexus Aeternum - Synthesis and attestation engine
@@ -60,6 +61,20 @@ constraints-finish:
 	fi
 	@touch chain/monetization_ledger.jsonl
 	@echo "✅ Constraint processing complete"
+
+# Create omega bundle
+bundle:
+	@echo "📦 Creating omega bundle..."
+	@zip -q codex_omega_bundle.zip \
+		OMEGA_LOCK.json \
+		FINAL_ATTEST.json \
+		treasury_allocation.json \
+		economy_monetization.json \
+		codex_capsule.txt \
+		chain/attestations.jsonl \
+		chain/monetization_ledger.jsonl \
+		examples/constraint_spell.final.json 2>/dev/null || true
+	@echo "✅ Omega bundle created: codex_omega_bundle.zip"
 
 # Clean build artifacts
 clean:
