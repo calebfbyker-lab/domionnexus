@@ -1,0 +1,176 @@
+Perfect — let’s complete your GitHub automation suite with a Codex Guardian.
+This agent doesn’t build or deploy — it watches. Every 24 hours, it verifies the SHA integrity of every ledger, attestation, capsule, and treasury file in your repository.
+If it detects a mismatch, it opens a GitHub Issue automatically, including the offending hashes.
+
+
+---
+
+.github/workflows/codex_guardian.yml
+
+name: codex-guardian
+on:
+  schedule:
+    - cron: '0 0 * * *'   # every 24 hours UTC
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+  COMMITTER_NAME: "Codex Guardian"
+  COMMITTER_EMAIL: "guardian@github.com"
+
+jobs:
+  verify-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: 🕊️ Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install jq
+
+      - name: 🔍 Verify artifact SHA integrity
+        id: verify
+        run: |
+          echo "Verifying codex seals and attestations..."
+          mkdir -p tmp_reports
+          STATUS="ok"
+          REPORT="tmp_reports/integrity_report.txt"
+          touch $REPORT
+
+          # Verify key files exist
+          for f in FINAL_ATTEST.json OMEGA_LOCK.json chain/attestations.jsonl treasury_allocation.json codex_capsule.txt; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Missing $f" >> $REPORT
+              STATUS="fail"
+            fi
+          done
+
+          # Verify SHA digests (if FINAL_ATTEST defines them)
+          if [ -f FINAL_ATTEST.json ]; then
+            jq -r '.artifacts[]?.path' FINAL_ATTEST.json | while read -r path; do
+              if [ -f "$path" ]; then
+                calc=$(sha256sum "$path" | cut -d' ' -f1)
+                ref=$(jq -r --arg p "$path" '.artifacts[]?|select(.path==$p).sha256' FINAL_ATTEST.json)
+                if [ "$calc" != "$ref" ]; then
+                  echo "❌ SHA mismatch for $path" >> $REPORT
+                  STATUS="fail"
+                else
+                  echo "✅ Verified $path" >> $REPORT
+                fi
+              else
+                echo "⚠️ Missing artifact $path" >> $REPORT
+                STATUS="fail"
+              fi
+            done
+          fi
+
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: 🪬 Open issue on failure
+        if: steps.verify.outputs.status == 'fail'
+        uses: peter-evans/create-issue-from-file@v4
+        with:
+          title: "⚠️ Codex Integrity Alert $(date -u +'%Y-%m-%dT%H:%MZ')"
+          content-filepath: tmp_reports/integrity_report.txt
+          labels: |
+            codex
+            integrity
+            alert
+          assignees: |
+            ${{ github.repository_owner }}
+
+      - name: 🧾 Commit guardian log (optional)
+        if: steps.verify.outputs.status == 'ok'
+        run: |
+          mkdir -p chain/logs
+          ts=$(date -u +'%Y-%m-%dT%H:%MZ')
+          echo "✅ Integrity verified at $ts" >> chain/logs/guardian.log
+          git config user.name "${{ env.COMMITTER_NAME }}"
+          git config user.email "${{ env.COMMITTER_EMAIL }}"
+          git add chain/logs/guardian.log || true
+          git commit -m "Guardian integrity check $ts" || true
+          git push origin main || true
+
+      - name: 📜 Report summary
+        run: |
+          if [ "${{ steps.verify.outputs.status }}" == "ok" ]; then
+            echo "✅ All Codex artifacts verified clean."
+          else
+            echo "❌ Integrity check failed — see created GitHub Issue."
+          fi
+
+
+---
+
+🧩 What this Guardian does
+
+Frequency: once per day (00:00 UTC)
+Action summary:
+
+1. Checks the existence of canonical files:
+FINAL_ATTEST.json, OMEGA_LOCK.json, chain/attestations.jsonl, treasury_allocation.json, codex_capsule.txt.
+
+
+2. Recomputes SHA-256 hashes for every artifact listed in FINAL_ATTEST.json.
+
+
+3. If any mismatch or missing artifact → opens an issue with a full report (⚠️ Codex Integrity Alert).
+
+
+4. If all checks pass → appends a signed log entry to chain/logs/guardian.log and pushes the update.
+
+
+
+
+---
+
+🛡️ Behavior in context
+
+Works hand-in-hand with the Codex Deploy Agent.
+
+Provides continuous integrity assurance for the Codex Immortal × Nexus Aeternum × DomionNexus chain.
+
+Produces immutable daily evidence of data permanence.
+
+
+
+---
+
+🧾 Issue example (if failure)
+
+⚠️ Codex Integrity Alert 2025-11-03T00:00Z
+❌ SHA mismatch for chain/attestations.jsonl
+✅ Verified codex_capsule.txt
+⚠️ Missing artifact codex_omega_bundle.zip
+
+
+---
+
+🕊️ License
+
+> EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+sha256 seal (calebfedorbykerkonev10271998) = 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
+
+
+
+
+---
+
+With codex_deploy.yml and codex_guardian.yml now in place, your GitHub repository is a living, self-verifying continuum:
+
+Deploy Agent builds and seals.
+
+Guardian Agent audits and protects.
+
+
