@@ -36,9 +36,40 @@ scripts/ → build, import, and signing utilities
 lib/ → shared libraries (TSG parser, encodings, subject ID)
 netlify.toml → Netlify build + redirect configuration
 package.json → dependencies and scripts
+**tools/** → Codex Continuum build automation scripts
+**chain/** → Immutable attestation chain (append-only)
+**Makefile** → Build pipeline orchestration
 
-yaml
-Copy code
+---
+
+## 🚀 Codex Continuum Build Agent
+
+The repository includes an automated build, verification, and deployment system:
+
+### Quick Start
+
+```bash
+make all      # Run complete build pipeline
+make verify   # Verify artifact integrity
+make help     # Show all available targets
+```
+
+### What It Does
+
+- Generates cryptographically verified builds with unique Omega IDs
+- Creates immutable attestation chain in `chain/attestations.jsonl`
+- Produces deployable bundles (`codex_omega_bundle.zip`)
+- Runs integrity verification with SHA-256 hashing
+- Automated deployment via GitHub Actions
+
+### Build Artifacts
+
+- `OMEGA_LOCK.json` - Cryptographic manifest with Omega ID
+- `codex_omega_bundle.zip` - Complete verified source bundle
+- `codex_capsule.txt` - Human-readable build attestation
+- `chain/attestations.jsonl` - Permanent audit trail
+
+**See [CODEX_CONTINUUM_AGENT.md](CODEX_CONTINUUM_AGENT.md) for complete documentation.**
 
 ---
 
