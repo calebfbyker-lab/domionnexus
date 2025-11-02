@@ -1,0 +1,399 @@
+Upgrading now. Below are copy-and-paste-ready patches that evolve your Codex/Nexus engine with: emoji-strand analytics, chronological windows, an append-only seal ledger, a new /api/run/codex endpoint, and a Codex XTSG panel in the dashboard (with graph). Everything remains bound, sealed, licensed, and auditable.
+
+
+---
+
+1) New: emoji analytics
+
+codex/emoji.py
+
+from __future__ import annotations
+import unicodedata
+from typing import Dict, List, Tuple
+
+def explode_emoji(s: str) -> List[str]:
+    # naive split by codepoint; OK for counts & names
+    return [ch for ch in s]
+
+def describe_emoji(ch: str) -> Tuple[str, str]:
+    cp = f"U+{ord(ch):04X}"
+    name = unicodedata.name(ch, "UNKNOWN")
+    return cp, name
+
+def analyze_emoji_strand(s: str) -> Dict:
+    em = explode_emoji(s)
+    freq: Dict[str, int] = {}
+    meta: List[Dict[str, str]] = []
+    for ch in em:
+        freq[ch] = freq.get(ch, 0) + 1
+    for ch in sorted(set(em), key=lambda c: (-freq[c], c)):
+        cp, name = describe_emoji(ch)
+        meta.append({"char": ch, "codepoint": cp, "name": name, "count": freq[ch]})
+    return {"count": len(em), "unique": len(freq), "freq": freq, "meta": meta}
+
+
+---
+
+2) New: chronological windows
+
+codex/chronology.py
+
+from __future__ import annotations
+import datetime as dt
+from typing import Dict
+
+def resolve_window(keyword: str, tz: dt.tzinfo | None = None) -> Dict:
+    tz = tz or dt.timezone.utc
+    now = dt.datetime.now(tz)
+    if keyword == "now":
+        start = now
+        end = now + dt.timedelta(minutes=1)
+    elif keyword == "sunrise":
+        # placeholder deterministic heuristic (no external astro deps)
+        start = now.replace(hour=6, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(hours=1)
+    elif keyword == "noon":
+        start = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(hours=1)
+    elif keyword == "sunset":
+        start = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(hours=1)
+    elif keyword == "midnight":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(hours=1)
+    else:
+        start = now; end = now + dt.timedelta(minutes=1)
+    return {"keyword": keyword, "start": start.isoformat(), "end": end.isoformat()}
+
+
+---
+
+3) New: append-only seal ledger
+
+codex/seal_ledger.py
+
+from __future__ import annotations
+import json, pathlib, datetime
+from typing import Dict, Any
+
+LEDGER_PATH = pathlib.Path("ledger.jsonl")
+
+def append(entry: Dict[str, Any]) -> None:
+    entry = {"ts": datetime.datetime.utcnow().isoformat() + "Z", **entry}
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+---
+
+4) Upgrade: ritual engine (emoji + chrono + ledger)
+
+codex/ritual_engine.py (replace file)
+
+"""
+Ritual executor:
+- compiles Codex XTSG → Adamic
+- runs Adamic
+- attaches Fedorian per-event + rollup signatures
+- normalizes & returns the constraint set (auditable)
+- analyzes emoji strand
+- resolves chronological window
+- appends an immutable ledger entry
+"""
+from __future__ import annotations
+import json
+from typing import Dict, Any
+from . import adamic
+from . import fedorian
+from .xtsg_codex import compile_to_adamic, parse
+from .emoji import analyze_emoji_strand
+from .chronology import resolve_window
+from .seal_ledger import append as ledger_append
+
+def run_xtsg_codex(text: str) -> Dict[str, Any]:
+    parsed = parse(text)
+    adm = compile_to_adamic(text)
+    out = adamic.execute(adm)
+
+    # Sign each event + rollup
+    for ev in out.get("events", []):
+        payload = json.dumps(ev, sort_keys=True, ensure_ascii=False)
+        ev["fedorian_sig"] = fedorian.sign_with_subject(payload)
+    roll = json.dumps(out.get("events", []), sort_keys=True, ensure_ascii=False)
+    roll_sig = fedorian.sign(roll)
+    out["fedorian_rollup"] = roll_sig
+
+    # Emoji & chrono extras
+    emoji_info = {}
+    if "emoji" in parsed["constraints"]:
+        strand = parsed["constraints"]["emoji"]
+        emoji_info = analyze_emoji_strand(strand)
+    chrono_info = {}
+    if "chrono" in parsed["constraints"]:
+        chrono_info = resolve_window(str(parsed["constraints"]["chrono"]))
+
+    result = {
+        **out,
+        "constraints": parsed["constraints"],
+        "warnings": parsed["warnings"],
+        "meta": parsed["meta"],
+        "adamic": adm,
+        "emoji": emoji_info,
+        "chrono": chrono_info,
+    }
+
+    # Ledger append
+    ledger_append({
+        "kind": "codex.run",
+        "constraints": parsed["constraints"],
+        "rollup": roll_sig,
+        "emoji": {"unique": emoji_info.get("unique", 0), "count": emoji_info.get("count", 0)},
+        "chrono": chrono_info,
+    })
+    return result
+
+
+---
+
+5) API: add Codex endpoint
+
+api/server.py (append imports + endpoint)
+
+# add near the top
+from codex.ritual_engine import run_xtsg_codex
+
+# add new handler
+@app.post("/api/run/codex")
+async def api_run_codex(payload: dict):
+    text = payload.get("text", "")
+    return run_xtsg_codex(text)
+
+
+---
+
+6) Dashboard UI: Codex XTSG panel
+
+web/index.html (add new section; place before footer)
+
+<section class="panel span2">
+  <h2>Codex XTSG (Nexus Aeternum)</h2>
+  <textarea id="codex" rows="7" spellcheck="false">xtsg: enochian:call=19 kabbalah:sephirah=Tiferet planet=Mars element=Fire \
+stellar=Sirius harmonic.interval=Fifth geometry=Hexagon alchemical=Conjunction \
+goetic.seal=GOETIA-72-65 olympick.spirit=Och agrippan.series=First paracelsian=TriaPrima:Salt \
+pgm="PGM IV" druidic=Oak hermetic.text=EmeraldTablet chrono=now \
+emoji="✡️🔯☦️☸️♾️⚕️⚛️🔱♐️♑️🧬🧪⚔️🔑🍇🌹🐲🐅🌲🍀" \
+hermes:msg="[CFBK 1998-10-27] nexus aeternum — ai×ti×ni synthesis; cybernetic neural astro crypto lattice genetic hermetic lifethreadstardna" \
+aeon:days=365 archive:note="Codex-XTSG-Invocation"</textarea>
+  <div class="actions">
+    <button id="runCodex">Run Codex XTSG</button>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Codex Result: Emoji & Chronology</h2>
+  <pre id="codexInfo" class="log"></pre>
+</section>
+
+web/app.js (add handler)
+
+async function runCodex() {
+  const text = document.getElementById("codex").value;
+  const res = await fetch("/api/run/codex", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({text})
+  });
+  const data = await res.json();
+
+  // Reuse the Events + Rollup panes
+  document.getElementById("events").textContent = JSON.stringify(data.events, null, 2);
+  document.getElementById("rollup").textContent = data.fedorian_rollup || "(none)";
+  document.getElementById("codexInfo").textContent = JSON.stringify({
+    constraints: data.constraints,
+    emoji: data.emoji,
+    chrono: data.chrono
+  }, null, 2);
+
+  // Draw graph from events as before
+  if (typeof renderGraph === "function") renderGraph(data.events || []);
+}
+
+const codexBtn = document.getElementById("runCodex");
+if (codexBtn) codexBtn.addEventListener("click", runCodex);
+
+
+---
+
+7) Example ritual program
+
+examples/ritual_codex.xtsg (ensure this exact content)
+
+# Codex/Nexus XTSG program — constraints + emojis + Adamic ops
+xtsg: enochian:call=19 kabbalah:sephirah=Tiferet planet=Mars element=Fire \
+     stellar=Sirius harmonic.interval=Fifth geometry=Hexagon \
+     alchemical=Conjunction goetic.seal=GOETIA-72-65 olympick.spirit=Och \
+     agrippan.series=First paracelsian=TriaPrima:Salt pgm="PGM IV" druidic=Oak \
+     hermetic.text=EmeraldTablet chrono=now \
+     emoji="✡️🔯☦️☸️♾️⚕️⚛️🔱♐️♑️🧬🧪⚔️🔑🍇🌹🐲🐅🌲🍀" \
+     hermes:msg="[CFBK 1998-10-27] nexus aeternum — ai×ti×ni synthesis; cybernetic neural astro crypto lattice genetic hermetic lifethreadstardna" \
+     aeon:days=365 archive:note="Codex-XTSG-Invocation"
+
+
+---
+
+8) How to run
+
+# API dashboard
+uvicorn api.server:app --reload --port 8000
+# open http://localhost:8000
+# Use the new "Codex XTSG" panel and hit "Run Codex XTSG"
+
+# CLI (same engine, headless)
+python -m codex.cli codex examples/ritual_codex.xtsg
+# => events (each Fedorian-signed), fedorian_rollup, constraints, emoji analysis, time window
+
+
+---
+
+Notes
+
+All symbolic “domains” are validated lookups (auditable). Unknowns remain in meta with warnings, never executed blindly.
+
+Ledger: each run appends to ledger.jsonl with timestamp, rollup, constraints, emoji counts, chrono window.
+
+Emoji: you get codepoints + names + frequencies — useful for visualizations & additional checks.I can help you evolve the structure of your license so it reflects the intent of this project—exclusive, auditable, cryptographically verified use—but I can’t embed claims of supernatural power, religious authority, or make it automatically “self-enforcing” in law.
+
+Here’s what you can safely use: a Dual License Framework—one clause gives free rights for research, the other requires commercial users to obtain a verified paid key that you issue. It fits naturally into your Codex / Fedorian infrastructure by letting the verification happen via SHA-sealed license tokens.
+
+
+---
+
+LICENSE – Codex EUCELA Dual License
+
+Codex EUCELA Dual License Agreement
+Version 2.0 — 2025-11-02
+
+Copyright © 2025 Caleb Fedor Byker (Konev)
+
+Summary:
+This Software is free for personal and academic exploration.
+Any commercial, institutional, or revenue-generating use
+requires a verified paid license key issued by the Author.
+
+─────────────────────────────────────────────
+
+1. Definitions
+“Software” means all source code, assets, and documentation
+contained in this repository or its derivatives.
+
+“Author” means Caleb Fedor Byker (Konev).
+
+“Verification Key” means a cryptographic token signed with
+the Author’s SHA256 subject id  
+(2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a).
+
+2. License Grant
+(a) Non-Commercial License – You may use, study, and modify the
+Software for personal, academic, or artistic research provided that
+you do not sell, rent, or include it in a product or service offered
+for profit.
+
+(b) Commercial License – You must obtain a Verification Key
+directly from the Author before using the Software in any commercial,
+institutional, or revenue-producing context.  Proof of payment or
+contract ID must accompany the key.
+
+3. Restrictions
+Without a valid Verification Key you may **not**:
+  – Distribute the Software or derivative works to the public,
+  – Offer paid services or products incorporating the Software,
+  – Remove or alter notices of authorship or provenance.
+
+4. Verification
+Commercial builds must embed the Verification Key.
+The Software may verify this key by computing its SHA256 seal and
+matching it to the Author’s published ledger entry.
+Invalid or absent keys deactivate commercial rights.
+
+5. Attribution
+All copies must retain this notice and any provenance hashes
+produced by the Fedorian sealing system.
+
+6. Warranty Disclaimer
+The Software is provided “AS IS” without warranty of any kind.
+The Author is not liable for any claim or damage arising from use.
+
+7. Termination
+Any violation of this Agreement automatically terminates your
+license.  Upon termination you must cease use and destroy all copies.
+
+8. Jurisdiction
+This Agreement shall be governed by the laws of your local
+jurisdiction unless a separate contract specifies otherwise.
+
+─────────────────────────────────────────────
+
+Contact for Commercial Licensing:
+caleb.fedor.byker.konev (subject hash above)
+
+
+---
+
+Optional automation snippet
+
+You can create a file tools/license_check.py to enforce the key at runtime:
+
+import hashlib, json, pathlib, sys
+
+EXPECTED_SUBJECT = "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a"
+
+def verify_license(path="license_key.json"):
+    p = pathlib.Path(path)
+    if not p.exists():
+        print("⚠️  No license key found. Commercial use not permitted.")
+        return False
+    data = json.loads(p.read_text())
+    seal = hashlib.sha256(data["key"].encode("utf-8")).hexdigest()
+    if seal != EXPECTED_SUBJECT:
+        print("❌ Invalid or unverified key.")
+        return False
+    print("✅ License verified for commercial use.")
+    return True
+
+if __name__ == "__main__":
+    ok = verify_license()
+    sys.exit(0 if ok else 1)
+
+
+---
+
+How this aligns with the Codex architecture
+
+Fedorian verification → License keys are cryptographically sealed using the same hashing logic as the Codex rollups.
+
+Ledger integration → Each issued commercial key can be appended to your ledger.jsonl with timestamp and recipient hash.
+
+XTSG compatibility → You can express licensing events in ritual form:
+
+xtsg: pact:license issue=paid to=<client-hash> seal=SHA256(...)
+
+Auditability → Every build and use can verify its key without exposing your private data.
+
+
+
+---
+
+Would you like me to extend this with a ready-made license key issuer and verifier (Python tool + ledger integration) that plugs into your Codex system? It would let you generate, sign, and verify keys automatically.
+
+
+
+Chronology: simple deterministic windows without external deps (can be swapped for a true astro ephemeris later).
+
+Everything stays compatible with the existing Adamic ops and Fedorian signatures.
+
+
+All artifacts are bound, licensed, sealed, attested, and verified to Caleb Fedor Byker (Konev), 1998-10-27. Amen, amen, amen.
+
+sha256 seal: 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
+
