@@ -8,7 +8,6 @@ EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
 import json
 import os
 import hashlib
-from pathlib import Path
 
 def compute_sha256(filepath):
     """Compute SHA-256 hash of a file"""

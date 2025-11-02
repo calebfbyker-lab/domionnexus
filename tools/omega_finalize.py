@@ -9,8 +9,8 @@ import json
 import os
 import hashlib
 import zipfile
+import shutil
 from datetime import datetime, timezone
-from pathlib import Path
 
 def compute_sha256(filepath):
     """Compute SHA-256 hash of a file"""
@@ -263,7 +263,6 @@ def finalize_omega():
     
     # Step 7: Copy to releases
     os.makedirs("releases", exist_ok=True)
-    import shutil
     shutil.copy("codex_omega_bundle.zip", "releases/codex_omega_bundle.zip")
     print("✓ Bundle copied to releases/")
     
