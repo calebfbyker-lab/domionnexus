@@ -1,0 +1,801 @@
+Ascending to the capstone: v111 — “Codex Continuum Covenant”.
+This release hardens the Codex with a notarized, append-only witness log, policy-guarded API keys, portable snapshots, scholarly exports, deltas between versions, and a tiny i18n layer. No new mysticism—just verifiable engineering you can ship.
+
+Everything below is copy-paste-ready. Drop files where indicated, run the finalizer, commit, and tag.
+
+
+---
+
+0) Manifest bump
+
+In scripts/build.py, before writing the manifest:
+
+root_manifest["version"] = "v111"
+root_manifest["status"]  = "covenant"
+root_manifest["comment"] = "Notary log + policy guard + snapshots + scholarly export + deltas + i18n"
+
+
+---
+
+1) Transparency Notary (append-only witness log)
+
+scripts/notary_log.py
+
+#!/usr/bin/env python3
+"""
+v111 Notary Log — append-only transparency ledger.
+Each entry links to the previous via sha256(prev_json).
+HMAC (env CODEX_SIGNING_SECRET) attests issuer.
+"""
+import os, json, time, hmac, hashlib, pathlib, base64
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PROV = ROOT / "provenance"
+LOG  = PROV / "notary_log.jsonl"
+
+def _hmac(payload: bytes) -> str:
+    secret = os.environ.get("CODEX_SIGNING_SECRET","")
+    if not secret: return ""
+    return base64.b64encode(hmac.new(secret.encode(), payload, hashlib.sha256).digest()).decode()
+
+def append_witness(kind: str, ref_path: str, meta: dict):
+    PROV.mkdir(parents=True, exist_ok=True)
+    prev = ""
+    if LOG.exists():
+        with open(LOG, "rb") as f:
+            try:
+                f.seek(-4096, 2)
+            except OSError:
+                f.seek(0)
+            tail = f.read().splitlines()
+            if tail:
+                prev = tail[-1].decode()
+    prev_hash = hashlib.sha256(prev.encode()).hexdigest() if prev else "0"*64
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "version": "v111",
+        "kind": kind,
+        "ref": ref_path,
+        "prev_sha256": prev_hash,
+        "meta": meta
+    }
+    payload = json.dumps(entry, separators=(",",":")).encode()
+    entry["hmac_b64"] = _hmac(payload)
+    with open(LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry)+"\n")
+    print("Notarized:", kind, "→", ref_path)
+
+if __name__ == "__main__":
+    import sys, json as _json
+    k = sys.argv[1] if len(sys.argv)>1 else "witness"
+    r = sys.argv[2] if len(sys.argv)>2 else "manifest.json"
+    m = _json.loads(sys.argv[3]) if len(sys.argv)>3 else {}
+    append_witness(k, r, m)
+
+
+---
+
+2) Policy Guard (API keys + scopes + tiny rate-limit)
+
+modules/security/policy.py
+
+# v111 Policy Guard — simple API key + scopes + token bucket
+import os, time, hmac, base64, hashlib
+from typing import Dict
+
+_KEYS: Dict[str, Dict] = {}   # in-memory (optionally persisted later)
+_BUCKETS: Dict[str, Dict] = {}
+
+SECRET = os.environ.get("CODEX_SIGNING_SECRET","")
+
+def _sig(s: str)->str:
+    return base64.b64encode(hmac.new(SECRET.encode(), s.encode(), hashlib.sha256).digest()).decode() if SECRET else ""
+
+def issue_key(holder: str, scopes=("read",), rate=60) -> Dict:
+    key = base64.urlsafe_b64encode(os.urandom(18)).decode().strip("=")
+    _KEYS[key] = {"holder":holder, "scopes":set(scopes), "rate":rate}
+    return {"key":key, "sig":_sig(key), "scopes":list(scopes), "rate":rate}
+
+def authorize(key: str, scope: str) -> bool:
+    rec = _KEYS.get(key)
+    return bool(rec and scope in rec["scopes"])
+
+def rate_limit(key: str) -> bool:
+    now = time.time()
+    b = _BUCKETS.setdefault(key, {"tokens":1.0, "ts":now})
+    rate = _KEYS.get(key,{}).get("rate",60)  # requests per minute
+    capacity = max(rate, 1)
+    refill = (now - b["ts"]) * (rate/60.0)
+    b["tokens"] = min(capacity, b["tokens"] + refill)
+    b["ts"] = now
+    if b["tokens"] >= 1.0:
+        b["tokens"] -= 1.0
+        return True
+    return False
+
+Add to monetization/api_gateway.py
+
+from fastapi import Depends, Header, HTTPException
+from modules.security.policy import issue_key, authorize, rate_limit
+
+def require(scope:str):
+    def _dep(x_api_key: str = Header(default="")):
+        if not x_api_key or not authorize(x_api_key, scope) or not rate_limit(x_api_key):
+            raise HTTPException(status_code=403, detail="Forbidden or rate-limited")
+        return True
+    return _dep
+
+@app.post("/v111/keys/issue")
+def v111_issue_key(payload: dict, x_admin_secret: str = Header(default="")):
+    import os
+    if x_admin_secret != os.environ.get("CODEX_SIGNING_SECRET",""):
+        raise HTTPException(status_code=403, detail="Admin secret invalid")
+    holder = payload.get("holder","anonymous")
+    scopes = payload.get("scopes",["read"])
+    rate   = payload.get("rate",60)
+    return issue_key(holder, tuple(scopes), rate)
+
+@app.get("/v111/protected/ping")
+def v111_ping(dep=Depends(require("read"))):
+    return {"ok":True,"msg":"pong","version":"v111"}
+
+
+---
+
+3) Snapshots (portable zips with metadata)
+
+scripts/snapshot_backup.py
+
+#!/usr/bin/env python3
+"""
+Create dated snapshot zip of library + provenance + manifest.
+"""
+import pathlib, time, zipfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+OUT  = ROOT / "snapshots"
+INCLUDE = ["manifest.json", "library/index.json", "library/checksums.txt",
+           "provenance", "archives/codex_universalis.json", "provenance/triple_seal.json"]
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    z = OUT / f"codex_snapshot_{stamp}.zip"
+    with zipfile.ZipFile(z, "w", compression=zipfile.ZIP_DEFLATED) as zp:
+        for item in INCLUDE:
+            p = ROOT / item
+            if p.is_file():
+                zp.write(p, arcname=item)
+            elif p.is_dir():
+                for f in p.rglob("*"):
+                    if f.is_file():
+                        zp.write(f, arcname=str(f.relative_to(ROOT)))
+    print("Snapshot:", z)
+
+if __name__=="__main__": main()
+
+
+---
+
+4) Deltas between library states
+
+modules/library/delta.py
+
+# v111 Delta — compute difference between two library indexes
+import json, pathlib
+from typing import Dict, List
+
+def load_index(p: pathlib.Path)->Dict:
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def diff(a: Dict, b: Dict) -> Dict:
+    A = {e["path"]: e for e in a.get("entries",[])}
+    B = {e["path"]: e for e in b.get("entries",[])}
+    added   = [B[k] for k in B.keys()-A.keys()]
+    removed = [A[k] for k in A.keys()-B.keys()]
+    changed = [B[k] for k in (A.keys() & B.keys()) if A[k]["sha256"] != B[k]["sha256"]]
+    return {"added":added, "removed":removed, "changed":changed}
+
+API: add to monetization/api_gateway.py
+
+from modules.library.delta import diff as libdiff
+@app.post("/v111/delta")
+def v111_delta(payload: dict):
+    import pathlib, json
+    root = pathlib.Path(__file__).resolve().parents[1]
+    a = json.loads((root/"library"/payload.get("a","index.json")).read_text(encoding="utf-8"))
+    b = json.loads((root/"library"/payload.get("b","index.json")).read_text(encoding="utf-8"))
+    return {"ok":True, "delta": libdiff(a,b)}
+
+
+---
+
+5) Scholarly export (CSL JSON + BibTeX)
+
+modules/library/export_scholar.py
+
+# v111 Scholar Export — CSL JSON and BibTeX entries for the Codex
+import json, pathlib, datetime
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+LIB  = ROOT / "library" / "index.json"
+OUTD = ROOT / "library"
+
+def csl():
+    now = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    return [{
+        "type": "dataset",
+        "id": "codex-continuum",
+        "title": "Codex Continuum (Triune → Universalis → Nexus Aeternum → Covenant)",
+        "version": (json.loads((ROOT/"manifest.json").read_text(encoding="utf-8")).get("version","v111")),
+        "author": [{"family":"Byker (Konev)","given":"Caleb Fedor"}],
+        "issued": {"date-parts":[[int(now[:4]), int(now[5:7]), int(now[8:10])]]},
+        "publisher": "CFBK",
+        "URL": "local"
+    }]
+
+def bibtex():
+    man = json.loads((ROOT/"manifest.json").read_text(encoding="utf-8"))
+    v = man.get("version","v111")
+    return f"""@misc{{CodexContinuum{v},
+  title={{Codex Continuum}},
+  author={{Caleb Fedor Byker (Konev)}},
+  year={{2025}},
+  howpublished={{Version {v}, local distribution}},
+  note={{Subject SHA256: 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a}}
+}}"""
+
+def write_all():
+    OUTD.mkdir(parents=True, exist_ok=True)
+    (OUTD/"citations.csl.json").write_text(json.dumps(csl(), indent=2), encoding="utf-8")
+    (OUTD/"citations.bib").write_text(bibtex(), encoding="utf-8")
+    print("Wrote scholarly exports:", OUTD/"citations.csl.json", OUTD/"citations.bib")
+
+if __name__=="__main__": write_all()
+
+
+---
+
+6) i18n (tiny client-side)
+
+site/i18n.json
+
+{
+  "en": { "title": "Codex Continuum", "library": "Library", "capsule": "Capsule", "search": "Search" },
+  "es": { "title": "Códice Continuum", "library": "Biblioteca", "capsule": "Cápsula", "search": "Buscar" }
+}
+
+site/i18n.js
+
+<script>
+(async function(){
+  const dict = await fetch("../site/i18n.json").then(r=>r.json()).catch(()=>({}));
+  function t(key){ const lang = (localStorage.getItem("lang")||"en"); return (dict[lang]||dict.en||{})[key]||key; }
+  window.codex_i18n = { t, set:(l)=>{ localStorage.setItem("lang", l); location.reload(); } };
+})();
+</script>
+
+Add a language toggle to site/frontispiece.html header:
+
+<select aria-label="Language" onchange="codex_i18n.set(this.value)">
+  <option value="en">EN</option>
+  <option value="es">ES</option>
+</select>
+<script src="i18n.js"></script>
+
+
+---
+
+7) v111 Finalizer (one command)
+
+scripts/v111_finalize.py
+
+#!/usr/bin/env python3
+"""
+v111 Covenant — finalize: build, verify, library, scholarly, snapshot, notary, seal.
+"""
+import subprocess, json, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+def run(*cmd): print(">", *cmd); subprocess.run(cmd, check=True)
+
+def main():
+    run("python","scripts/final_build.py")
+    run("python","scripts/verify_integrity.py")
+    run("python","-m","modules.library.indexer")
+    run("python","modules/library/export_scholar.py")
+    run("python","scripts/checksums_index.py")
+    run("python","scripts/build_capsule_v110x.py")
+    run("python","scripts/snapshot_backup.py")
+    # notarize key artefacts
+    run("python","scripts/notary_log.py","manifest","manifest.json",'{}')
+    run("python","scripts/notary_log.py","library","library/index.json",'{}')
+    run("python","scripts/notary_log.py","capsule","archives/codex_capsule_v110x.html",'{}')
+    # finalize
+    run("python","scripts/merkle_provenance.py")
+    run("python","scripts/triple_seal.py")
+    print("v111 Covenant complete.")
+
+if __name__=="__main__": main()
+
+Track new files in scripts/build.py:
+
+tracked += [
+  "scripts/notary_log.py",
+  "scripts/snapshot_backup.py",
+  "modules/security/policy.py",
+  "modules/library/delta.py",
+  "modules/library/export_scholar.py",
+  "site/i18n.json","site/i18n.js",
+  "scripts/v111_finalize.py"
+]
+
+
+---
+
+8) Docs
+
+docs/changelog.md (append)
+
+## v111 Covenant
+- Transparency Notary (append-only notary_log.jsonl with chained hashes + HMAC)
+- Policy Guard (API keys + scopes + simple rate limit)
+- Snapshots (dated zip bundles)
+- Library deltas (added/removed/changed)
+- Scholarly exports (CSL JSON + BibTeX)
+- i18n (EN/ES) for frontispiece
+- Manifest status: covenant
+
+docs/architecture.md (append)
+
+### v111 Covenant
+The Codex now carries its own law and witness:
+- **Law**: Policy-guarded API keys + scope control.
+- **Witness**: Append-only notarization chain with HMAC attestation.
+- **Memory**: Snapshots + deltas for forensic diffs.
+- **Scholarship**: CSL/BibTeX exports for citation.
+- **Humanity**: i18n layer (EN/ES) on the frontispiece.
+
+
+---
+
+9) CI (optional)
+
+.github/workflows/v111-covenant.yml
+
+name: v111 Covenant
+on: { workflow_dispatch: {} }
+jobs:
+  covenant:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - run: pip install jsonschema pyyaml
+      - run: CODEX_SIGNING_SECRET=${{ secrets.CODEX_SIGNING_SECRET }} python scripts/v111_finalize.py
+      - name: Commit + Tag
+        run: |
+          git config user.name "codex-bot"
+          git config user.email "codex-bot@users.noreply.github.com"
+          git add provenance/* library/* site/i18n.* archives/*.html snapshots/*.zip || true
+          git commit -m "v111 Covenant — notary, policy guard, snapshots, scholarly, deltas, i18n" || echo "no changes"
+          git tag -a v111 -m "Codex Continuum v111 Covenant"
+          git push --follow-tags
+
+
+---
+
+10) Quick run
+
+# Finish v111 end-to-end (with HMAC if you set a secret)
+export CODEX_SIGNING_SECRET="set-a-strong-secret"
+python scripts/v111_finalize.py
+
+# Serve API (keys + protected ping + delta)
+uvicorn monetization.api_gateway:app --port 8080
+
+# Issue an API key (admin)
+curl -s -X POST http://127.0.0.1:8080/v111/keys/issue \
+  -H "x-admin-secret: $CODEX_SIGNING_SECRET" -H "content-type: application/json" \
+  -d '{"holder":"cfbk","scopes":["read"],"rate":120}'
+
+# Use the key
+curl -s http://127.0.0.1:8080/v111/protected/ping -H "x-api-key: <PASTE_KEY>"
+
+
+---
+
+What v111 achieves (plain talk)
+
+Trust: Every important file gets a notarized, chained, HMAC-attested witness entry.
+
+Control: Scopes + rate limits keep usage honest.
+
+Portability: Snapshots + capsule make archiving trivial.
+
+Reproducibility: Deltas and checksums tell you exactly what changed.
+
+Citations: CSL/BibTeX make it easy to reference the Codex in academic work.
+
+People-friendly: i18n keeps the illuminated frontispiece welcoming.
+
+
+
+---
+
+Subject seal (as always)
+
+sha256("calebfedorbykerkonev10271998") = 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aSealing the capstone polish: v111.x — “Covenant Ω”.
+This pass doesn’t change the philosophy—only hardens it: persistent API keys, a verifiable notary chain, tamper checks, snapshot rotation, and a single integrity roll-up. All code below is copy-paste-ready.
+
+
+---
+
+1) Manifest stamp
+
+Add this before you write the manifest in scripts/build.py:
+
+root_manifest["version"] = "v111.x"
+root_manifest["status"]  = "covenant-omega"
+root_manifest["comment"] = "Persistent keys, notary verification, snapshot rotation, integrity roll-up"
+
+
+---
+
+2) Persistent API keys (JSON store + rotate)
+
+modules/security/policy_store.json
+
+{ "keys": [] }
+
+modules/security/policy.py (drop-in replacement)
+
+# v111.x Policy Guard — persistent API key store + scopes + token bucket + rotation
+import os, time, hmac, base64, hashlib, json, pathlib
+from typing import Dict, Set, List
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+STORE = ROOT / "modules" / "security" / "policy_store.json"
+SECRET = os.environ.get("CODEX_SIGNING_SECRET","")
+
+_KEYS: Dict[str, Dict] = {}     # in-memory
+_BUCKETS: Dict[str, Dict] = {}  # rate buckets
+
+def _sig(s: str)->str:
+    return base64.b64encode(hmac.new(SECRET.encode(), s.encode(), hashlib.sha256).digest()).decode() if SECRET else ""
+
+def _load():
+    global _KEYS
+    if STORE.exists():
+        data = json.loads(STORE.read_text(encoding="utf-8"))
+        _KEYS = { rec["key"]: {"holder":rec["holder"], "scopes":set(rec["scopes"]), "rate":rec["rate"], "created":rec.get("created","")} for rec in data.get("keys",[]) }
+    else:
+        STORE.write_text(json.dumps({"keys":[]}, indent=2), encoding="utf-8")
+
+def _save():
+    STORE.write_text(json.dumps({"keys":[{"key":k,"holder":v["holder"],"scopes":list(v["scopes"]), "rate":v["rate"], "created":v.get("created","")} for k,v in _KEYS.items()]}, indent=2), encoding="utf-8")
+
+def issue_key(holder: str, scopes=("read",), rate=60) -> Dict:
+    _load()
+    key = base64.urlsafe_b64encode(os.urandom(18)).decode().strip("=")
+    _KEYS[key] = {"holder":holder, "scopes":set(scopes), "rate":int(rate), "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    _save()
+    return {"key":key, "sig":_sig(key), "scopes":list(scopes), "rate":int(rate), "holder":holder}
+
+def revoke_key(key: str) -> bool:
+    _load()
+    if key in _KEYS:
+        del _KEYS[key]; _save(); return True
+    return False
+
+def rotate_key(old_key: str) -> Dict:
+    _load()
+    rec = _KEYS.get(old_key)
+    if not rec: return {}
+    revoke_key(old_key)
+    return issue_key(rec["holder"], tuple(rec["scopes"]), rec["rate"])
+
+def authorize(key: str, scope: str) -> bool:
+    _load()
+    rec = _KEYS.get(key)
+    return bool(rec and scope in rec["scopes"])
+
+def rate_limit(key: str) -> bool:
+    now = time.time()
+    b = _BUCKETS.setdefault(key, {"tokens":1.0, "ts":now})
+    rate = (_KEYS.get(key,{}) or {}).get("rate",60)  # req/min
+    capacity = max(rate, 1)
+    refill = (now - b["ts"]) * (rate/60.0)
+    b["tokens"] = min(capacity, b["tokens"] + refill)
+    b["ts"] = now
+    if b["tokens"] >= 1.0:
+        b["tokens"] -= 1.0
+        return True
+    return False
+
+API additions in monetization/api_gateway.py
+
+from modules.security.policy import issue_key, authorize, rate_limit, revoke_key, rotate_key
+from fastapi import Depends, Header, HTTPException
+
+def require(scope:str):
+    def _dep(x_api_key: str = Header(default="")):
+        if not x_api_key or not authorize(x_api_key, scope) or not rate_limit(x_api_key):
+            raise HTTPException(status_code=403, detail="Forbidden or rate-limited")
+        return True
+    return _dep
+
+@app.post("/v111.x/keys/issue")
+def v111x_issue_key(payload: dict, x_admin_secret: str = Header(default="")):
+    import os
+    if x_admin_secret != os.environ.get("CODEX_SIGNING_SECRET",""):
+        raise HTTPException(status_code=403, detail="Admin secret invalid")
+    return issue_key(payload.get("holder","anonymous"), tuple(payload.get("scopes",["read"])), int(payload.get("rate",60)))
+
+@app.post("/v111.x/keys/revoke")
+def v111x_revoke(payload: dict, x_admin_secret: str = Header(default="")):
+    import os
+    if x_admin_secret != os.environ.get("CODEX_SIGNING_SECRET",""):
+        raise HTTPException(status_code=403, detail="Admin secret invalid")
+    return {"ok": revoke_key(payload.get("key",""))}
+
+@app.post("/v111.x/keys/rotate")
+def v111x_rotate(payload: dict, x_admin_secret: str = Header(default="")):
+    import os
+    if x_admin_secret != os.environ.get("CODEX_SIGNING_SECRET",""):
+        raise HTTPException(status_code=403, detail="Admin secret invalid")
+    newk = rotate_key(payload.get("key",""))
+    if not newk: raise HTTPException(status_code=404, detail="Key not found")
+    return newk
+
+@app.get("/v111.x/protected/ping")
+def v111x_ping(dep=Depends(require("read"))):
+    return {"ok":True,"msg":"pong","version":"v111.x"}
+
+
+---
+
+3) Notary verification (chain-of-trust check + API)
+
+scripts/notary_verify.py
+
+#!/usr/bin/env python3
+"""
+Verify append-only notary chain:
+ - each entry HMAC is valid (if secret set)
+ - each entry prev_sha256 matches sha256(prev_line)
+"""
+import os, json, hashlib, hmac, base64, pathlib, sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+LOG  = ROOT/"provenance"/"notary_log.jsonl"
+SECRET = os.environ.get("CODEX_SIGNING_SECRET","")
+
+def verify()->dict:
+    if not LOG.exists(): return {"ok": False, "error":"notary_log.jsonl missing"}
+    prev = b""
+    n = 0
+    for raw in LOG.read_bytes().splitlines():
+        n += 1
+        entry = json.loads(raw)
+        # prev link check
+        want = hashlib.sha256(prev).hexdigest() if prev else "0"*64
+        if entry.get("prev_sha256") != want:
+            return {"ok": False, "error": f"prev_sha256 mismatch at line {n}"}
+        # HMAC check (if secret set)
+        if SECRET and "hmac_b64" in entry:
+            payload = json.dumps({k:entry[k] for k in entry if k!="hmac_b64"}, separators=(",",":")).encode()
+            calc = base64.b64encode(hmac.new(SECRET.encode(), payload, hashlib.sha256).digest()).decode()
+            if calc != entry["hmac_b64"]:
+                return {"ok": False, "error": f"HMAC mismatch at line {n}"}
+        prev = raw
+    return {"ok": True, "entries": n}
+
+if __name__=="__main__":
+    print(json.dumps(verify(), indent=2))
+
+API endpoint (add to monetization/api_gateway.py)
+
+@app.get("/v111.x/notary/verify")
+def v111x_notary_verify():
+    import subprocess, json, pathlib, sys
+    here = pathlib.Path(__file__).resolve().parents[1]
+    out = subprocess.check_output([sys.executable, str(here/"scripts"/"notary_verify.py")], text=True)
+    return json.loads(out)
+
+
+---
+
+4) Snapshot rotation (keep N newest)
+
+scripts/snapshot_rotate.py
+
+#!/usr/bin/env python3
+"""
+Keep only the N most-recent snapshots in /snapshots
+"""
+import pathlib, sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SNAP = ROOT/"snapshots"
+
+def main(n_keep:int=5):
+    if not SNAP.exists(): return
+    files = sorted(SNAP.glob("codex_snapshot_*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[n_keep:]:
+        p.unlink()
+        print("Removed", p.name)
+
+if __name__=="__main__":
+    n = int(sys.argv[1]) if len(sys.argv)>1 else 5
+    main(n)
+
+
+---
+
+5) Integrity roll-up (one JSON to rule them all)
+
+scripts/integrity_rollup.py
+
+#!/usr/bin/env python3
+"""
+Collects hashes & provenance pointers into a single integrity_rollup.json
+"""
+import json, pathlib, hashlib, time
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+PROV = ROOT/"provenance"
+LIB  = ROOT/"library"
+
+def sha(p: pathlib.Path)->str:
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for c in iter(lambda:f.read(8192), b""): h.update(c)
+    return h.hexdigest()
+
+def main():
+    roll = {
+        "version":"v111.x",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "subject_sha256":"2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+        "artifacts":{}
+    }
+    refs = {
+        "manifest":"manifest.json",
+        "library_index":"library/index.json",
+        "checksums":"library/checksums.txt",
+        "universalis":"archives/codex_universalis.json",
+        "triple_seal":"provenance/triple_seal.json",
+        "merkle_tree":"provenance/merkle_tree.json",
+        "notary_log":"provenance/notary_log.jsonl"
+    }
+    for k, rel in refs.items():
+        p = ROOT/rel
+        if p.exists(): roll["artifacts"][k] = {"path": rel, "sha256": sha(p)}
+    (PROV/"integrity_rollup.json").write_text(json.dumps(roll, indent=2), encoding="utf-8")
+    print("Wrote", PROV/"integrity_rollup.json")
+
+if __name__=="__main__": main()
+
+Expose via API:
+
+@app.get("/v111.x/integrity")
+def v111x_integrity():
+    p = pathlib.Path(__file__).resolve().parents[1]/"provenance"/"integrity_rollup.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"ok":False,"error":"rollup missing"}
+
+
+---
+
+6) Finish script (one command)
+
+scripts/v111x_finish.py
+
+#!/usr/bin/env python3
+"""
+v111.x Covenant Ω — finalize everything:
+build → verify → index → scholarly → snapshot → rotate → notary+verify → rollup → seal
+"""
+import subprocess, pathlib, os, sys
+
+def run(*cmd): print(">", *cmd); subprocess.run(cmd, check=True)
+
+def main():
+    run("python","scripts/final_build.py")
+    run("python","scripts/verify_integrity.py")
+    run("python","-m","modules.library.indexer")
+    run("python","modules/library/export_scholar.py")
+    run("python","scripts/checksums_index.py")
+    run("python","scripts/build_capsule_v110x.py")
+    run("python","scripts/snapshot_backup.py")
+    run("python","scripts/snapshot_rotate.py","5")
+    # notarize major artefacts
+    run("python","scripts/notary_log.py","manifest","manifest.json","{}")
+    run("python","scripts/notary_log.py","library","library/index.json","{}")
+    run("python","scripts/notary_log.py","capsule","archives/codex_capsule_v110x.html","{}")
+    # verify notary
+    run("python","scripts/notary_verify.py")
+    # provenance & rollup
+    run("python","scripts/merkle_provenance.py")
+    run("python","scripts/triple_seal.py")
+    run("python","scripts/integrity_rollup.py")
+    print("v111.x Covenant Ω complete.")
+
+if __name__=="__main__": main()
+
+Add these paths to the tracked list in scripts/build.py:
+
+tracked += [
+  "modules/security/policy_store.json",
+  "scripts/notary_verify.py",
+  "scripts/snapshot_rotate.py",
+  "scripts/integrity_rollup.py",
+  "scripts/v111x_finish.py"
+]
+
+
+---
+
+7) Makefile sugar
+
+.PHONY: covenant_omega notary_verify snapshot_rotate integrity
+covenant_omega:
+\tpython scripts/v111x_finish.py
+notary_verify:
+\tpython scripts/notary_verify.py
+snapshot_rotate:
+\tpython scripts/snapshot_rotate.py 5
+integrity:
+\tpython scripts/integrity_rollup.py && cat provenance/integrity_rollup.json
+
+
+---
+
+8) API quick-tests
+
+# issue key (admin)
+curl -s -X POST http://127.0.0.1:8080/v111.x/keys/issue \
+  -H "x-admin-secret: $CODEX_SIGNING_SECRET" -H "content-type: application/json" \
+  -d '{"holder":"cfbk","scopes":["read"],"rate":120}'
+
+# use key
+curl -s http://127.0.0.1:8080/v111.x/protected/ping -H "x-api-key: <PASTE_KEY>"
+
+# verify notary
+curl -s http://127.0.0.1:8080/v111.x/notary/verify
+
+# view integrity roll-up
+curl -s http://127.0.0.1:8080/v111.x/integrity
+
+
+---
+
+9) Docs
+
+Append to docs/changelog.md:
+
+## v111.x Covenant Ω
+- Persistent API keys with revoke/rotate
+- Notary chain verifier + API
+- Snapshot rotation (retain newest N)
+- Integrity roll-up (single JSON proving major artefacts)
+- Manifest status: covenant-omega
+
+
+---
+
+10) One-shot finish
+
+export CODEX_SIGNING_SECRET="set-a-strong-secret"
+python scripts/v111x_finish.py
+git add .
+git commit -m "v111.x Covenant Ω — persistent keys, notary verify, snapshot rotation, integrity roll-up"
+git tag -a v111.x -m "Codex Continuum v111.x Covenant Ω"
+git push --follow-tags
+
+
+---
+
+Subject seal (per your instruction):
+sha256("calebfedorbykerkonev10271998") = 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
