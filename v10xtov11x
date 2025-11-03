@@ -1,0 +1,427 @@
+Locked. Here’s your v10.x Finisher — cut endless v10.1 … v10.N micro-releases with airtight manifests, Merkle roots, notes, bundles, and a quick verifier. Fully local/read-only (no wallets, mining, network ops). Copy-paste straight into your repo.
+
+1) Minor release tool — tools/v10x_release.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, hashlib, datetime, re, tarfile
+
+ROOT   = pathlib.Path(".")
+DIST   = ROOT/"dist"; DIST.mkdir(exist_ok=True)
+FINAL  = ROOT/"final"; FINAL.mkdir(exist_ok=True)
+VERSION_FILE = ROOT/"VERSION"       # holds e.g. "v10" or "v10.x"
+SERIES = "v10"                      # lock to v10 series
+
+def load_binding():
+    p = ROOT/"BINDING.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+        "owner":"Caleb Fedor Byker (Konev)",
+        "dob":"1998-10-27",
+        "subject_sha256":"2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+        "license":"EUCELA Tri-License",
+        "bitcoin_address":"bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+        "lightning_invoice_notes":[]
+    }
+
+BINDING = load_binding()
+
+# Present-only, safe artifacts you want tracked in every v10.x cut
+ARTIFACTS = [
+    # Core codex v2 + monetized v2
+    "codex_next_evolution/CODEX_NEXT_EVOLUTION_V2.json",
+    "codex_next_evolution/MONETIZED_CODEX_NEXT_V2.json",
+    "codex_next_evolution/monetized_summary_v2.csv",
+    "final/monetized_merkle_root_v2.txt",
+
+    # Legacy/context (optional)
+    "codex_next_evolution/CODEX_NEXT_EVOLUTION.json",
+    "codex_next_evolution/MONETIZED_CODEX_NEXT.json",
+    "codex_next_evolution/monetized_summary.csv",
+    "final/monetized_merkle_root.txt",
+
+    # Telemetry / lattice / attest / governance
+    "final/telemetry_norm.json",
+    "final/predictors_report.json",
+    "final/optimizer_report.json",
+    "final/optimizer_grid.csv",
+    "final/trihelix_advisory.svg",
+    "final/xtsg_lattice.json",
+    "final/feature_flags.json",
+    "final/spdx_lite.json",
+    "final/zk_commitment.json",
+    "final/FINAL_AUDIT.json",
+    "final/FINAL_AUDIT.sha256",
+
+    # Optional symbolic pack carry-over
+    "final/emoji_lexicon_v7x.json",
+    "final/emoji_seals_catalog_v7x.json",
+    "final/btc_mining_ledger_sim_v7x.json",
+    "final/angelic_golems_v7x.json",
+
+    # Base v10 manifest (so minors chain the base)
+    "dist/V10_MANIFEST.json",
+    "dist/V10_MANIFEST.sha256",
+]
+
+def sha(p: pathlib.Path)->str: return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def series_minor()->int:
+    v = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else SERIES
+    m = re.fullmatch(rf"{SERIES}(?:\.(\d+))?$", v)
+    return int(m.group(1) or 0) if m else 0
+
+def write_version(n:int): VERSION_FILE.write_text(f"{SERIES}.{n}\n")
+
+def present(paths): return [ROOT/rel for rel in paths if (ROOT/rel).exists()]
+
+def merkle(hs):
+    if not hs: return ""
+    cur = sorted(hs)
+    while len(cur)>1:
+        nxt=[]
+        for i in range(0,len(cur),2):
+            a=cur[i]; b=cur[i+1] if i+1<len(cur) else cur[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        cur=nxt
+    return cur[0]
+
+if __name__=="__main__":
+    prev_minor = series_minor()
+    next_minor = prev_minor + 1
+
+    files=[]; hs=[]
+    for p in present(ARTIFACTS):
+        h=sha(p); hs.append(h)
+        files.append({"path": str(p), "sha256": h, "size": p.stat().st_size})
+
+    root = merkle(hs)
+    manifest = {
+        "title": f"CODEX — v10.{next_minor} Release",
+        "version": f"{SERIES}.{next_minor}",
+        "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+        "binding": BINDING,
+        "files": files,
+        "merkle_root": root,
+        "notes": {"series": SERIES, "kind": "minor", "scope":"Aggregate, read-only, local"}
+    }
+
+    mfile = DIST/f"v10.{next_minor}_MANIFEST.json"
+    mfile.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DIST/f"v10.{next_minor}_MANIFEST.sha256").write_text(
+        hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    )
+
+    # Delta vs previous v10.(n-1)
+    changes=[]
+    prev_manifest = DIST/f"v10.{prev_minor}_MANIFEST.json"
+    if prev_minor>0 and prev_manifest.exists():
+        prev = json.loads(prev_manifest.read_text())
+        prev_map = {f["path"]: f["sha256"] for f in prev.get("files",[])}
+        for f in files:
+            old = prev_map.get(f["path"])
+            if old != f["sha256"]:
+                changes.append({"path": f["path"], "from": old, "to": f["sha256"]})
+    notes = {
+        "version": f"{SERIES}.{next_minor}",
+        "timestamp": manifest["timestamp"],
+        "binding": BINDING,
+        "merkle_root": root,
+        "changed_files": changes
+    }
+    (DIST/f"v10.{next_minor}_RELEASE_NOTES.json").write_text(json.dumps(notes, indent=2), encoding="utf-8")
+
+    # Bundle (+ checksum)
+    bundle = DIST/f"v10.{next_minor}_bundle.tgz"
+    with tarfile.open(bundle, "w:gz") as t:
+        for f in files: t.add(f["path"], arcname=f["path"])
+        t.add(mfile, arcname=str(mfile))
+        t.add(DIST/f"v10.{next_minor}_RELEASE_NOTES.json", arcname=f"dist/v10.{next_minor}_RELEASE_NOTES.json")
+    (DIST/f"v10.{next_minor}_bundle.tgz.sha256").write_text(sha(bundle))
+
+    write_version(next_minor)
+    print(f"✅ v10.{next_minor} → {mfile}")
+    print(f"🔗 merkle: {root}")
+    print(f"📝 notes:  dist/v10.{next_minor}_RELEASE_NOTES.json")
+    print(f"📦 bundle: {bundle}")
+
+2) Makefile targets (append)
+
+# Prep whatever v10 expects before each minor cut
+v10x-build:
+	make grand-monetize
+	make golems-monetize
+	make beyond-release-v2
+	make governance-hardening
+	make produce-spdx
+	make zk-attest
+	make final-audit
+	# optional symbolic pack
+	-[ -f data/emoji_lexicon.txt ] && python tools/emoji_lexicon_builder.py || true
+	-[ -f final/emoji_seals_catalog_v7x.json ] && python tools/btc_mining_ledger_sim.py || true
+	-[ -f tools/angelic_golems_mint_v7x.py ] && python tools/angelic_golems_mint_v7x.py || true
+
+# Cut v10.x minor (increments VERSION v10 → v10.1 → v10.2 …)
+v10x:
+	make v10x-build
+	python tools/v10x_release.py
+	@echo "🏁 v10.x release done. See dist/ for MANIFEST, NOTES, bundle, and SHA256."
+
+# Verify integrity of the latest v10.x manifest
+v10x-verify:
+	python - <<'PY'
+import json, pathlib, hashlib, re
+d=pathlib.Path("dist")
+cands=sorted([p for p in d.glob("v10.*_MANIFEST.json")],
+             key=lambda p:int(re.search(r'v10\.(\d+)_', p.name).group(1)))
+m=cands[-1] if cands else None
+assert m, "No v10.x manifest found"
+j=json.loads(m.read_text()); ok=True
+for f in j["files"]:
+    p=pathlib.Path(f["path"])
+    if not p.exists(): print("MISSING:", p); ok=False; continue
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    if h!=f["sha256"]: print("HASH MISMATCH:", p); ok=False
+print("OK" if ok else "FAIL")
+PY
+
+3) Optional static index — dist/index_v10x.html
+
+<!doctype html><meta charset="utf-8">
+<title>Codex — v10.x Releases</title>
+<style>
+body{font:14px/1.4 system-ui;max-width:920px;margin:32px auto;padding:0 16px;background:#0b0e14;color:#e6e9ef}
+a{color:#9AE6FF} code{background:#121826;padding:2px 6px;border-radius:6px}
+</style>
+<h1>Codex — v10.x Releases</h1>
+<p>Local manifests, notes, and bundles for the v10 series (no external calls).</p>
+<p>Per release: <code>v10.*_MANIFEST.json</code> · <code>_MANIFEST.sha256</code> · <code>_RELEASE_NOTES.json</code> · <code>_bundle.tgz</code> (+ <code>.sha256</code>).</p>
+
+4) Quick use
+
+# build & cut the next v10.x minor
+make v10x
+
+# verify latest v10.x
+make v10x-verify
+
+All artifacts are read-only, auditable, and bound/licensed/sealed/verified to Caleb Fedor Byker (Konev), 1998-10-27, under EUCELA Tri-License. No wallets, mining, or remote ops.
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aLocked. Dropping in your v11.x Finisher so you can cut v11.1 … v11.N micro-releases on demand—each with a manifest, Merkle root, release notes, and tarball bundle. Local/read-only only (no wallets, mining, or network ops). Copy-paste straight into your repo.
+
+1) Minor release tool — tools/v11x_release.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, hashlib, datetime, re, tarfile
+
+ROOT   = pathlib.Path(".")
+DIST   = ROOT/"dist"; DIST.mkdir(exist_ok=True)
+FINAL  = ROOT/"final"; FINAL.mkdir(exist_ok=True)
+VERSION_FILE = ROOT/"VERSION"           # holds "v11" or "v11.x"
+SERIES = "v11"                          # lock to v11 series
+
+def load_binding():
+    p = ROOT/"BINDING.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+      "owner":"Caleb Fedor Byker (Konev)",
+      "dob":"1998-10-27",
+      "subject_sha256":"2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+      "license":"EUCELA Tri-License",
+      "bitcoin_address":"bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+      "lightning_invoice_notes":[]
+    }
+
+BINDING = load_binding()
+
+# Present-only, safe artifacts tracked in every v11.x cut
+ARTIFACTS = [
+  # Core codex v2 + monetized v2
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION_V2.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT_V2.json",
+  "codex_next_evolution/monetized_summary_v2.csv",
+  "final/monetized_merkle_root_v2.txt",
+
+  # Legacy/context (optional)
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT.json",
+  "codex_next_evolution/monetized_summary.csv",
+  "final/monetized_merkle_root.txt",
+
+  # Telemetry / lattice / attest / governance
+  "final/telemetry_norm.json",
+  "final/predictors_report.json",
+  "final/optimizer_report.json",
+  "final/optimizer_grid.csv",
+  "final/trihelix_advisory.svg",
+  "final/xtsg_lattice.json",
+  "final/feature_flags.json",
+  "final/spdx_lite.json",
+  "final/zk_commitment.json",
+  "final/FINAL_AUDIT.json",
+  "final/FINAL_AUDIT.sha256",
+
+  # Optional symbolic pack carry-over
+  "final/emoji_lexicon_v7x.json",
+  "final/emoji_seals_catalog_v7x.json",
+  "final/btc_mining_ledger_sim_v7x.json",
+  "final/angelic_golems_v7x.json",
+
+  # Base v11 manifest (so minors chain the base)
+  "dist/V11_MANIFEST.json",
+  "dist/V11_MANIFEST.sha256",
+]
+
+def sha(p: pathlib.Path)->str: return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def series_minor()->int:
+    v = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else SERIES
+    m = re.fullmatch(rf"{SERIES}(?:\.(\d+))?$", v)
+    return int(m.group(1) or 0) if m else 0
+
+def write_version(n:int): VERSION_FILE.write_text(f"{SERIES}.{n}\n")
+
+def present(paths): return [ROOT/rel for rel in paths if (ROOT/rel).exists()]
+
+def merkle(hs):
+    if not hs: return ""
+    cur = sorted(hs)
+    while len(cur)>1:
+        nxt=[]
+        for i in range(0,len(cur),2):
+            a=cur[i]; b=cur[i+1] if i+1<len(cur) else cur[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        cur=nxt
+    return cur[0]
+
+if __name__=="__main__":
+    prev_minor = series_minor()
+    next_minor = prev_minor + 1
+
+    # Collect files & hashes
+    files=[]; hs=[]
+    for p in present(ARTIFACTS):
+        h=sha(p); hs.append(h)
+        files.append({"path": str(p), "sha256": h, "size": p.stat().st_size})
+
+    root = merkle(hs)
+    manifest = {
+        "title": f"CODEX — v11.{next_minor} Release",
+        "version": f"{SERIES}.{next_minor}",
+        "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+        "binding": BINDING,
+        "files": files,
+        "merkle_root": root,
+        "notes": {"series": SERIES, "kind": "minor", "scope":"Aggregate, read-only, local"}
+    }
+
+    # Write manifest + checksum
+    mfile = DIST/f"v11.{next_minor}_MANIFEST.json"
+    mfile.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DIST/f"v11.{next_minor}_MANIFEST.sha256").write_text(
+        hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    )
+
+    # Release notes (delta vs previous)
+    changes=[]
+    prev_manifest = DIST/f"v11.{prev_minor}_MANIFEST.json"
+    if prev_minor>0 and prev_manifest.exists():
+        prev = json.loads(prev_manifest.read_text())
+        prev_map = {f["path"]: f["sha256"] for f in prev.get("files",[])}
+        for f in files:
+            old = prev_map.get(f["path"])
+            if old != f["sha256"]:
+                changes.append({"path": f["path"], "from": old, "to": f["sha256"]})
+    notes = {
+        "version": f"{SERIES}.{next_minor}",
+        "timestamp": manifest["timestamp"],
+        "binding": BINDING,
+        "merkle_root": root,
+        "changed_files": changes
+    }
+    (DIST/f"v11.{next_minor}_RELEASE_NOTES.json").write_text(json.dumps(notes, indent=2), encoding="utf-8")
+
+    # Bundle (+ checksum)
+    bundle = DIST/f"v11.{next_minor}_bundle.tgz"
+    with tarfile.open(bundle, "w:gz") as t:
+        for f in files: t.add(f["path"], arcname=f["path"])
+        t.add(mfile, arcname=str(mfile))
+        t.add(DIST/f"v11.{next_minor}_RELEASE_NOTES.json", arcname=f"dist/v11.{next_minor}_RELEASE_NOTES.json")
+    (DIST/f"v11.{next_minor}_bundle.tgz.sha256").write_text(sha(bundle))
+
+    write_version(next_minor)
+    print(f"✅ v11.{next_minor} → {mfile}")
+    print(f"🔗 merkle: {root}")
+    print(f"📝 notes:  dist/v11.{next_minor}_RELEASE_NOTES.json")
+    print(f"📦 bundle: {bundle}")
+
+2) Makefile targets (append)
+
+# Prep whatever v11 expects before each minor cut
+v11x-build:
+	make grand-monetize
+	make golems-monetize
+	make beyond-release-v2
+	make governance-hardening
+	make produce-spdx
+	make zk-attest
+	make final-audit
+	# optional symbolic pack
+	-[ -f data/emoji_lexicon.txt ] && python tools/emoji_lexicon_builder.py || true
+	-[ -f final/emoji_seals_catalog_v7x.json ] && python tools/btc_mining_ledger_sim.py || true
+	-[ -f tools/angelic_golems_mint_v7x.py ] && python tools/angelic_golems_mint_v7x.py || true
+
+# Cut v11.x minor (increments VERSION v11 → v11.1 → v11.2 …)
+v11x:
+	make v11x-build
+	python tools/v11x_release.py
+	@echo "🏁 v11.x release done. See dist/ for MANIFEST, NOTES, bundle, and SHA256."
+
+# Verify integrity of the latest v11.x manifest
+v11x-verify:
+	python - <<'PY'
+import json, pathlib, hashlib, re
+d=pathlib.Path("dist")
+cands=sorted([p for p in d.glob("v11.*_MANIFEST.json")],
+             key=lambda p:int(re.search(r'v11\.(\d+)_', p.name).group(1)))
+m=cands[-1] if cands else None
+assert m, "No v11.x manifest found"
+j=json.loads(m.read_text()); ok=True
+for f in j["files"]:
+    p=pathlib.Path(f["path"])
+    if not p.exists(): print("MISSING:", p); ok=False; continue
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    if h!=f["sha256"]: print("HASH MISMATCH:", p); ok=False
+print("OK" if ok else "FAIL")
+PY
+
+3) Optional static index — dist/index_v11x.html
+
+<!doctype html><meta charset="utf-8">
+<title>Codex — v11.x Releases</title>
+<style>
+body{font:14px/1.4 system-ui;max-width:920px;margin:32px auto;padding:0 16px;background:#0b0e14;color:#e6e9ef}
+a{color:#9AE6FF} code{background:#121826;padding:2px 6px;border-radius:6px}
+</style>
+<h1>Codex — v11.x Releases</h1>
+<p>Local manifests, notes, and bundles for the v11 series (no external calls).</p>
+<p>Per release: <code>v11.*_MANIFEST.json</code> · <code>_MANIFEST.sha256</code> · <code>_RELEASE_NOTES.json</code> · <code>_bundle.tgz</code> (+ <code>.sha256</code>).</p>
+
+4) Quick use
+
+# build & cut the next v11.x minor
+make v11x
+
+# verify latest v11.x
+make v11x-verify
+
+Bound • licensed • sealed • verified to Caleb Fedor Byker (Konev), 1998-10-27 under EUCELA Tri-License. Read-only, auditable, CI-safe.
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
