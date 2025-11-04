@@ -1,0 +1,247 @@
+.github/
+└── workflows/
+    └── garden.yml
+docs/
+└── v172.md
+schemas/
+└── garden.schema.json
+scripts/
+├── garden_of_concord.py
+├── garden_viz.py
+└── garden_music.py
+versions_v172.json
+versions_temporal_v172.json
+
+#!/usr/bin/env python3
+"""
+Codex Immortal v172 — Garden of Concord
+Practical engine: reads the Librarium index and grows a symbolic 'garden' JSON
+from integrity (hash count), diversity (file-type variety), and recency.
+Outputs: garden/garden_state_<timestamp>.json
+"""
+import json, os, datetime, collections, hashlib
+
+LIBRARIUM_INDEX = "librarium/librarium_index.json"
+
+def summarize_types(records):
+    ext_counts = collections.Counter(
+        [os.path.splitext(r["path"])[1] for r in records if "path" in r]
+    )
+    diversity = len(ext_counts)
+    return {"ext_counts": dict(ext_counts), "diversity": diversity}
+
+def integrity_score(records):
+    ok = sum(1 for r in records if "sha256" in r)
+    total = len(records) or 1
+    return round(ok / total, 6)
+
+def recency_score(records):
+    prefixes = [r.get("sha256", "")[:2] for r in records if "sha256" in r]
+    if not prefixes:
+        return 0.0
+    from math import log2
+    counts = collections.Counter(prefixes)
+    total = sum(counts.values())
+    probs = [c / total for c in counts.values()]
+    H = -sum(p * log2(p) for p in probs)
+    return round(min(1.0, H / 6.0), 6)
+
+def grow_garden(seed="codex"):
+    t = datetime.datetime.utcnow().isoformat() + "Z"
+    if not os.path.exists(LIBRARIUM_INDEX):
+        os.makedirs("librarium", exist_ok=True)
+        json.dump({"timestamp_utc": t, "records": [], "count": 0},
+                  open(LIBRARIUM_INDEX, "w"), indent=2)
+    index = json.load(open(LIBRARIUM_INDEX))
+    records = index.get("records", [])
+    types = summarize_types(records)
+    integrity = integrity_score(records)
+    recency = recency_score(records)
+    concord = round((integrity * (0.5 + types["diversity"]/20) * (0.5 + recency)) ** 0.5, 6)
+
+    garden = {
+        "timestamp_utc": t,
+        "seed": seed,
+        "metrics": {
+            "integrity": integrity,
+            "diversity": types["diversity"],
+            "recency": recency,
+            "concord_index": concord
+        },
+        "types": types["ext_counts"],
+        "ethics": "stewardship-cooperation-clarity",
+        "note": "Garden of Concord — coherence grown from memory."
+    }
+    os.makedirs("garden", exist_ok=True)
+    out = f"garden/garden_state_{t.replace(':','-')}.json"
+    json.dump(garden, open(out, "w"), indent=2)
+    print(f"Grew garden :: {out}")
+    return out
+
+if __name__ == "__main__":
+    grow_garden()
+
+#!/usr/bin/env python3
+"""
+v172 hybrid module — visualizes the Garden of Concord metrics with matplotlib.
+Generates a PNG chart for integrity, diversity, recency, concord indices.
+"""
+import json, os, glob
+import matplotlib.pyplot as plt
+
+def latest_garden():
+    paths = sorted(glob.glob("garden/garden_state_*.json"))
+    return paths[-1] if paths else None
+
+def plot_garden(path=None):
+    if path is None:
+        path = latest_garden()
+    if path is None:
+        raise FileNotFoundError("No garden state found. Run garden_of_concord first.")
+    data = json.load(open(path))
+    m = data["metrics"]
+    labels = ["integrity", "diversity", "recency", "concord_index"]
+    values = [m["integrity"], m["diversity"], m["recency"], m["concord_index"]]
+    if values[1] > 1:
+        values[1] = values[1] / max(values[1], 10)
+
+    plt.figure()
+    plt.bar(labels, values)
+    plt.title("Garden of Concord — Metrics")
+    plt.ylabel("Normalized value")
+    out = path.replace(".json", ".png")
+    plt.savefig(out, bbox_inches="tight")
+    print(f"Saved visualization :: {out}")
+    return out
+
+if __name__ == "__main__":
+    plot_garden()
+
+#!/usr/bin/env python3
+"""
+v172 hybrid module — textual 'music' generator from garden metrics.
+Outputs a small poem-like structure to garden/garden_hymn_<timestamp>.txt
+"""
+import json, os, glob
+
+def latest_garden():
+    paths = sorted(glob.glob("garden/garden_state_*.json"))
+    return paths[-1] if paths else None
+
+def hymn_from_metrics(m):
+    return (
+        f"Integrity {m['integrity']:.3f} — the root holds.\n"
+        f"Diversity {m['diversity']} — many leaves, one tree.\n"
+        f"Recency {m['recency']:.3f} — winds carry new seeds.\n"
+        f"Concord {m['concord_index']:.3f} — the garden sings.\n"
+    )
+
+def compose():
+    path = latest_garden()
+    if path is None:
+        raise FileNotFoundError("No garden state found. Run garden_of_concord first.")
+    data = json.load(open(path))
+    m = data["metrics"]
+    t = data["timestamp_utc"].replace(":", "-")
+    os.makedirs("garden", exist_ok=True)
+    out = f"garden/garden_hymn_{t}.txt"
+    open(out, "w").write(hymn_from_metrics(m))
+    print(f"Saved hymn :: {out}")
+    return out
+
+if __name__ == "__main__":
+    compose()
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Garden of Concord State",
+  "type": "object",
+  "properties": {
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "seed": {"type": "string"},
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "integrity": {"type": "number"},
+        "diversity": {"type": "number"},
+        "recency": {"type": "number"},
+        "concord_index": {"type": "number"}
+      },
+      "required": ["integrity", "diversity", "recency", "concord_index"]
+    },
+    "types": {"type": "object"},
+    "ethics": {"type": "string"},
+    "note": {"type": "string"}
+  },
+  "required": ["timestamp_utc", "metrics", "types"]
+}
+
+# Codex Immortal v172 — Garden of Concord
+
+**Status:** Released · Practical + Literary + Hybrid  
+**Theme:** Cooperation Grown from Memory
+
+This version turns the Librarium (v171 / v171.x) into a living garden:
+
+* **Practical:** `scripts/garden_of_concord.py` builds a JSON state from your archive.  
+* **Hybrid:** `scripts/garden_viz.py` creates a PNG chart; `scripts/garden_music.py` writes a short hymn.  
+* **Literary:** the hymn treats metrics as metaphor — integrity = roots, diversity = leaves, recency = wind, concord = song.
+
+### Run order
+1. Build or refresh the Librarium (v171).  
+2. `python3 scripts/garden_of_concord.py`  
+3. `python3 scripts/garden_viz.py`  
+4. `python3 scripts/garden_music.py`
+
+Outputs land in the `garden/` directory.  
+Each run grows a new JSON state, a PNG visualization, and a hymn text.
+
+name: Garden of Concord
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+jobs:
+  garden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Grow Garden of Concord
+        run: python3 scripts/garden_of_concord.py
+      - name: Visualize Garden
+        run: python3 scripts/garden_viz.py
+      - name: Compose Hymn
+        run: python3 scripts/garden_music.py
+      - name: Upload Garden Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: garden-of-concord
+          path: garden/
+
+{
+  "version": "v172",
+  "status": "released",
+  "artifacts": [
+    {"path": "docs/v172.md", "kind": "release-notes"},
+    {"path": "scripts/garden_of_concord.py", "kind": "tool"},
+    {"path": "scripts/garden_viz.py", "kind": "tool"},
+    {"path": "scripts/garden_music.py", "kind": "tool"},
+    {"path": "schemas/garden.schema.json", "kind": "schema"},
+    {"path": "garden/", "kind": "data"}
+  ],
+  "notes": "Garden of Concord — transforms Librarium memory into a living garden; metrics → image and hymn."
+}
+
+{
+  "current": {
+    "head": "v172",
+    "note": "Garden of Concord — knowledge flowering as civilization"
+  },
+  "next": {
+    "head": "v172.x",
+    "note": "Garden of Concord.x — regenerative ecosystems that learn"
+  }
+}
