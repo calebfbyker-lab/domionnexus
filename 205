@@ -1,0 +1,665 @@
+# Build v205 — "Codex Logos Γ (Gamma): Governance, Grants & Compliance"
+# Repo: codex_v205_gamma_governance
+# Adds: roles/permissions, proposals & voting (quadratic), grants engine (ties to treasury),
+# attestations (HMAC-SHA256 signatures), compliance checks, API (port 8819), CI, Docker, tests, manifest, ZIP.
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v205_gamma_governance"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ----- Directories
+for d in [
+    ".github/workflows","codex/utils","codex/economy","codex/telemetry","codex/policy",
+    "codex/treasury","codex/governance","codex/grants","codex/attest",
+    "dashboard","deploy","docs","scripts","tests"
+]:
+    os.makedirs(os.path.join(BASE,d), exist_ok=True)
+
+# ----- Utils & config
+W("codex/utils/crypto.py","""import hashlib, hmac, json, time, base64
+sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()
+sha256_json=lambda o: sha256_bytes(json.dumps(o, sort_keys=True).encode())
+def hmac_sha256(key:bytes, msg:bytes)->str: return hmac.new(key, msg, hashlib.sha256).hexdigest()
+b64=lambda b: base64.b64encode(b).decode()
+now=lambda: int(time.time())
+""")
+W("codex/config.json", json.dumps({
+  "version": "v205-gamma",
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice": "lnbc1p5s0ppfdqdgdshx6pqg9c8qpp5nx5xppwrv42qxgxal55fv43ep7uscv3n4t0jj65cpnmq9t5cp9hqsp5662c050wmnwfdd40pcgafc60dss5nfg6gchv566lx0zdlq4jnrgs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zqwgcqqdwqqqqqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwz4wh5qqzqsqquqqqqqqqqqqqqqq9gu82fczxfmc5c6uvxlp6jeyvjdtuddy9km06lmsq9e35j7xn3cthhx2jtua69a3hlktx77tccqttvmrp9xt3408jqlks8szual5p9d6spqwppcn",
+  "price_per_unit_governance": 55.0,
+  "virtue_floor": 0.9,
+  "governance_secret": "codex-governance-secret-key",
+  "quorum": 0.2,
+  "pass_threshold": 0.6
+}, indent=2))
+W("codex/config.py","import json\nCONFIG=json.load(open('codex/config.json'))\n")
+
+# ----- Economy & Telemetry
+W("codex/economy/ledger.jsonl","")
+W("codex/economy/ledger.py","""import json, time, os
+class Ledger:
+    def __init__(self, path='codex/economy/ledger.jsonl'):
+        self.path=path; os.makedirs(os.path.dirname(path), exist_ok=True)
+    def record(self, actor, event, signal, clarity, virtue=1.0, revenue=0.0, note=None, tags=None):
+        tx={'ts':time.time(),'actor':actor,'event':event,'signal':signal,'clarity':clarity,'virtue':virtue,'revenue':revenue,'note':note,'tags':tags or []}
+        with open(self.path,'a',encoding='utf-8') as f: f.write(json.dumps(tx)+'\\n')
+        return tx
+LEDGER=Ledger()
+""")
+W("codex/telemetry/signals.jsonl","")
+W("codex/telemetry/telemetry.py","""import json, time, os
+from codex.economy.ledger import LEDGER
+from codex.config import CONFIG
+PATH='codex/telemetry/signals.jsonl'
+os.makedirs('codex/telemetry', exist_ok=True)
+def emit(name:str,payload:dict,clarity:float=1.0,virtue:float=0.95,tags=None):
+    sig={'ts':time.time(),'name':name,'payload':payload,'clarity':clarity,'virtue':virtue,'tags':tags or []}
+    open(PATH,'a',encoding='utf-8').write(json.dumps(sig)+'\\n')
+    revenue=clarity*CONFIG.get('price_per_unit_governance',55.0)
+    LEDGER.record('telemetry',name,signal=1.0,clarity=clarity,virtue=virtue,revenue=revenue,note=name,tags=tags)
+    return sig
+""")
+
+# ----- Policy (compliance lint for intents)
+W("codex/policy/guard.py","""DENY=['forbidden','illegal','exploit']
+REQUIRE=['ethical','compliant','aligned']
+def check(intent:str)->dict:
+    i=intent.lower()
+    for t in DENY:
+        if t in i: return {'ok':False,'reason':t}
+    ok=any(r in i for r in REQUIRE)
+    return {'ok':ok,'reason':None if ok else 'missing_alignment_terms'}
+""")
+
+# ----- Treasury minimal (for grants disbursement)
+W("codex/treasury/accounts.py","""from dataclasses import dataclass
+from typing import Dict
+@dataclass
+class Account:
+    balance:float=0.0
+class Treasury:
+    def __init__(self): self.accts:Dict[str,Account]={}
+    def ensure(self, who:str): self.accts.setdefault(who, Account()); return self.accts[who]
+    def credit(self, who:str, amt:float): a=self.ensure(who); a.balance+=amt; return {'ok':True,'balance':a.balance}
+    def debit(self, who:str, amt:float): a=self.ensure(who); 
+        if a.balance<amt: return {'ok':False,'error':'insufficient'}
+        a.balance-=amt; return {'ok':True,'balance':a.balance}
+    def status(self, who:str): a=self.ensure(who); return {'who':who,'balance':a.balance}
+TREASURY=Treasury()
+""")
+
+# ----- Governance: roles & ACL
+W("codex/governance/roles.py","""ROLES={'admin':set(),'council':set(),'member':set()}
+PERMS={
+  'propose': {'admin','council','member'},
+  'vote':    {'admin','council','member'},
+  'grant':   {'admin','council'},
+  'assign':  {'admin'}
+}
+def add_role(user:str, role:str):
+    ROLES.setdefault(role,set()).add(user); return {'ok':True,'role':role,'user':user}
+def has_perm(user:str, perm:str)->bool:
+    allowed=PERMS.get(perm,set())
+    return any(user in ROLES.get(r,set()) for r in allowed)
+def whois(user:str):
+    return {'user':user,'roles':[r for r,s in ROLES.items() if user in s]}
+""")
+
+# ----- Governance: proposals & voting (quadratic)
+W("codex/governance/proposals.py","""import math, time, uuid
+PROPOSALS={}
+VOTES={}
+def create(author:str, title:str, text:str)->dict:
+    pid=str(uuid.uuid4())
+    PROPOSALS[pid]={'id':pid,'author':author,'title':title,'text':text,'created':time.time(),'closed':False}
+    VOTES[pid]={}
+    return {'ok':True,'id':pid}
+def vote(pid:str, voter:str, weight:float)->dict:
+    if pid not in PROPOSALS or PROPOSALS[pid]['closed']: return {'ok':False,'error':'not_open'}
+    VOTES[pid][voter]=max(0.0, float(weight))
+    return tally(pid)
+def close(pid:str)->dict:
+    if pid in PROPOSALS: PROPOSALS[pid]['closed']=True
+    return tally(pid)
+def tally(pid:str)->dict:
+    w=VOTES.get(pid,{})
+    # Quadratic voting: influence = sqrt(weight)
+    yes=sum(math.sqrt(v) for v in w.values())
+    total=yes  # simple yes-only for brevity; extend with no/abstain if needed
+    return {'ok':True,'pid':pid,'yes_influence':round(yes,6),'voters':len(w),'closed':PROPOSALS.get(pid,{}).get('closed',False)}
+""")
+
+# ----- Grants: quadratic funding from proposals
+W("codex/grants/engine.py","""from codex.treasury.accounts import TREASURY
+from codex.governance.proposals import tally, PROPOSALS
+def allocate(pid:str, pool:float, recipients:dict)->dict:
+    # recipients: {user: vote_weight}; use sqrt weights to split pool
+    import math
+    if pid not in PROPOSALS: return {'ok':False,'error':'unknown_proposal'}
+    roots={u: math.sqrt(max(0.0,w)) for u,w in recipients.items()}
+    s=sum(roots.values()) or 1.0
+    dist={u: pool*(r/s) for u,r in roots.items()}
+    for u,amt in dist.items(): TREASURY.credit(u, amt)
+    return {'ok':True,'pid':pid,'pool':pool,'distribution':{u:round(a,6) for u,a in dist.items()}}
+""")
+
+# ----- Attestations (HMAC-SHA256 signatures)
+W("codex/attest/sign.py","""from codex.utils.crypto import hmac_sha256
+from codex.config import CONFIG
+def sign(message:dict)->str:
+    import json
+    key=CONFIG.get('governance_secret','codex-secret').encode()
+    return hmac_sha256(key, json.dumps(message, sort_keys=True).encode())
+def verify(message:dict, signature:str)->bool:
+    return sign(message)==signature
+""")
+
+# ----- Dashboard API (port 8819)
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.policy.guard import check
+from codex.governance.roles import add_role, whois, has_perm
+from codex.governance.proposals import create as p_create, vote as p_vote, close as p_close, PROPOSALS, VOTES, tally as p_tally
+from codex.grants.engine import allocate
+from codex.treasury.accounts import TREASURY
+from codex.attest.sign import sign, verify
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path
+
+        if p=='/api/policy/check': return self._ok(check(body.get('intent','govern ethically')))
+
+        if p=='/api/role/add': return self._ok(add_role(body.get('user','cfbk'), body.get('role','member')))
+        if p=='/api/role/whois': return self._ok(whois(body.get('user','cfbk')))
+
+        if p=='/api/proposal/create':
+            if not has_perm(body.get('author','cfbk'), 'propose'): return self._ok({'ok':False,'error':'no_perm'})
+            return self._ok(p_create(body.get('author','cfbk'), body.get('title','Untitled'), body.get('text','')))
+
+        if p=='/api/proposal/vote':
+            if not has_perm(body.get('voter','cfbk'), 'vote'): return self._ok({'ok':False,'error':'no_perm'})
+            return self._ok(p_vote(body.get('pid',''), body.get('voter','cfbk'), float(body.get('weight',1.0))))
+
+        if p=='/api/proposal/close': return self._ok(p_close(body.get('pid','')))
+        if p=='/api/proposal/tally': return self._ok(p_tally(body.get('pid','')))
+
+        if p=='/api/grants/allocate':
+            if not has_perm(body.get('caller','cfbk'), 'grant'): return self._ok({'ok':False,'error':'no_perm'})
+            return self._ok(allocate(body.get('pid',''), float(body.get('pool',0.0)), body.get('recipients',{})))
+
+        if p=='/api/treasury/status': return self._ok(TREASURY.status(body.get('who','cfbk')))
+
+        if p=='/api/attest/sign': return self._ok({'sig': sign(body.get('message',{}))})
+        if p=='/api/attest/verify': return self._ok({'ok': verify(body.get('message',{}), body.get('sig',''))})
+
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=='/api/proposals': return self._ok({'proposals': list(PROPOSALS.values())})
+        if p=='/api/votes': return self._ok({k:list(v.keys()) for k,v in VOTES.items()})
+        if p=='/': return super().do_GET()
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8819)
+""")
+
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Γ — Governance, Grants & Compliance</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Γ — Governance • Grants • Compliance</h1>
+<div>
+  <button onclick="addRole()">Add Role</button>
+  <button onclick="whois()">Whois</button>
+  <button onclick="create()">Create Proposal</button>
+  <button onclick="vote()">Vote</button>
+  <button onclick="tally()">Tally</button>
+  <button onclick="closeP()">Close</button>
+  <button onclick="allocate()">Allocate Grant</button>
+  <button onclick="status()">Treasury Status</button>
+  <button onclick="listP()">List Proposals</button>
+  <button onclick="attest()">Attest</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function addRole(){ post('/api/role/add', {user:'cfbk', role:'council'}); }
+function whois(){ post('/api/role/whois', {user:'cfbk'}); }
+function create(){ post('/api/proposal/create', {author:'cfbk', title:'Fund Δ→Σ integrations', text:'Bridge modules & strategies.'}); }
+function vote(){ post('/api/proposal/vote', {pid:window.lastPid||'', voter:'cfbk', weight:9}); }
+function tally(){ post('/api/proposal/tally', {pid:window.lastPid||''}); }
+function closeP(){ post('/api/proposal/close', {pid:window.lastPid||''}); }
+function allocate(){ post('/api/grants/allocate', {caller:'cfbk', pid:window.lastPid||'', pool:100, recipients:{'cfbk':9,'ally':4}}); }
+function status(){ post('/api/treasury/status', {who:'cfbk'}); }
+function listP(){ get('/api/proposals'); }
+async function attest(){ const msg={purpose:'governance', ts:Date.now()}; const s=await (await fetch('/api/attest/sign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})})).json(); const v=await (await fetch('/api/attest/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,sig:s.sig})})).json(); document.getElementById('out').textContent=JSON.stringify({sig:s.sig, verify:v},null,2); }
+</script>
+</body></html>
+""")
+
+# ----- Docs, CI, Docker, Tests
+W("docs/v205_gamma.md", f"# v205 — Codex Logos Γ (Gamma): Governance, Grants & Compliance\nGenerated: {now}\nRun API: `python3 dashboard/api.py` (port 8819)\n")
+W(".github/workflows/ci.yml","""name: Codex Gamma CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Governance smoke
+        run: python3 - <<'PY'\nfrom codex.governance.roles import add_role, has_perm\nfrom codex.governance.proposals import create, vote, close\nadd_role('ci','admin')\np=create('ci','Test','Hello')\npid=p['id']\nprint(vote(pid,'ci',9))\nprint(close(pid))\nprint('perm propose?', has_perm('ci','propose'))\nPY
+""")
+W("deploy/Dockerfile","""FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8819\nCMD ["python3","dashboard/api.py"]\n""")
+W("tests/test_gamma.py","""from codex.governance.proposals import create, vote, tally\np=create('test','Gamma','Text'); pid=p['id']\nvote(pid,'test',4)\nr=tally(pid)\nassert r['ok'] and r['voters']>=1\nprint('gamma ok')\n""")
+
+# ----- Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ----- ZIP
+zip_path="/mnt/data/codex_v205_gamma_governance.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE) pi# Build v205.x — "Codex Logos Γ⁺ (Gamma Plus): Delegation, Snapshots & Compliance Flows"
+# Repo: codex_v205x_gamma_plus
+# Adds to v205: vote types (YES/NO/ABSTAIN), delegation, snapshots, simple Merkle receipts,
+# policy templates, compliance checklist, webhook events, JSON schemas, richer API (port 8820),
+# CI, Docker, tests, manifest, ZIP.
+
+import os, json, zipfile, hashlib, datetime, shutil, random
+
+BASE="/mnt/data/codex_v205x_gamma_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ----- Directories
+for d in [
+    ".github/workflows","codex/utils","codex/economy","codex/telemetry","codex/policy",
+    "codex/treasury","codex/governance","codex/grants","codex/attest","codex/audit",
+    "codex/snapshots","codex/webhooks","codex/schemas",
+    "dashboard","deploy","docs","scripts","tests"
+]:
+    os.makedirs(os.path.join(BASE,d), exist_ok=True)
+
+# ----- Utils & config
+W("codex/utils/crypto.py","""import hashlib, hmac, json, time, base64, math
+sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()
+sha256_json=lambda o: sha256_bytes(json.dumps(o, sort_keys=True).encode())
+def hmac_sha256(key:bytes, msg:bytes)->str: return hmac.new(key, msg, hashlib.sha256).hexdigest()
+b64=lambda b: base64.b64encode(b).decode()
+now=lambda: int(time.time())
+def merkle_root(items:list[str])->str:
+    if not items: return sha256_bytes(b'')
+    level=[bytes.fromhex(x) if all(c in '0123456789abcdef' for c in x) and len(x)==64 else hashlib.sha256(x.encode()).digest() for x in items]
+    while len(level)>1:
+        nxt=[]
+        for i in range(0,len(level),2):
+            a=level[i]; b=level[i+1] if i+1<len(level) else a
+            nxt.append(hashlib.sha256(a+b).digest())
+        level=nxt
+    return level[0].hex()
+""")
+W("codex/config.json", json.dumps({
+  "version": "v205.x-gamma-plus",
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice": "lnbc1p5s0ppfdqdgdshx6pqg9c8qpp5nx5xppwrv42qxgxal55fv43ep7uscv3n4t0jj65cpnmq9t5cp9hqsp5662c050wmnwfdd40pcgafc60dss5nfg6gchv566lx0zdlq4jnrgs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zqwgcqqdwqqqqqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwz4wh5qqzqsqquqqqqqqqqqqqqqq9gu82fczxfmc5c6uvxlp6jeyvjdtuddy9km06lmsq9e35j7xn3cthhx2jtua69a3hlktx77tccqttvmrp9xt3408jqlks8szual5p9d6spqwppcn",
+  "price_per_unit_governance": 55.0,
+  "virtue_floor": 0.9,
+  "governance_secret": "codex-governance-secret-key",
+  "quorum": 0.2,
+  "pass_threshold": 0.6
+}, indent=2))
+W("codex/config.py","import json\nCONFIG=json.load(open('codex/config.json'))\n")
+
+# ----- Economy & Telemetry
+W("codex/economy/ledger.jsonl","")
+W("codex/economy/ledger.py","""import json, time, os
+class Ledger:
+    def __init__(self, path='codex/economy/ledger.jsonl'):
+        self.path=path; os.makedirs(os.path.dirname(path), exist_ok=True)
+    def record(self, actor, event, signal, clarity, virtue=1.0, revenue=0.0, note=None, tags=None):
+        tx={'ts':time.time(),'actor':actor,'event':event,'signal':signal,'clarity':clarity,'virtue':virtue,'revenue':revenue,'note':note,'tags':tags or []}
+        with open(self.path,'a',encoding='utf-8') as f: f.write(json.dumps(tx)+'\\n')
+        return tx
+LEDGER=Ledger()
+""")
+W("codex/telemetry/signals.jsonl","")
+W("codex/telemetry/telemetry.py","""import json, time, os
+from codex.economy.ledger import LEDGER
+from codex.config import CONFIG
+PATH='codex/telemetry/signals.jsonl'
+os.makedirs('codex/telemetry', exist_ok=True)
+def emit(name:str,payload:dict,clarity:float=1.0,virtue:float=0.95,tags=None):
+    sig={'ts':time.time(),'name':name,'payload':payload,'clarity':clarity,'virtue':virtue,'tags':tags or []}
+    open(PATH,'a',encoding='utf-8').write(json.dumps(sig)+'\\n')
+    revenue=clarity*CONFIG.get('price_per_unit_governance',55.0)
+    LEDGER.record('telemetry',name,signal=1.0,clarity=clarity,virtue=virtue,revenue=revenue,note=name,tags=tags)
+    return sig
+""")
+
+# ----- Policy templates & checklists
+W("codex/policy/templates.py","""TEMPLATES={
+ 'simple_grant': {'require':['impact','budget','timeline'],'deny':['illegal']},
+ 'code_change': {'require':['tests','review','security'],'deny':['keys','secrets']}
+}
+def lint(template:str, doc:dict)->dict:
+    t=TEMPLATES.get(template, {'require':[],'deny':[]})
+    missing=[k for k in t['require'] if k not in doc]
+    banned=[k for k in t['deny'] if any(k in str(v).lower() for v in doc.values())]
+    return {'ok':not missing and not banned,'missing':missing,'banned':banned}
+""")
+
+# ----- Treasury stub (for link)
+W("codex/treasury/accounts.py","""from dataclasses import dataclass
+from typing import Dict
+@dataclass
+class Account: balance:float=0.0
+class Treasury:
+    def __init__(self): self.accts:Dict[str,Account]={}
+    def ensure(self, who:str): self.accts.setdefault(who, Account()); return self.accts[who]
+    def credit(self, who:str, amt:float): a=self.ensure(who); a.balance+=amt; return {'ok':True,'balance':a.balance}
+    def status(self, who:str): a=self.ensure(who); return {'who':who,'balance':a.balance}
+TREASURY=Treasury()
+""")
+
+# ----- Governance: roles & delegation
+W("codex/governance/roles.py","""ROLES={'admin':set(),'council':set(),'member':set()}
+DELEGATION={}  # voter -> delegate
+PERMS={'propose': {'admin','council','member'}, 'vote': {'admin','council','member'}, 'grant': {'admin','council'}, 'assign': {'admin'}}
+def add_role(user:str, role:str): ROLES.setdefault(role,set()).add(user); return {'ok':True,'role':role,'user':user}
+def has_perm(user:str, perm:str)->bool: return any(user in ROLES.get(r,set()) for r in PERMS.get(perm,set()))
+def whois(user:str): return {'user':user,'roles':[r for r,s in ROLES.items() if user in s],'delegate':DELEGATION.get(user)}
+def delegate(from_user:str, to_user:str): DELEGATION[from_user]=to_user; return {'ok':True,'from':from_user,'to':to_user}
+def resolve_voter(user:str)->str: return DELEGATION.get(user,user)
+""")
+
+# ----- Governance: proposals w/ YES/NO/ABSTAIN & quadratic
+W("codex/governance/proposals.py","""import math, time, uuid
+from codex.governance.roles import resolve_voter
+PROPOSALS={}
+VOTES={}  # pid -> voter -> {'choice':str,'weight':float}
+def create(author:str, title:str, text:str)->dict:
+    pid=str(uuid.uuid4())
+    PROPOSALS[pid]={'id':pid,'author':author,'title':title,'text':text,'created':time.time(),'closed':False}
+    VOTES[pid]={}; return {'ok':True,'id':pid}
+def vote(pid:str, voter:str, choice:str, weight:float)->dict:
+    if pid not in PROPOSALS or PROPOSALS[pid]['closed']: return {'ok':False,'error':'not_open'}
+    v=resolve_voter(voter)
+    choice=choice.upper()
+    if choice not in ('YES','NO','ABSTAIN'): return {'ok':False,'error':'bad_choice'}
+    VOTES[pid][v]={'choice':choice,'weight':max(0.0,float(weight))}
+    return tally(pid)
+def close(pid:str)->dict:
+    if pid in PROPOSALS: PROPOSALS[pid]['closed']=True
+    return tally(pid)
+def tally(pid:str)->dict:
+    w=VOTES.get(pid,{}); yes=no=abstain=0.0
+    for rec in w.values():
+        influence=math.sqrt(rec['weight'])
+        if rec['choice']=='YES': yes+=influence
+        elif rec['choice']=='NO': no+=influence
+        else: abstain+=influence
+    total=yes+no+abstain
+    decision='PENDING'
+    if PROPOSALS.get(pid,{}).get('closed',False):
+        decision='PASS' if yes>no else 'FAIL'
+    return {'ok':True,'pid':pid,'yes':round(yes,6),'no':round(no,6),'abstain':round(abstain,6),'total':round(total,6),'closed':PROPOSALS.get(pid,{}).get('closed',False),'decision':decision}
+""")
+
+# ----- Grants: distribution remains (example hook)
+W("codex/grants/engine.py","""from codex.treasury.accounts import TREASURY
+import math
+def allocate(pool:float, recipients:dict)->dict:
+    roots={u: math.sqrt(max(0.0,w)) for u,w in recipients.items()}
+    s=sum(roots.values()) or 1.0
+    dist={u: pool*(r/s) for u,r in roots.items()}
+    for u,amt in dist.items(): TREASURY.credit(u, amt)
+    return {'ok':True,'pool':pool,'distribution':{u:round(a,6) for u,a in dist.items()}}
+""")
+
+# ----- Attest + Snapshots (Merkle)
+W("codex/attest/sign.py","""from codex.utils.crypto import hmac_sha256
+from codex.config import CONFIG
+import json
+def sign(message:dict)->str:
+    key=CONFIG.get('governance_secret','codex-secret').encode()
+    return hmac_sha256(key, json.dumps(message, sort_keys=True).encode())
+def verify(message:dict, signature:str)->bool:
+    return sign(message)==signature
+""")
+W("codex/snapshots/snap.py","""import time, json
+from codex.utils.crypto import sha256_json, merkle_root
+SNAPSHOTS=[]  # list of {'ts','root','items'}
+def take(items:list[dict])->dict:
+    h=[sha256_json(i) for i in items]
+    root=merkle_root(h); s={'ts':time.time(),'root':root,'items':h}
+    SNAPSHOTS.append(s); return s
+def list_roots(): return [{'ts':s['ts'],'root':s['root']} for s in SNAPSHOTS]
+""")
+
+# ----- Webhooks
+W("codex/webhooks/bus.py","""EVT=[]
+def push(event:str, payload:dict): EVT.append({'event':event,'payload':payload}); return {'ok':True,'queued':len(EVT)}
+def drain(): out=list(EVT); EVT.clear(); return out
+""")
+
+# ----- Schemas
+W("codex/schemas/proposal.schema.json", json.dumps({
+  "$schema":"http://json-schema.org/draft-07/schema#",
+  "title":"Proposal",
+  "type":"object",
+  "properties":{"author":{"type":"string"},"title":{"type":"string"},"text":{"type":"string"}},
+  "required":["author","title","text"]
+}, indent=2))
+
+# ----- Audit (export helpers)
+W("codex/audit/export.py","""import csv, json, os
+def export_jsonl_to_csv(jsonl_path:str, csv_path:str):
+    rows=[]
+    if not os.path.exists(jsonl_path): 
+        open(csv_path,'w').close(); return {'ok':True,'rows':0}
+    with open(jsonl_path,encoding='utf-8') as f:
+        for ln in f:
+            try: rows.append(json.loads(ln))
+            except: pass
+    if not rows:
+        open(csv_path,'w').close(); return {'ok':True,'rows':0}
+    keys=sorted({k for r in rows for k in r.keys()})
+    with open(csv_path,'w',newline='',encoding='utf-8') as f:
+        w=csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(rows)
+    return {'ok':True,'rows':len(rows),'csv':csv_path}
+""")
+
+# ----- Dashboard API (port 8820)
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.governance.roles import add_role, whois, has_perm, delegate
+from codex.governance.proposals import create as p_create, vote as p_vote, close as p_close, PROPOSALS, VOTES, tally as p_tally
+from codex.grants.engine import allocate
+from codex.treasury.accounts import TREASURY
+from codex.attest.sign import sign, verify
+from codex.snapshots.snap import take as snap_take, list_roots
+from codex.policy.templates import lint as policy_lint
+from codex.webhooks.bus import push as wh_push, drain as wh_drain
+from codex.audit.export import export_jsonl_to_csv
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path
+
+        if p=='/api/role/add': return self._ok(add_role(body.get('user','cfbk'), body.get('role','member')))
+        if p=='/api/role/delegate': return self._ok(delegate(body.get('from','cfbk'), body.get('to','council')))
+        if p=='/api/role/whois': return self._ok(whois(body.get('user','cfbk')))
+
+        if p=='/api/proposal/create': return self._ok(p_create(body.get('author','cfbk'), body.get('title','Untitled'), body.get('text','')))
+        if p=='/api/proposal/vote': return self._ok(p_vote(body.get('pid',''), body.get('voter','cfbk'), body.get('choice','YES'), float(body.get('weight',1.0))))
+        if p=='/api/proposal/tally': return self._ok(p_tally(body.get('pid','')))
+        if p=='/api/proposal/close': return self._ok(p_close(body.get('pid','')))
+
+        if p=='/api/grants/allocate': return self._ok(allocate(float(body.get('pool',0.0)), body.get('recipients',{})))
+
+        if p=='/api/treasury/status': return self._ok(TREASURY.status(body.get('who','cfbk')))
+
+        if p=='/api/attest/sign': return self._ok({'sig': sign(body.get('message',{}))})
+        if p=='/api/attest/verify': return self._ok({'ok': verify(body.get('message',{}), body.get('sig',''))})
+
+        if p=='/api/snapshot/take': return self._ok(snap_take(body.get('items',[])))
+        if p=='/api/snapshot/list': return self._ok(list_roots())
+
+        if p=='/api/policy/lint': return self._ok(policy_lint(body.get('template','simple_grant'), body.get('doc',{})))
+
+        if p=='/api/webhook/push': return self._ok(wh_push(body.get('event','governance'), body.get('payload',{})))
+        if p=='/api/webhook/drain': return self._ok(wh_drain())
+
+        if p=='/api/audit/ledger_csv': return self._ok(export_jsonl_to_csv('codex/economy/ledger.jsonl','codex/audit/ledger.csv'))
+        if p=='/api/audit/telemetry_csv': return self._ok(export_jsonl_to_csv('codex/telemetry/signals.jsonl','codex/audit/telemetry.csv'))
+
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=='/api/proposals': return self._ok({'proposals': list(PROPOSALS.values())})
+        if p=='/api/votes': return self._ok({k:list(v.keys()) for k,v in VOTES.items()})
+        if p=='/': return super().do_GET()
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8820)
+""")
+
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Γ⁺ — Delegation, Snapshots & Compliance</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Γ⁺ — Delegation • Snapshots • Compliance</h1>
+<div>
+  <button onclick="addRole()">Add Role</button>
+  <button onclick="delegate()">Delegate</button>
+  <button onclick="create()">Create</button>
+  <button onclick="voteYes()">Vote YES</button>
+  <button onclick="voteNo()">Vote NO</button>
+  <button onclick="voteAbs()">Vote ABSTAIN</button>
+  <button onclick="tally()">Tally</button>
+  <button onclick="closeP()">Close</button>
+  <button onclick="snapshot()">Snapshot</button>
+  <button onclick="lint()">Lint Grant</button>
+  <button onclick="webhook()">Webhook Push</button>
+  <button onclick="drain()">Webhook Drain</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function addRole(){ post('/api/role/add', {user:'cfbk', role:'member'}); }
+function delegate(){ post('/api/role/delegate', {from:'ally', to:'cfbk'}); }
+function create(){ post('/api/proposal/create', {author:'cfbk', title:'Gamma Plus', text:'Delegation + snapshots + compliance'}); }
+function voteYes(){ post('/api/proposal/vote', {pid:'', voter:'ally', choice:'YES', weight:9}); }
+function voteNo(){ post('/api/proposal/vote', {pid:'', voter:'cfbk', choice:'NO', weight:4}); }
+function voteAbs(){ post('/api/proposal/vote', {pid:'', voter:'guest', choice:'ABSTAIN', weight:1}); }
+function tally(){ post('/api/proposal/tally', {pid:''}); }
+function closeP(){ post('/api/proposal/close', {pid:''}); }
+function snapshot(){ post('/api/snapshot/take', {items:[{a:1},{b:2},{c:3}]}); }
+function lint(){ post('/api/policy/lint', {template:'simple_grant', doc:{impact:'yes', budget:100, timeline:'Q1'}}); }
+function webhook(){ post('/api/webhook/push', {event:'proposal.tally', payload:{pid:'demo'}}); }
+function drain(){ post('/api/webhook/drain', {}); }
+</script>
+</body></html>
+""")
+
+# ----- Docs, CI, Docker, Tests
+W("docs/v205x_gamma_plus.md", f"# v205.x — Codex Logos Γ⁺ (Gamma Plus)\nGenerated: {now}\nRun API: `python3 dashboard/api.py` (port 8820)\n")
+W(".github/workflows/ci.yml","""name: Codex Gamma Plus CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delegation + vote + snapshot smoke
+        run: python3 - <<'PY'\nfrom codex.governance.roles import add_role, delegate\nfrom codex.governance.proposals import create, vote, tally, close\nfrom codex.snapshots.snap import take\nadd_role('ci','member'); delegate('ally','ci'); p=create('ci','Test','Text'); pid=p['id']\nprint(vote(pid,'ally','YES',9)); print(vote(pid,'ci','NO',4)); print(tally(pid)); print(close(pid))\nprint(take([{'x':1},{'y':2}]))\nPY
+""")
+W("deploy/Dockerfile","""FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8820\nCMD ["python3","dashboard/api.py"]\n""")
+W("tests/test_gamma_plus.py","""from codex.governance.proposals import create, vote, tally\np=create('test','Gamma+','Text'); pid=p['id']\nvote(pid,'test','YES',4)\nr=tally(pid)\nassert r['ok'] and r['total']>0\nprint('gamma-plus ok')\n""")
+
+# ----- Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ----- ZIP
+zip_path="/mnt/data/codex_v205x_gamma_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
