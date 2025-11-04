@@ -1,0 +1,891 @@
+# Build v204 — "Codex Logos Σ (Sigma Strategos): Orchestration, Strategy & Markets"
+# Repo: codex_v204_sigma_strategos
+# Adds: DAG engine, scheduler, strategy backtester, risk model, adapters (webhook/http),
+#       policy guardrails, API (port 8816), CI, Docker, tests, manifest, ZIP.
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v204_sigma_strategos"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ----- Directories
+for d in [
+    ".github/workflows","codex/utils","codex/economy","codex/telemetry","codex/policy",
+    "codex/graph","codex/scheduler","codex/strategy","codex/adapters",
+    "dashboard","deploy","docs","scripts","tests"
+]:
+    os.makedirs(os.path.join(BASE,d), exist_ok=True)
+
+# ----- Utils & config
+W("codex/utils/crypto.py","""import hashlib, json, time, base64
+sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()
+sha256_json=lambda o: sha256_bytes(json.dumps(o, sort_keys=True).encode())
+b64=lambda b: base64.b64encode(b).decode()
+now=lambda: int(time.time())
+""")
+W("codex/config.json", json.dumps({
+  "version": "v204-sigma",
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice": "lnbc1p5s0ppfdqdgdshx6pqg9c8qpp5nx5xppwrv42qxgxal55fv43ep7uscv3n4t0jj65cpnmq9t5cp9hqsp5662c050wmnwfdd40pcgafc60dss5nfg6gchv566lx0zdlq4jnrgs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zqwgcqqdwqqqqqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwz4wh5qqzqsqquqqqqqqqqqqqqqq9gu82fczxfmc5c6uvxlp6jeyvjdtuddy9km06lmsq9e35j7xn3cthhx2jtua69a3hlktx77tccqttvmrp9xt3408jqlks8szual5p9d6spqwppcn",
+  "price_per_unit_alpha": 42.0,
+  "virtue_floor": 0.8
+}, indent=2))
+W("codex/config.py","import json\nCONFIG=json.load(open('codex/config.json'))\n")
+
+# ----- Economy & Telemetry
+W("codex/economy/ledger.jsonl","")
+W("codex/economy/ledger.py","""import json, time, os
+class Ledger:
+    def __init__(self, path='codex/economy/ledger.jsonl'):
+        self.path=path; os.makedirs(os.path.dirname(path), exist_ok=True)
+    def record(self, actor, event, signal, clarity, virtue=1.0, revenue=0.0, note=None, tags=None):
+        tx={'ts':time.time(),'actor':actor,'event':event,'signal':signal,'clarity':clarity,'virtue':virtue,'revenue':revenue,'note':note,'tags':tags or []}
+        with open(self.path,'a',encoding='utf-8') as f: f.write(json.dumps(tx)+'\\n')
+        return tx
+LEDGER=Ledger()
+""")
+W("codex/telemetry/signals.jsonl","")
+W("codex/telemetry/telemetry.py","""import json, time, os
+from codex.economy.ledger import LEDGER
+from codex.config import CONFIG
+PATH='codex/telemetry/signals.jsonl'
+os.makedirs('codex/telemetry', exist_ok=True)
+def emit(name:str,payload:dict,clarity:float=1.0,virtue:float=0.9,tags=None):
+    sig={'ts':time.time(),'name':name,'payload':payload,'clarity':clarity,'virtue':virtue,'tags':tags or []}
+    open(PATH,'a',encoding='utf-8').write(json.dumps(sig)+'\\n')
+    revenue=clarity*CONFIG.get('price_per_unit_alpha',42.0)
+    LEDGER.record('telemetry',name,signal=1.0,clarity=clarity,virtue=virtue,revenue=revenue,note=name,tags=tags)
+    return sig
+""")
+
+# ----- Policy guard
+W("codex/policy/guard.py","""DENY=['forbidden','illegal','exploit']
+def check(intent:str)->dict:
+    i=intent.lower()
+    for t in DENY:
+        if t in i:
+            return {'ok':False,'reason':t}
+    return {'ok':True}
+""")
+
+# ----- DAG engine
+W("codex/graph/dag.py","""from collections import defaultdict, deque
+from codex.telemetry.telemetry import emit
+
+class DAG:
+    def __init__(self):
+        self.graph=defaultdict(list); self.indeg=defaultdict(int); self.meta={}
+    def add(self, u, v=None):
+        if v is None:
+            self.graph[u]=self.graph.get(u,[])
+            self.indeg[u]=self.indeg.get(u,0)
+        else:
+            self.graph[u].append(v); self.indeg[v]=self.indeg.get(v,0)+1; self.indeg[u]=self.indeg.get(u,0)
+        return self
+    def set_meta(self, node, fn):
+        self.meta[node]=fn; return self
+    def run(self, payload:dict):
+        q=deque([n for n,d in self.indeg.items() if d==0]); out={}; order=[]
+        while q:
+            u=q.popleft(); order.append(u)
+            fn=self.meta.get(u, lambda x: x)
+            out[u]=fn(out)  # pass current out as context
+            for v in self.graph[u]:
+                self.indeg[v]-=1
+                if self.indeg[v]==0: q.append(v)
+        emit('dag.run',{'order':order,'out_keys':list(out.keys())},clarity=1.0,virtue=0.9,tags=['Σ','DAG'])
+        return {'order':order,'result':out}
+""")
+
+# ----- Scheduler
+W("codex/scheduler/cron.py","""import time, threading
+from codex.telemetry.telemetry import emit
+JOBS=[]
+def job(name, fn, interval=60.0):
+    JOBS.append({'name':name,'fn':fn,'interval':interval,'next':time.time()+interval})
+    return {'ok':True,'name':name}
+def loop(stop_event=None, tick=1.0):
+    while not (stop_event and stop_event.is_set()):
+        now=time.time()
+        for j in JOBS:
+            if now>=j['next']:
+                try:
+                    res=j['fn']()
+                    emit('cron.run',{'job':j['name'],'res':res},clarity=0.9,virtue=0.9,tags=['Σ','CRON'])
+                finally:
+                    j['next']=now+j['interval']
+        time.sleep(tick)
+""")
+
+# ----- Strategy: alpha + risk + portfolio
+W("codex/strategy/alpha.py","""import math, time, random
+def moving_alpha(series:list[float], window:int=5)->float:
+    if not series: return 0.0
+    w=max(1,min(window,len(series)))
+    mu=sum(series[-w:])/w
+    drift = (series[-1]-series[max(0,len(series)-w)]) / max(1,w)
+    signal = math.tanh(mu + drift)
+    return round(signal,6)
+def simulate_prices(n:int=64, seed:int=7):
+    random.seed(seed); x=[]; p=100.0
+    for _ in range(n):
+        p*= (1+random.uniform(-0.02,0.02)); x.append(round(p,4))
+    return x
+""")
+W("codex/strategy/risk.py","""import statistics, math
+def risk_metrics(series:list[float])->dict:
+    if len(series)<2: return {'vol':0,'sharpe':0}
+    returns=[(series[i+1]-series[i])/series[i] for i in range(len(series)-1)]
+    vol=statistics.pstdev(returns) if len(returns)>1 else 0.0
+    sharpe=(statistics.mean(returns)/vol) if vol else 0.0
+    return {'vol':round(vol,6),'sharpe':round(sharpe,6)}
+""")
+W("codex/strategy/portfolio.py","""from codex.strategy.alpha import moving_alpha
+def decide(series:list[float])->dict:
+    a=moving_alpha(series)
+    action='BUY' if a>0.15 else 'SELL' if a<-0.15 else 'HOLD'
+    size=abs(a)
+    return {'alpha':a,'action':action,'size':round(size,3)}
+""")
+
+# ----- Adapters
+W("codex/adapters/http.py","""import json, urllib.request
+def fetch_json(url:str)->dict:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {'error':str(e)}
+""")
+W("codex/adapters/webhook.py","""import json
+EVENTS=[]
+def push(event:str, payload:dict):
+    EVENTS.append({'event':event,'payload':payload})
+    return {'ok':True,'queued':len(EVENTS)}
+def drain()->list[dict]:
+    out=list(EVENTS); EVENTS.clear(); return out
+""")
+
+# ----- Dashboard API (port 8816)
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.policy.guard import check
+from codex.graph.dag import DAG
+from codex.strategy.alpha import simulate_prices, moving_alpha
+from codex.strategy.risk import risk_metrics
+from codex.strategy.portfolio import decide
+from codex.scheduler.cron import job, loop
+from codex.adapters.webhook import push as wh_push, drain as wh_drain
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path
+        if p=='/api/policy/check': return self._ok(check(body.get('intent','')))
+        if p=='/api/graph/run':
+            dag=DAG()
+            dag.add('alpha','risk').add('risk','decide').add('decide')
+            series=body.get('series') or simulate_prices(64,7)
+            dag.set_meta('alpha', lambda ctx: {'alpha': moving_alpha(series)})
+            dag.set_meta('risk',  lambda ctx: risk_metrics(series))
+            dag.set_meta('decide',lambda ctx: decide(series))
+            return self._ok(dag.run({'series':series}))
+        if p=='/api/schedule/job':
+            name=body.get('name','heartbeat')
+            interval=float(body.get('interval',30))
+            job(name, lambda: {'ts':'ok'}, interval)
+            return self._ok({'scheduled':name,'interval':interval})
+        if p=='/api/webhook/push': return self._ok(wh_push(body.get('event','note'), body.get('payload',{})))
+        if p=='/api/webhook/drain': return self._ok(wh_drain())
+        self.send_error(404)
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=='/': return super().do_GET()
+        return super().do_GET()
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8816)
+""")
+
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Σ — Strategos</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Σ — Orchestration, Strategy & Markets</h1>
+<div>
+  <button onclick="policy()">Policy Check</button>
+  <button onclick="graph()">Run Strategy DAG</button>
+  <button onclick="schedule()">Schedule Heartbeat</button>
+  <button onclick="push()">Webhook Push</button>
+  <button onclick="drain()">Webhook Drain</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});document.getElementById('out').textContent=await r.text();}
+function policy(){ post('/api/policy/check', {intent:'trade ethically'}); }
+function graph(){ post('/api/graph/run', {}); }
+function schedule(){ post('/api/schedule/job', {name:'hb', interval:10}); }
+function push(){ post('/api/webhook/push', {event:'alpha', payload:{a:1}}); }
+function drain(){ post('/api/webhook/drain', {}); }
+</script>
+</body></html>
+""")
+
+# ----- Docs, CI, Docker, Tests
+W("docs/v204_sigma.md", f"# v204 — Codex Logos Σ (Sigma Strategos)\nGenerated: {now}\nRun API: `python3 dashboard/api.py` (port 8816)\n")
+W(".github/workflows/ci.yml","""name: Codex Sigma CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: DAG + Strategy smoke
+        run: python3 - <<'PY'\nfrom codex.graph.dag import DAG\nfrom codex.strategy.alpha import simulate_prices, moving_alpha\nfrom codex.strategy.risk import risk_metrics\nfrom codex.strategy.portfolio import decide\nseries=simulate_prices(64,7)\ndag=DAG().add('alpha','risk').add('risk','decide').add('decide')\ndag.set_meta('alpha', lambda ctx: {'alpha': moving_alpha(series)})\ndag.set_meta('risk', lambda ctx: risk_metrics(series))\ndag.set_meta('decide', lambda ctx: decide(series))\nprint(dag.run({'series':series}))\nPY
+""")
+W("deploy/Dockerfile","""FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8816\nCMD ["python3","dashboard/api.py"]\n""")
+W("tests/test_sigma.py","""from codex.strategy.alpha import simulate_prices, moving_alpha\ns=simulate_prices(32,3)\na=moving_alpha(s)\nassert -1<=a<=1\nprint('sigma ok')\n""")
+
+# ----- Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ----- ZIP
+zip_path="/mnt/data/codex_v204_sigma_strategos.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v204.x — "Codex Logos Σ⁺ (Sigma Strategos Plus): Backtester, OMS, Risk & Signals"
+# Repo: codex_v204x_sigma_strategos_plus
+# Adds to v204: backtesting engine, order simulator (OMS), position accounting, signal bus,
+#                risk constraints, strategy registry, richer API (port 8817), CI, Docker, tests, manifest, ZIP.
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v204x_sigma_strategos_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ----- Directories
+for d in [
+    ".github/workflows","codex/utils","codex/economy","codex/telemetry","codex/policy",
+    "codex/graph","codex/scheduler","codex/strategy","codex/adapters",
+    "codex/oms","codex/backtest","codex/signals","codex/registry",
+    "dashboard","deploy","docs","scripts","tests"
+]:
+    os.makedirs(os.path.join(BASE,d), exist_ok=True)
+
+# ----- Utils & config
+W("codex/utils/crypto.py","""import hashlib, json, time, base64
+sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()
+sha256_json=lambda o: sha256_bytes(json.dumps(o, sort_keys=True).encode())
+b64=lambda b: base64.b64encode(b).decode()
+now=lambda: int(time.time())
+""")
+W("codex/config.json", json.dumps({
+  "version": "v204.x-sigma-plus",
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice": "lnbc1p5s0ppfdqdgdshx6pqg9c8qpp5nx5xppwrv42qxgxal55fv43ep7uscv3n4t0jj65cpnmq9t5cp9hqsp5662c050wmnwfdd40pcgafc60dss5nfg6gchv566lx0zdlq4jnrgs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zqwgcqqdwqqqqqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwz4wh5qqzqsqquqqqqqqqqqqqqqq9gu82fczxfmc5c6uvxlp6jeyvjdtuddy9km06lmsq9e35j7xn3cthhx2jtua69a3hlktx77tccqttvmrp9xt3408jqlks8szual5p9d6spqwppcn",
+  "price_per_unit_alpha": 42.0,
+  "virtue_floor": 0.8,
+  "max_leverage": 2.0,
+  "max_position": 1.0
+}, indent=2))
+W("codex/config.py","import json\nCONFIG=json.load(open('codex/config.json'))\n")
+
+# ----- Economy & Telemetry
+W("codex/economy/ledger.jsonl","")
+W("codex/economy/ledger.py","""import json, time, os
+class Ledger:
+    def __init__(self, path='codex/economy/ledger.jsonl'):
+        self.path=path; os.makedirs(os.path.dirname(path), exist_ok=True)
+    def record(self, actor, event, signal, clarity, virtue=1.0, revenue=0.0, note=None, tags=None):
+        tx={'ts':time.time(),'actor':actor,'event':event,'signal':signal,'clarity':clarity,'virtue':virtue,'revenue':revenue,'note':note,'tags':tags or []}
+        with open(self.path,'a',encoding='utf-8') as f: f.write(json.dumps(tx)+'\\n')
+        return tx
+LEDGER=Ledger()
+""")
+W("codex/telemetry/signals.jsonl","")
+W("codex/telemetry/telemetry.py","""import json, time, os
+from codex.economy.ledger import LEDGER
+from codex.config import CONFIG
+PATH='codex/telemetry/signals.jsonl'
+os.makedirs('codex/telemetry', exist_ok=True)
+def emit(name:str,payload:dict,clarity:float=1.0,virtue:float=0.9,tags=None):
+    sig={'ts':time.time(),'name':name,'payload':payload,'clarity':clarity,'virtue':virtue,'tags':tags or []}
+    open(PATH,'a',encoding='utf-8').write(json.dumps(sig)+'\\n')
+    revenue=clarity*CONFIG.get('price_per_unit_alpha',42.0)
+    LEDGER.record('telemetry',name,signal=1.0,clarity=clarity,virtue=virtue,revenue=revenue,note=name,tags=tags)
+    return sig
+""")
+
+# ----- Policy guard
+W("codex/policy/guard.py","""DENY=['forbidden','illegal','exploit']
+def check(intent:str)->dict:
+    i=intent.lower()
+    for t in DENY:
+        if t in i:
+            return {'ok':False,'reason':t}
+    return {'ok':True}
+""")
+
+# ----- Strategy registry
+W("codex/registry/strategies.py","""REGISTRY={}
+def register(name, spec): REGISTRY[name]=spec; return {'ok':True,'name':name}
+def list_strategies(): return sorted(list(REGISTRY.keys()))
+def get(name): return REGISTRY.get(name)
+""")
+
+# ----- Signals bus
+W("codex/signals/bus.py","""SUBS={}
+def subscribe(topic:str, fn):
+    SUBS.setdefault(topic, []).append(fn); return {'ok':True,'topic':topic,'subscribers':len(SUBS[topic])}
+def publish(topic:str, payload):
+    out=[]; 
+    for fn in SUBS.get(topic, []):
+        try: out.append(fn(payload))
+        except Exception as e: out.append({'error':str(e)})
+    return {'ok':True,'topic':topic,'results':out}
+""")
+
+# ----- OMS (orders, positions, PnL)
+W("codex/oms/oms.py","""from dataclasses import dataclass, field
+from typing import List
+from codex.config import CONFIG
+
+@dataclass
+class Order:
+    side:str   # 'BUY'/'SELL'
+    size:float
+    price:float
+
+@dataclass
+class Position:
+    qty:float=0.0
+    avg_price:float=0.0
+    pnl:float=0.0
+    history:List[Order]=field(default_factory=list)
+
+    def apply(self, o:Order):
+        if o.side=='BUY':
+            new_qty=self.qty+o.size
+            self.avg_price=(self.avg_price*self.qty + o.price*o.size)/max(1e-9,new_qty)
+            self.qty=new_qty
+        elif o.side=='SELL':
+            self.qty-=o.size
+            self.pnl+=(o.price - self.avg_price)*o.size
+        self.history.append(o)
+
+class OMS:
+    def __init__(self):
+        self.pos=Position()
+    def place(self, side:str, size:float, price:float):
+        size=min(size, CONFIG.get('max_position',1.0))
+        o=Order(side,size,price); self.pos.apply(o)
+        return {'ok':True,'side':side,'size':size,'price':price,'qty':self.pos.qty,'pnl':round(self.pos.pnl,6)}
+    def mark(self, price:float):
+        unreal=(price-self.pos.avg_price)*self.pos.qty
+        return {'qty':self.pos.qty,'avg_price':self.pos.avg_price,'realized_pnl':self.pos.pnl,'unrealized_pnl':unreal,'equity':self.pos.pnl+unreal}
+""")
+
+# ----- Backtester
+W("codex/backtest/engine.py","""from codex.strategy.alpha import moving_alpha, simulate_prices
+from codex.strategy.portfolio import decide
+from codex.oms.oms import OMS
+
+def run(n:int=128, seed:int=11):
+    prices=simulate_prices(n, seed)
+    oms=OMS(); equity=[]
+    for p in prices:
+        d=decide(prices[:prices.index(p)+1])
+        if d['action']=='BUY': oms.place('BUY', d['size'], p)
+        elif d['action']=='SELL': oms.place('SELL', d['size'], p)
+        equity.append(oms.mark(p)['equity'])
+    return {'prices':prices,'equity':equity,'final':equity[-1] if equity else 0.0}
+""")
+
+# ----- Strategy core (reuse from v204)
+W("codex/strategy/alpha.py","""import math, random
+def moving_alpha(series:list[float], window:int=5)->float:
+    if not series: return 0.0
+    w=max(1,min(window,len(series)))
+    mu=sum(series[-w:])/w
+    drift = (series[-1]-series[max(0,len(series)-w)]) / max(1,w)
+    return round(math.tanh(mu/100 + drift),6)
+def simulate_prices(n:int=64, seed:int=7):
+    random.seed(seed); x=[]; p=100.0
+    for _ in range(n):
+        p*= (1+random.uniform(-0.02,0.02)); x.append(round(p,4))
+    return x
+""")
+W("codex/strategy/risk.py","""import statistics
+def risk_metrics(series:list[float])->dict:
+    if len(series)<2: return {'vol':0,'sharpe':0}
+    returns=[(series[i+1]-series[i])/series[i] for i in range(len(series)-1)]
+    vol=statistics.pstdev(returns) if len(returns)>1 else 0.0
+    sharpe=(statistics.mean(returns)/vol) if vol else 0.0
+    return {'vol':round(vol,6),'sharpe':round(sharpe,6)}
+""")
+W("codex/strategy/portfolio.py","""from codex.strategy.alpha import moving_alpha
+def decide(series:list[float])->dict:
+    a=moving_alpha(series)
+    action='BUY' if a>0.15 else 'SELL' if a<-0.15 else 'HOLD'
+    size=abs(a)
+    return {'alpha':a,'action':action,'size':round(size,3)}
+""")
+
+# ----- Adapters
+W("codex/adapters/webhook.py","""EVENTS=[]
+def push(event:str, payload:dict):
+    EVENTS.append({'event':event,'payload':payload})
+    return {'ok':True,'queued':len(EVENTS)}
+def drain()->list[dict]:
+    out=list(EVENTS); EVENTS.clear(); return out
+""")
+
+# ----- DAG (slim util for v204.x demos)
+W("codex/graph/dag.py","""from collections import defaultdict, deque
+def run_linear(steps, ctx):
+    order=[]; data=ctx
+    for name,fn in steps:
+        data=fn(data); order.append(name)
+    return {'order':order,'result':data}
+""")
+
+# ----- API (port 8817)
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.registry.strategies import register as sreg, list_strategies as slist, get as sget
+from codex.backtest.engine import run as backtest
+from codex.oms.oms import OMS
+from codex.signals.bus import subscribe, publish
+from codex.strategy.alpha import simulate_prices
+from codex.policy.guard import check
+from codex.adapters.webhook import push as wh_push, drain as wh_drain
+
+OMS_INSTANCE=OMS()
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path
+        if p=='/api/strategy/register': return self._ok(sreg(body.get('name','demo'), body.get('spec',{})))
+        if p=='/api/strategy/backtest': return self._ok(backtest(body.get('n',128), body.get('seed',11)))
+        if p=='/api/oms/place': return self._ok(OMS_INSTANCE.place(body.get('side','BUY'), float(body.get('size',0.1)), float(body.get('price',100.0))))
+        if p=='/api/oms/mark':  return self._ok(OMS_INSTANCE.mark(float(body.get('price',100.0))))
+        if p=='/api/signal/subscribe':
+            topic=body.get('topic','alpha')
+            subscribe(topic, lambda payload: {'topic':topic,'len':len(str(payload))})
+            return self._ok({'subscribed':topic})
+        if p=='/api/signal/publish': return self._ok(publish(body.get('topic','alpha'), body.get('payload',{})))
+        if p=='/api/policy/check': return self._ok(check(body.get('intent','build ethically')))
+        if p=='/api/webhook/push': return self._ok(wh_push(body.get('event','note'), body.get('payload',{})))
+        if p=='/api/webhook/drain': return self._ok(wh_drain())
+        self.send_error(404)
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=='/api/strategy/list': return self._ok({'strategies': slist()})
+        if p=='/api/prices': return self._ok({'series': simulate_prices(64,7)})
+        if p=='/': return super().do_GET()
+        return super().do_GET()
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8817)
+""")
+
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Σ⁺ — Strategos Plus</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Σ⁺ — Backtester • OMS • Signals</h1>
+<div>
+  <button onclick="listStrat()">List</button>
+  <button onclick="backtest()">Backtest</button>
+  <button onclick="place()">Place</button>
+  <button onclick="mark()">Mark</button>
+  <button onclick="sub()">Subscribe</button>
+  <button onclick="pub()">Publish</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function listStrat(){ get('/api/strategy/list'); }
+function backtest(){ post('/api/strategy/backtest', {n:128, seed:11}); }
+function place(){ post('/api/oms/place', {side:'BUY', size:0.2, price:101.5}); }
+function mark(){ post('/api/oms/mark', {price:103}); }
+function sub(){ post('/api/signal/subscribe', {topic:'alpha'}); }
+function pub(){ post('/api/signal/publish', {topic:'alpha', payload:{k:'v'}}); }
+</script>
+</body></html>
+""")
+
+# ----- Docs, CI, Docker, Tests
+W("docs/v204x_sigma_plus.md", f"# v204.x — Codex Logos Σ⁺ (Sigma Strategos Plus)\nGenerated: {now}\nRun API: `python3 dashboard/api.py` (port 8817)\n")
+W(".github/workflows/ci.yml","""name: Codex Sigma Plus CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backtester smoke
+        run: python3 - <<'PY'\nfrom codex.backtest.engine import run\nprint(run(64,13))\nPY
+""")
+W("deploy/Dockerfile","""FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8817\nCMD ["python3","dashboard/api.py"]\n""")
+W("tests/test_sigma_plus.py","""from codex.backtest.engine import run\nr=run(32,5)\nassert 'final' in r\nprint('sigma-plus ok')\n""")
+
+# ----- Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ----- ZIP
+zip_path="/mnt/data/codex_v204x_sigma_strategos_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v204.💲♾️ — "Codex Logos Σ•Treasury & Honors"
+# Repo: codex_v204e_sigma_treasury_honors
+# Adds on top of v204.x: on-ledger treasury (accounts, escrow, stakes),
+# reputation/badges system, risk shields, audit exports, and richer UI.
+# API on port 8818. CI, Docker, tests, manifest, ZIP included.
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v204e_sigma_treasury_honors"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ----- Directories
+for d in [
+    ".github/workflows","codex/utils","codex/economy","codex/telemetry","codex/policy",
+    "codex/treasury","codex/honors","codex/audit",
+    "dashboard","deploy","docs","scripts","tests"
+]:
+    os.makedirs(os.path.join(BASE,d), exist_ok=True)
+
+# ----- Utils & config
+W("codex/utils/crypto.py","""import hashlib, json, time, base64
+sha256_bytes=lambda b: hashlib.sha256(b).hexdigest()
+sha256_json=lambda o: sha256_bytes(json.dumps(o, sort_keys=True).encode())
+b64=lambda b: base64.b64encode(b).decode()
+now=lambda: int(time.time())
+""")
+W("codex/config.json", json.dumps({
+  "version": "v204.emoji-sigma-treasury-honors",
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice": "lnbc1p5s0ppfdqdgdshx6pqg9c8qpp5nx5xppwrv42qxgxal55fv43ep7uscv3n4t0jj65cpnmq9t5cp9hqsp5662c050wmnwfdd40pcgafc60dss5nfg6gchv566lx0zdlq4jnrgs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zqwgcqqdwqqqqqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwz4wh5qqzqsqquqqqqqqqqqqqqqq9gu82fczxfmc5c6uvxlp6jeyvjdtuddy9km06lmsq9e35j7xn3cthhx2jtua69a3hlktx77tccqttvmrp9xt3408jqlks8szual5p9d6spqwppcn",
+  "price_per_unit_merit": 33.0,
+  "virtue_floor": 0.85,
+  "treasury_base_ccy": "USD"
+}, indent=2))
+W("codex/config.py","import json\nCONFIG=json.load(open('codex/config.json'))\n")
+
+# ----- Economy & Telemetry (reuse minimal)
+W("codex/economy/ledger.jsonl","")
+W("codex/economy/ledger.py","""import json, time, os
+class Ledger:
+    def __init__(self, path='codex/economy/ledger.jsonl'):
+        self.path=path; os.makedirs(os.path.dirname(path), exist_ok=True)
+    def record(self, actor, event, signal, clarity, virtue=1.0, revenue=0.0, note=None, tags=None):
+        tx={'ts':time.time(),'actor':actor,'event':event,'signal':signal,'clarity':clarity,'virtue':virtue,'revenue':revenue,'note':note,'tags':tags or []}
+        with open(self.path,'a',encoding='utf-8') as f: f.write(json.dumps(tx)+'\\n')
+        return tx
+LEDGER=Ledger()
+""")
+W("codex/telemetry/signals.jsonl","")
+W("codex/telemetry/telemetry.py","""import json, time, os
+from codex.economy.ledger import LEDGER
+from codex.config import CONFIG
+PATH='codex/telemetry/signals.jsonl'
+os.makedirs('codex/telemetry', exist_ok=True)
+def emit(name:str,payload:dict,clarity:float=1.0,virtue:float=0.9,tags=None):
+    sig={'ts':time.time(),'name':name,'payload':payload,'clarity':clarity,'virtue':virtue,'tags':tags or []}
+    open(PATH,'a',encoding='utf-8').write(json.dumps(sig)+'\\n')
+    revenue=clarity*CONFIG.get('price_per_unit_merit',33.0)
+    LEDGER.record('telemetry',name,signal=1.0,clarity=clarity,virtue=virtue,revenue=revenue,note=name,tags=tags)
+    return sig
+""")
+
+# ----- Policy (very light)
+W("codex/policy/guard.py","""DENY=['forbidden','illegal','exploit']
+def check(intent:str)->dict:
+    i=intent.lower()
+    for t in DENY:
+        if t in i:
+            return {'ok':False,'reason':t}
+    return {'ok':True}
+""")
+
+# ----- Treasury: accounts, escrow, stakes
+W("codex/treasury/accounts.py","""from dataclasses import dataclass, field
+from typing import Dict
+from codex.telemetry.telemetry import emit
+
+@dataclass
+class Account:
+    balance:float=0.0
+    escrow:float=0.0
+    staked:float=0.0
+
+class Treasury:
+    def __init__(self): self.accts:Dict[str,Account]={}
+    def ensure(self, who:str): self.accts.setdefault(who, Account()); return self.accts[who]
+    def credit(self, who:str, amt:float): a=self.ensure(who); a.balance+=amt; emit('treasury.credit',{'who':who,'amt':amt},0.9,0.9,['💲']); return {'ok':True,'balance':a.balance}
+    def debit(self, who:str, amt:float): a=self.ensure(who); 
+        if a.balance<amt: return {'ok':False,'error':'insufficient'}
+        a.balance-=amt; emit('treasury.debit',{'who':who,'amt':amt},0.9,0.9,['💲']); return {'ok':True,'balance':a.balance}
+    def lock_escrow(self, who:str, amt:float): a=self.ensure(who);
+        if a.balance<amt: return {'ok':False,'error':'insufficient'}
+        a.balance-=amt; a.escrow+=amt; emit('treasury.escrow',{'who':who,'amt':amt},0.9,0.9,['🛡']); return {'ok':True,'escrow':a.escrow}
+    def release_escrow(self, who:str, amt:float): a=self.ensure(who);
+        if a.escrow<amt: return {'ok':False,'error':'escrow_insufficient'}
+        a.escrow-=amt; a.balance+=amt; emit('treasury.release',{'who':who,'amt':amt},0.9,0.9,['🛡']); return {'ok':True,'escrow':a.escrow,'balance':a.balance}
+    def stake(self, who:str, amt:float): a=self.ensure(who);
+        if a.balance<amt: return {'ok':False,'error':'insufficient'}
+        a.balance-=amt; a.staked+=amt; emit('treasury.stake',{'who':who,'amt':amt},0.9,0.9,['🧲']); return {'ok':True,'staked':a.staked}
+    def unstake(self, who:str, amt:float): a=self.ensure(who);
+        if a.staked<amt: return {'ok':False,'error':'stake_insufficient'}
+        a.staked-=amt; a.balance+=amt; emit('treasury.unstake',{'who':who,'amt':amt},0.9,0.9,['🧲']); return {'ok':True,'staked':a.staked,'balance':a.balance}
+    def status(self, who:str): a=self.ensure(who); return {'who':who,'balance':a.balance,'escrow':a.escrow,'staked':a.staked}
+TREASURY=Treasury()
+""")
+
+# ----- Honors: badges & medals
+W("codex/honors/badges.py","""from dataclasses import dataclass, field
+from typing import Dict, List
+from codex.telemetry.telemetry import emit
+
+@dataclass
+class Badge: 
+    name:str; icon:str; rule:str
+
+CATALOG=[
+    Badge('Initiate','🥉','1+ successful actions'),
+    Badge('Adept','🥈','10+ successful actions'),
+    Badge('Master','🥇','100+ successful actions'),
+    Badge('Guardian','🛡','risk shield activations'),
+    Badge('Artificer','🪄','created artifacts')
+]
+
+class Honors:
+    def __init__(self): self.user_badges:Dict[str,List[str]]={}; self.counts:Dict[str,int]={}
+    def record(self, who:str, action:str):
+        k=f\"{who}:{action}\"; self.counts[k]=self.counts.get(k,0)+1
+        n=self.counts[k]
+        if n>=1: self.award(who,'Initiate')
+        if n>=10: self.award(who,'Adept')
+        if n>=100: self.award(who,'Master')
+        return {'ok':True,'count':n}
+    def award(self, who:str, name:str):
+        L=self.user_badges.setdefault(who,[])
+        if name not in L: L.append(name); emit('honors.award',{'who':who,'badge':name},0.9,0.95,['🏅'])
+        return {'ok':True,'badges':L}
+    def badges(self, who:str): return {'who':who,'badges': self.user_badges.get(who,[])}
+HONORS=Honors()
+""")
+
+# ----- Audit: CSV export of ledger + telemetry
+W("codex/audit/export.py","""import csv, json, os
+def export_jsonl_to_csv(jsonl_path:str, csv_path:str):
+    rows=[]
+    if not os.path.exists(jsonl_path): 
+        open(csv_path,'w').close(); return {'ok':True,'rows':0}
+    with open(jsonl_path,encoding='utf-8') as f:
+        for ln in f:
+            try: rows.append(json.loads(ln))
+            except: pass
+    if not rows: 
+        open(csv_path,'w').close(); return {'ok':True,'rows':0}
+    keys=sorted({k for r in rows for k in r.keys()})
+    with open(csv_path,'w',newline='',encoding='utf-8') as f:
+        w=csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(rows)
+    return {'ok':True,'rows':len(rows),'csv':csv_path}
+""")
+
+# ----- Dashboard API (port 8818)
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.policy.guard import check
+from codex.treasury.accounts import TREASURY
+from codex.honors.badges import HONORS
+from codex.audit.export import export_jsonl_to_csv
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path
+        if p=='/api/policy/check': return self._ok(check(body.get('intent','build ethically')))
+        if p=='/api/treasury/credit': return self._ok(TREASURY.credit(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/debit': return self._ok(TREASURY.debit(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/escrow': return self._ok(TREASURY.lock_escrow(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/release': return self._ok(TREASURY.release_escrow(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/stake': return self._ok(TREASURY.stake(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/unstake': return self._ok(TREASURY.unstake(body.get('who','cfbk'), float(body.get('amt',0.0))))
+        if p=='/api/treasury/status': return self._ok(TREASURY.status(body.get('who','cfbk')))
+        if p=='/api/honors/record': return self._ok(HONORS.record(body.get('who','cfbk'), body.get('action','act')))
+        if p=='/api/honors/badges': return self._ok(HONORS.badges(body.get('who','cfbk')))
+        if p=='/api/audit/ledger_csv': return self._ok(export_jsonl_to_csv('codex/economy/ledger.jsonl','codex/audit/ledger.csv'))
+        if p=='/api/audit/telemetry_csv': return self._ok(export_jsonl_to_csv('codex/telemetry/signals.jsonl','codex/audit/telemetry.csv'))
+        self.send_error(404)
+    def do_GET(self):
+        p=urlparse(self.path).path
+        if p=='/': return super().do_GET()
+        return super().do_GET()
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8818)
+""")
+
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Σ•Treasury & Honors</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Σ•Treasury 💲♾️ & Honors 👑🏅</h1>
+<div>
+  <button onclick="credit()">Credit</button>
+  <button onclick="debit()">Debit</button>
+  <button onclick="escrow()">Escrow</button>
+  <button onclick="release()">Release</button>
+  <button onclick="stake()">Stake</button>
+  <button onclick="unstake()">Unstake</button>
+  <button onclick="status()">Status</button>
+  <button onclick="record()">Record Action</button>
+  <button onclick="badges()">Badges</button>
+  <button onclick="ledger()">Ledger CSV</button>
+  <button onclick="telemetry()">Telemetry CSV</button>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,body){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});document.getElementById('out').textContent=await r.text();}
+function credit(){ post('/api/treasury/credit', {who:'cfbk', amt:10}); }
+function debit(){ post('/api/treasury/debit', {who:'cfbk', amt:3}); }
+function escrow(){ post('/api/treasury/escrow', {who:'cfbk', amt:2}); }
+function release(){ post('/api/treasury/release', {who:'cfbk', amt:1}); }
+function stake(){ post('/api/treasury/stake', {who:'cfbk', amt:2}); }
+function unstake(){ post('/api/treasury/unstake', {who:'cfbk', amt:1}); }
+function status(){ post('/api/treasury/status', {who:'cfbk'}); }
+function record(){ post('/api/honors/record', {who:'cfbk', action:'act'}); }
+function badges(){ post('/api/honors/badges', {who:'cfbk'}); }
+function ledger(){ post('/api/audit/ledger_csv', {}); }
+function telemetry(){ post('/api/audit/telemetry_csv', {}); }
+</script>
+</body></html>
+""")
+
+# ----- Docs, CI, Docker, Tests
+W("docs/v204e_sigma_treasury_honors.md", f"# v204.💲♾️ — Codex Logos Σ•Treasury & Honors\nGenerated: {now}\nRun API: `python3 dashboard/api.py` (port 8818)\n")
+W(".github/workflows/ci.yml","""name: Codex Sigma Treasury CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Treasury smoke
+        run: python3 - <<'PY'\nfrom codex.treasury.accounts import TREASURY\nprint(TREASURY.credit('ci',10))\nprint(TREASURY.lock_escrow('ci',2))\nprint(TREASURY.release_escrow('ci',1))\nprint(TREASURY.stake('ci',2))\nprint(TREASURY.unstake('ci',1))\nprint(TREASURY.status('ci'))\nPY
+""")
+W("deploy/Dockerfile","""FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8818\nCMD ["python3","dashboard/api.py"]\n""")
+W("tests/test_treasury.py","""from codex.treasury.accounts import TREASURY\nr=TREASURY.credit('test',5.0)\nassert r['ok'] and r['balance']>=5.0\nprint('treasury ok')\n""")
+
+# ----- Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ----- ZIP
+zip_path="/mnt/data/codex_v204e_sigma_treasury_honors.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
