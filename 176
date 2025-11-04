@@ -1,0 +1,496 @@
+Let's close the sixth cycle cleanly.
+Where v175 – Communitas aggregated harmony across nodes,
+v176 – Communitas .x (or simply v176) turns that snapshot into a small, self-contained service that shares summaries between peers.
+
+No mysticism this time—just normal, auditable code that runs in any repo.
+
+
+---
+
+📁 structure
+
+.github/
+└── workflows/
+    └── communitasx.yml
+docs/
+└── v176.md
+schemas/
+└── communitasx.schema.json
+scripts/
+└── communitasx_service.py
+versions_v176.json
+versions_temporal_v176.json
+
+
+---
+
+scripts/communitasx_service.py
+
+#!/usr/bin/env python3
+"""
+v176 – Communitas.x
+Lightweight peer-to-peer exchange of Communitas summaries.
+
+Starts a tiny HTTP JSON service:
+  GET  /status        → simple alive message
+  GET  /latest        → latest communitas/network_state_*.json
+  POST /share         → receive another node’s summary JSON and store
+
+Intended for small lab clusters, local dev, or federated testing.
+"""
+import os, json, glob, datetime, hashlib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+COMMUNITAS_GLOB = "communitas/network_state_*.json"
+INBOX = "communitas/inbox"
+
+def latest_summary():
+    files = sorted(glob.glob(COMMUNITAS_GLOB))
+    if not files: return {"status": "no local summaries"}
+    with open(files[-1]) as f:
+        data = json.load(f)
+    return data
+
+class CommunitasHandler(BaseHTTPRequestHandler):
+    def _json(self, data, code=200):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/status":
+            self._json({"status": "ok", "time": datetime.datetime.utcnow().isoformat()+"Z"})
+        elif self.path == "/latest":
+            self._json(latest_summary())
+        else:
+            self._json({"error": "unknown endpoint"}, 404)
+
+    def do_POST(self):
+        if self.path != "/share":
+            self._json({"error": "unknown endpoint"}, 404)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._json({"error": "invalid JSON"}, 400)
+            return
+        os.makedirs(INBOX, exist_ok=True)
+        sig = hashlib.sha256(body).hexdigest()[:16]
+        path = f"{INBOX}/shared_{sig}.json"
+        with open(path, "wb") as f:
+            f.write(body)
+        self._json({"stored": path, "signature": sig}, 201)
+
+def run(port=8080):
+    server = HTTPServer(("0.0.0.0", port), CommunitasHandler)
+    print(f"Communitas.x service running on port {port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Stopping service.")
+        server.server_close()
+
+if __name__ == "__main__":
+    run()
+
+
+---
+
+schemas/communitasx.schema.json
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Communitas.x Shared Summary",
+  "type": "object",
+  "properties": {
+    "timestamp_utc": {"type": "string", "format": "date-time"},
+    "node_count": {"type": "integer"},
+    "mean_concord": {"type": "number"},
+    "mean_empathy": {"type": "number"},
+    "diversity_index": {"type": "number"},
+    "network_harmony": {"type": "number"},
+    "signature": {"type": "string"}
+  },
+  "required": ["timestamp_utc","node_count","network_harmony","signature"]
+}
+
+
+---
+
+docs/v176.md
+
+# v176 – Communitas.x
+
+**Status:** Released  
+**Purpose:** Enable direct exchange of Communitas network summaries between peers.
+
+This version adds a minimal HTTP JSON API so multiple repositories can share
+and mirror their `communitas/network_state_*.json` files without a central server.
+
+## Run
+```bash
+python3 scripts/communitasx_service.py  # defaults to port 8080
+
+Endpoints
+
+GET /status → health check
+
+GET /latest → latest local summary
+
+POST /share → post another node's summary JSON
+
+
+All received summaries are stored under communitas/inbox/.
+
+Ethics
+
+No authentication, no telemetry, no background calls. Only exchanges explicit POST bodies; transparent, auditable, self-contained.
+
+---
+
+### `.github/workflows/communitasx.yml`
+```yaml
+name: Communitas.x
+on:
+  workflow_dispatch:
+jobs:
+  test-communitasx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Launch Communitas.x briefly
+        run: |
+          python3 scripts/communitasx_service.py &
+          sleep 5
+          pkill -f communitasx_service.py
+
+
+---
+
+versions_v176.json
+
+{
+  "version": "v176",
+  "status": "released",
+  "artifacts": [
+    {"path": "docs/v176.md", "kind": "release-notes"},
+    {"path": "scripts/communitasx_service.py", "kind": "tool"},
+    {"path": "schemas/communitasx.schema.json", "kind": "schema"},
+    {"path": "communitas/inbox/", "kind": "data"}
+  ],
+  "notes": "v176 – Communitas.x: lightweight HTTP service for peer-to-peer sharing of Communitas summaries."
+}
+
+
+---
+
+versions_temporal_v176.json
+
+{
+  "current": {
+    "head": "v176",
+    "note": "Communitas.x – peer-to-peer exchange of harmony summaries"
+  },
+  "next": {
+    "head": "v177-next",
+    "note": "Aeon Concordia – federated coordination and collective learning"
+  }
+}
+
+
+---
+
+✅ Usage summary
+
+1. Ensure communitas/network_state_*.json exists (from v175).
+
+
+2. Run
+
+python3 scripts/communitasx_service.py
+
+Your node will serve and accept summaries.
+
+
+3. From another node:
+
+curl -X POST http://<peer>:8080/share \
+     -H "Content-Type: application/json" \
+     --data-binary @communitas/network_state_<timestamp>.json
+
+
+
+Each node becomes a small, ethical peer exchanging harmony data transparently.
+
+
+---
+
+This concludes v176 – Communitas.x, the first working peer layer.
+From here the path opens to v177 – Aeon Concordia, where many such peers synchronize and learn collectively.Let’s conclude this cycle with clarity.
+v176.x – Communitas.x Adaptive Network takes the static peer service from v176 and lets multiple nodes learn from one another’s posted summaries.
+Every time a new summary arrives, the service updates a rolling average and variance of “network harmony” across all shared peers, then publishes a unified “adaptive_network_state.json.”
+Everything remains plain Python, auditable, and deployable.
+
+
+---
+
+📁 structure
+
+.github/
+└── workflows/
+    └── communitasx_adaptive.yml
+docs/
+└── v176x.md
+schemas/
+└── communitasx_adaptive.schema.json
+scripts/
+└── communitasx_adaptive_service.py
+versions_v176x.json
+versions_temporal_v176x.json
+
+
+---
+
+scripts/communitasx_adaptive_service.py
+
+#!/usr/bin/env python3
+"""
+v176.x – Communitas.x Adaptive Network
+Extends v176 HTTP service to learn rolling averages from shared peer summaries.
+
+Features:
+- GET /status
+- GET /latest
+- GET /adaptive_state
+- POST /share  (store + update global stats)
+
+Maintains communitas/adaptive_network_state.json with running mean/variance.
+"""
+import os, json, glob, datetime, hashlib, statistics
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+COMMUNITAS_GLOB = "communitas/network_state_*.json"
+INBOX = "communitas/inbox"
+STATE_PATH = "communitas/adaptive_network_state.json"
+
+def _load_json(path):
+    if not os.path.exists(path): return {}
+    try: return json.load(open(path))
+    except Exception: return {}
+
+def _hash_data(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:16]
+
+def _latest_summary():
+    files = sorted(glob.glob(COMMUNITAS_GLOB))
+    if not files: return None
+    return _load_json(files[-1])
+
+def _adaptive_update(new_data):
+    os.makedirs("communitas", exist_ok=True)
+    state = _load_json(STATE_PATH) or {"entries": []}
+    entries = state.get("entries", [])
+    entries.append({
+        "t": new_data.get("timestamp_utc"),
+        "network_harmony": new_data.get("network_harmony", 0.0)
+    })
+    entries = entries[-100:]  # keep last 100
+    vals = [e["network_harmony"] for e in entries if e["network_harmony"] is not None]
+    mean = statistics.mean(vals) if vals else 0.0
+    var = statistics.pvariance(vals) if len(vals) > 1 else 0.0
+    state.update({
+        "count": len(entries),
+        "avg_network_harmony": round(mean, 6),
+        "variance": round(var, 6),
+        "last_update": datetime.datetime.utcnow().isoformat() + "Z",
+        "signature": _hash_data(entries)
+    })
+    state["entries"] = entries
+    json.dump(state, open(STATE_PATH,"w"), indent=2)
+    return state
+
+class AdaptiveHandler(BaseHTTPRequestHandler):
+    def _json(self, data, code=200):
+        body = json.dumps(data, indent=2).encode()
+        self.send_response(code)
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/status":
+            self._json({"status":"ok","time":datetime.datetime.utcnow().isoformat()+"Z"})
+        elif self.path == "/latest":
+            data = _latest_summary() or {"note":"no local summary"}
+            self._json(data)
+        elif self.path == "/adaptive_state":
+            data = _load_json(STATE_PATH) or {"note":"no adaptive state yet"}
+            self._json(data)
+        else:
+            self._json({"error":"unknown endpoint"},404)
+
+    def do_POST(self):
+        if self.path != "/share":
+            self._json({"error":"unknown endpoint"},404)
+            return
+        length = int(self.headers.get("Content-Length",0))
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except Exception:
+            self._json({"error":"invalid JSON"},400)
+            return
+        os.makedirs(INBOX, exist_ok=True)
+        sig = hashlib.sha256(body).hexdigest()[:16]
+        path = f"{INBOX}/shared_{sig}.json"
+        with open(path,"wb") as f: f.write(body)
+        state = _adaptive_update(data)
+        self._json({"stored":path,"signature":sig,"adaptive_state":state},201)
+
+def run(port=8080):
+    os.makedirs("communitas", exist_ok=True)
+    server = HTTPServer(("0.0.0.0", port), AdaptiveHandler)
+    print(f"Communitas.x Adaptive service on port {port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down.")
+        server.server_close()
+
+if __name__ == "__main__":
+    run()
+
+
+---
+
+schemas/communitasx_adaptive.schema.json
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Communitas.x Adaptive State",
+  "type": "object",
+  "properties": {
+    "count": {"type": "integer"},
+    "avg_network_harmony": {"type": "number"},
+    "variance": {"type": "number"},
+    "last_update": {"type": "string", "format": "date-time"},
+    "signature": {"type": "string"},
+    "entries": {"type": "array"}
+  },
+  "required": ["count","avg_network_harmony","variance","signature"]
+}
+
+
+---
+
+docs/v176x.md
+
+# v176.x – Communitas.x Adaptive Network
+
+**Status:** Rolling  
+**Purpose:** Teach the Communitas.x peer service to learn from shared summaries.
+
+Adds `/adaptive_state` endpoint showing rolling average and variance of
+`network_harmony` across all received summaries.
+
+## Run
+```bash
+python3 scripts/communitasx_adaptive_service.py
+
+Endpoints
+
+Method	Path	Description
+
+GET	/status	Health check
+GET	/latest	Latest local summary
+GET	/adaptive_state	Current learned averages
+POST	/share	Upload a peer summary; updates state
+
+
+All updates are local, transparent, and stored under communitas/inbox/.
+
+---
+
+### `.github/workflows/communitasx_adaptive.yml`
+```yaml
+name: Communitas.x Adaptive
+on:
+  workflow_dispatch:
+jobs:
+  run-communitasx-adaptive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Start Adaptive Service (test)
+        run: |
+          python3 scripts/communitasx_adaptive_service.py &
+          sleep 5
+          pkill -f communitasx_adaptive_service.py
+
+
+---
+
+versions_v176x.json
+
+{
+  "version": "v176.x",
+  "status": "rolling",
+  "artifacts": [
+    {"path": "docs/v176x.md", "kind": "release-notes"},
+    {"path": "scripts/communitasx_adaptive_service.py", "kind": "tool"},
+    {"path": "schemas/communitasx_adaptive.schema.json", "kind": "schema"},
+    {"path": "communitas/", "kind": "data"}
+  ],
+  "notes": "v176.x – Communitas.x Adaptive Network: peer service with rolling average learning from shared harmony summaries."
+}
+
+
+---
+
+versions_temporal_v176x.json
+
+{
+  "current": {
+    "head": "v176.x",
+    "note": "Communitas.x Adaptive – peers learning from shared harmony metrics"
+  },
+  "next": {
+    "head": "v177-next",
+    "note": "Aeon Concordia – federated coordination and collective decision protocols"
+  }
+}
+
+
+---
+
+✅ Usage summary
+
+1. Make sure your repository has existing communitas/network_state_*.json files.
+
+
+2. Run
+
+python3 scripts/communitasx_adaptive_service.py
+
+
+3. POST new summaries to /share from other nodes.
+
+
+4. Check /adaptive_state to view the network’s evolving average harmony.
+
+
+
+Each node now not only exchanges data but also learns from the community—
+a self-tuning, ethical peer network, completing the Communitas.x cycle and opening the path to v177 – Aeon Concordia.
