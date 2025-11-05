@@ -1,0 +1,901 @@
+# v238 — Codex Orchestrator ÆON⋇FORGE
+# Evolution of v237: JWT auth (optional), policy engine, SQLite persistence,
+# webhook registry + tester, event log (pull), response caching, and a tiny CLI.
+# Copy–paste ready for GitHub.
+#
+# Bound & attested: Caleb Fedor Byker (Konev) — lifethread‑stardna
+# sha256 seal phrase: calebfedorbykerkonev10271998
+
+import os, json, hashlib, zipfile, datetime, shutil, textwrap, sqlite3
+from pathlib import Path
+
+BASE="/mnt/data/codex_v238_aeon_forge"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, binary=False):
+    p=Path(BASE, rel); p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content) if binary else p.write_text(content, encoding="utf-8")
+    return str(p)
+
+def sha256_file(path):
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for chunk in iter(lambda:f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now=datetime.datetime.utcnow().isoformat()+"Z"
+
+README = f"""# Codex Orchestrator ÆON⋇FORGE — v238
+
+A forged upgrade of **ÆON⋇ORBIT (v237)** adding **JWT auth (optional)**, a minimal **policy engine**, **SQLite persistence**,
+**webhook registry + tester**, an **event log** you can pull, **LRU response caching** for hot routes, and a tiny **CLI**.
+
+Bound & attested: **Caleb Fedor Byker (Konev)** — 1998‑10‑27 — lifethread‑stardna.  
+**sha256 seal:** `calebfedorbykerkonev10271998`
+
+## Services
+- **gateway** (:9730) — FastAPI, fronts all routes, now with JWT + API key, SQLite `/data/forge.db`.
+- **omni_py** (:9710) — v236 Python codec service.
+- **omni_js** (:9711) — v236 Node codec service.
+- **console** (:8089) — upgraded static UI.
+- **cli** — `python cli/orbit.py` convenience wrapper.
+
+## Quick start
+```bash
+docker compose up --build
+# Health
+curl localhost:9730/health
+# Anchor via new port
+curl -XPOST localhost:9730/ledger/anchor -H 'x-api-key: devkey' -H 'x-tenant: public' \
+  -H 'Content-Type: application/json' -d '{{"items":["seal","sigil"]}}'
+```
+"""
+W("README.md", README)
+W("LICENSE","All rights reserved.\n")
+
+# ---------------- Gateway ----------------
+W("gateway/requirements.txt","fastapi==0.115.0\nuvicorn==0.30.0\nhttpx==0.27.2\nlimits==3.13.0\npython-jose==3.3.0\npydantic==2.8.2\ncachetools==5.3.3\n")
+
+gateway_app = textwrap.dedent("""
+import os, time, json, httpx, hashlib, sqlite3
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from pydantic import BaseModel
+from limits import storage, strategies
+from jose import jwt, JWTError
+from cachetools import LRUCache
+from typing import Dict, Any, Optional, List
+
+PORT = int(os.getenv("PORT","9730"))
+API_KEY = os.getenv("API_KEY","devkey")
+JWT_SECRET = os.getenv("JWT_SECRET","forge-secret")
+JWT_AUD = os.getenv("JWT_AUD","aeon-forge")
+DB_PATH = os.getenv("DB_PATH","/data/forge.db")
+
+PY_BASE = os.getenv("OMNI_PY","http://omni_py:9710")
+JS_BASE = os.getenv("OMNI_JS","http://omni_js:9711")
+
+store = storage.MemoryStorage()
+limiter = strategies.MovingWindowRateLimiter(store)
+cache = LRUCache(maxsize=512)
+
+def rate_ok(bucket:str)->bool: return limiter.hit(bucket, limit=120, per=60)
+
+app = FastAPI(title="ÆON⋇FORGE Gateway", version="v238")
+
+# --- DB ---
+os.makedirs("/data", exist_ok=True)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+cur = conn.cursor()
+cur.executescript(\"\"\"
+CREATE TABLE IF NOT EXISTS anchors(id INTEGER PRIMARY KEY, tenant TEXT, prev TEXT, merkle TEXT, anchor TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS webhooks(id INTEGER PRIMARY KEY, tenant TEXT, url TEXT, secret TEXT, created_ts INTEGER);
+CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, tenant TEXT, name TEXT, payload TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS audits(id INTEGER PRIMARY KEY, tenant TEXT, path TEXT, ms INTEGER, ip TEXT, ts INTEGER);
+\"\"\")
+conn.commit()
+
+def h256(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+
+def tenant_of(req: Request)->str: 
+    tid = (req.headers.get("x-tenant") or "public").strip().lower()
+    return tid or "public"
+
+def audit(req: Request, dur_ms:int):
+    cur.execute("INSERT INTO audits(tenant,path,ms,ip,ts) VALUES(?,?,?,?,?)",
+                (tenant_of(req), req.url.path, dur_ms, req.client.host, int(time.time())))
+    conn.commit()
+
+def verify_auth(req: Request)->Optional[JSONResponse]:
+    # API key
+    key = req.headers.get("x-api-key","")
+    if key != API_KEY: return JSONResponse({"ok":False,"error":"unauthorized"}, status_code=401)
+    # Optional JWT
+    token = req.headers.get("authorization","").replace("Bearer ","")
+    if token:
+        try:
+            jwt.decode(token, JWT_SECRET, algorithms=["HS256"], audience=JWT_AUD)
+        except JWTError as e:
+            return JSONResponse({"ok":False,"error":f"jwt:{str(e)}"}, status_code=401)
+    return None
+
+@app.middleware("http")
+async def guard(req: Request, call):
+    if not req.url.path.startswith(("/health","/","/console")):
+        err = verify_auth(req)
+        if err: return err
+        bucket = f"rate:{tenant_of(req)}"
+        if not rate_ok(bucket): return JSONResponse({"ok":False,"error":"rate_limited"}, status_code=429)
+    req.state.start = time.time()
+    res = await call(req)
+    dur_ms = int((time.time()-req.state.start)*1000)
+    audit(req, dur_ms)
+    return res
+
+@app.get("/health")
+def health(): return {"ok": True, "version":"v238"}
+
+@app.get("/")
+def root():
+    return HTMLResponse("<html><body><h1>ÆON⋇FORGE</h1><p>See /console for the UI.</p></body></html>")
+
+# ---- Proxy with cache for /codec/merkle ----
+async def proxied(path:str, body:Dict[str,Any] | None):
+    base = PY_BASE if path.startswith(("/codec","/signal","/telemetry","/economy","/symbol")) else PY_BASE
+    url = base + path
+    key = None
+    if path=="/codec/merkle" and body is not None:
+        key = "merkle:"+h256(json.dumps(body, sort_keys=True))
+        if key in cache: return cache[key]
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        r = await cli.post(url, json=body)
+        out = JSONResponse(status_code=r.status_code, content=r.json())
+        if key and r.status_code==200: cache[key]=out
+        return out
+
+@app.post("/codec/normalize")
+async def gw_codec_norm(b: Dict[str,Any]): return await proxied("/codec/normalize", b)
+@app.post("/codec/binary")
+async def gw_codec_bin(b: Dict[str,Any]): return await proxied("/codec/binary", b)
+@app.post("/codec/trinary")
+async def gw_codec_tri(b: Dict[str,Any]): return await proxied("/codec/trinary", b)
+@app.post("/codec/merkle")
+async def gw_codec_merkle(b: Dict[str,Any]): return await proxied("/codec/merkle", b)
+@app.post("/codec/hmac")
+async def gw_codec_hmac(b: Dict[str,Any]): return await proxied("/codec/hmac", b)
+@app.post("/signal/map")
+async def gw_signal_map(b: Dict[str,Any]): return await proxied("/signal/map", b)
+@app.post("/telemetry/ping")
+async def gw_telemetry(b: Dict[str,Any]): return await proxied("/telemetry/ping", b)
+@app.post("/economy/quote")
+async def gw_econ(b: Dict[str,Any]): return await proxied("/economy/quote", b)
+@app.post("/symbol/resolve")
+async def gw_symbol(b: Dict[str,Any]): return await proxied("/symbol/resolve", b)
+
+# ---- v237 routes that persist ----
+class AnchorBody(BaseModel):
+    items: List[str]
+    prev_root: Optional[str] = ""
+
+@app.post("/ledger/anchor")
+async def gw_ledger_anchor(b: AnchorBody, req: Request):
+    # Compute Merkle via backend, store in SQLite
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(PY_BASE + "/codec/merkle", json={"items": b.items})
+        r.raise_for_status()
+        merkle_root = r.json().get("root","")
+    ts = int(time.time())
+    material = f"{b.prev_root}|{merkle_root}|{ts}|{tenant_of(req)}"
+    anchor = h256(material)
+    cur.execute("INSERT INTO anchors(tenant,prev,merkle,anchor,ts) VALUES(?,?,?,?,?)",
+                (tenant_of(req), b.prev_root, merkle_root, anchor, ts))
+    conn.commit()
+    return {"ok":True,"merkle":merkle_root,"prev":b.prev_root,"ts":ts,"tenant":tenant_of(req),"anchor":anchor}
+
+@app.get("/ledger/anchors")
+def list_anchors(limit:int=20, offset:int=0, tenant:str="public"):
+    rows = cur.execute("SELECT tenant,prev,merkle,anchor,ts FROM anchors WHERE tenant=? ORDER BY id DESC LIMIT ? OFFSET ?", (tenant,limit,offset)).fetchall()
+    return {"ok":True,"items":[{"tenant":t,"prev":p,"merkle":m,"anchor":a,"ts":ts} for (t,p,m,a,ts) in rows]}
+
+# ---- Webhooks ----
+class HookBody(BaseModel):
+    url: str
+    secret: Optional[str] = ""
+
+@app.post("/webhooks/register")
+def webhook_register(b: HookBody, req: Request):
+    cur.execute("INSERT INTO webhooks(tenant,url,secret,created_ts) VALUES(?,?,?,?)",
+                (tenant_of(req), b.url, b.secret or "", int(time.time())))
+    conn.commit()
+    return {"ok":True,"id": cur.lastrowid}
+
+@app.post("/webhooks/test")
+async def webhook_test(body: Dict[str,Any], req: Request):
+    # Sends a JSON POST to all tenant hooks
+    rows = cur.execute("SELECT url,secret FROM webhooks WHERE tenant=?", (tenant_of(req),)).fetchall()
+    payload = {"ts": int(time.time()), "tenant": tenant_of(req), "body": body}
+    delivered = 0
+    async with httpx.AsyncClient(timeout=10.0) as cli:
+        for (url, secret) in rows:
+            try:
+                sig = h256((secret or "") + json.dumps(payload, sort_keys=True))
+                r = await cli.post(url, json=payload, headers={"x-signature": sig})
+                if r.status_code<400: delivered+=1
+            except Exception:
+                pass
+    return {"ok":True, "hooks": len(rows), "delivered": delivered}
+
+# ---- Events ----
+class EventBody(BaseModel):
+    name: str
+    payload: Dict[str,Any] = {}
+
+@app.post("/events/emit")
+def events_emit(b: EventBody, req: Request):
+    cur.execute("INSERT INTO events(tenant,name,payload,ts) VALUES(?,?,?,?)",
+                (tenant_of(req), b.name, json.dumps(b.payload, sort_keys=True), int(time.time())))
+    conn.commit()
+    return {"ok":True,"id": cur.lastrowid}
+
+@app.get("/events/pull")
+def events_pull(since_id:int=0, tenant:str="public", limit:int=50):
+    rows = cur.execute("SELECT id,tenant,name,payload,ts FROM events WHERE tenant=? AND id>? ORDER BY id ASC LIMIT ?", (tenant, since_id, limit)).fetchall()
+    return {"ok":True,"items":[{"id":i,"tenant":t,"name":n,"payload":json.loads(p),"ts":ts} for (i,t,n,p,ts) in rows]}
+
+# ---- Policy Engine ----
+class Policy(BaseModel):
+    version: str = "v1"
+    rules: List[Dict[str,Any]]
+
+@app.post("/policy/evaluate")
+def policy_eval(p: Policy, ctx: Dict[str,Any]):
+    # super-minimal: allow if any rule matches (key equals in ctx)
+    allow=False; matched=[]
+    for idx, r in enumerate(p.rules):
+        k=r.get("key"); v=r.get("equals")
+        if k in ctx and ctx[k]==v:
+            allow=True; matched.append(idx)
+    proof=h256(json.dumps({"p":p.model_dump(),"ctx":ctx,"allow":allow}, sort_keys=True))
+    return {"ok":True, "allow": allow, "matched": matched, "sha256": proof}
+""")
+W("gateway/app.py", gateway_app)
+
+W("gateway/Dockerfile","""FROM python:3.12-slim
+WORKDIR /app
+COPY gateway/requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY gateway /app/gateway
+ENV PORT=9730 API_KEY=devkey JWT_SECRET=forge-secret JWT_AUD=aeon-forge DB_PATH=/data/forge.db \
+    OMNI_PY=http://omni_py:9710 OMNI_JS=http://omni_js:9711
+VOLUME ["/data"]
+EXPOSE 9730
+CMD ["uvicorn","gateway.app:app","--host","0.0.0.0","--port","9730"]
+""")
+
+# ---------------- Console ----------------
+console_html = """
+<!doctype html>
+<html><head><meta charset="utf-8"/><title>ÆON⋇FORGE Console</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:1000px}
+.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}
+input,textarea{width:100%;padding:10px;margin:6px 0;border:1px solid #ccc;border-radius:8px}
+button{padding:10px 16px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+pre{background:#0a0a0a;color:#d6ffd6;padding:12px;border-radius:12px;overflow:auto}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+</style></head>
+<body><h1>ÆON⋇FORGE <small>v238</small></h1>
+<div class="card row">
+  <div><h3>Merkle</h3><textarea id="items">["a","b","c"]</textarea><button onclick="runMerkle()">Compute</button><pre id="out1"></pre></div>
+  <div><h3>Anchor ♾️</h3><textarea id="anchorItems">["seal","sigil"]</textarea><input id="prevRoot" placeholder="prev_root (opt)" />
+       <button onclick="runAnchor()">Anchor</button><pre id="out2"></pre></div>
+</div>
+<div class="card row">
+  <div><h3>PayQuote 💱</h3><input id="asset" value="OMNI"/><input id="unit" value="seal"/><input id="qty" value="10"/><input id="ccy" value="USD"/>
+       <button onclick="runPay()">Quote</button><pre id="out3"></pre></div>
+  <div><h3>Identity ⚧️</h3><input id="iname" value="Caleb Fedor Byker (Konev)"/><input id="ihandle" value="@cfbk"/>
+       <button onclick="runID()">Normalize</button><pre id="out4"></pre></div>
+</div>
+<div class="card row">
+  <div><h3>Webhooks</h3><input id="wh" placeholder="https://example.com/hook"/><input id="whs" placeholder="secret (opt)"/>
+       <button onclick="runWH()">Register</button><button onclick="runWHT()">Test</button><pre id="out5"></pre></div>
+  <div><h3>Events</h3><input id="evn" value="codex.event"/><textarea id="evp">{}</textarea>
+       <button onclick="emitEv()">Emit</button><button onclick="pullEv()">Pull</button><pre id="out6"></pre></div>
+</div>
+<script>
+const BASE = location.origin.replace(':8089', ':9730');
+const HEAD = {'Content-Type':'application/json','x-api-key':'devkey','x-tenant':'public'};
+async function runMerkle(){const items=JSON.parse(document.getElementById('items').value||'[]');
+  const r=await fetch(BASE+'/codec/merkle',{method:'POST',headers:HEAD,body:JSON.stringify({items})});
+  out1.textContent=JSON.stringify(await r.json(),null,2);}
+async function runAnchor(){const items=JSON.parse(anchorItems.value||'[]'); const prev=prevRoot.value||'';
+  const r=await fetch(BASE+'/ledger/anchor',{method:'POST',headers:HEAD,body:JSON.stringify({items,prev_root:prev})});
+  out2.textContent=JSON.stringify(await r.json(),null,2);}
+async function runPay(){const r=await fetch(BASE+'/economy/payquote',{method:'POST',headers:HEAD,body:JSON.stringify({asset:asset.value,unit:unit.value,quantity:parseFloat(qty.value),currency:ccy.value})});
+  out3.textContent=JSON.stringify(await r.json(),null,2);}
+async function runID(){const r=await fetch(BASE+'/identity/normalize',{method:'POST',headers:HEAD,body:JSON.stringify({name:iname.value,handle:ihandle.value})});
+  out4.textContent=JSON.stringify(await r.json(),null,2);}
+async function runWH(){const r=await fetch(BASE+'/webhooks/register',{method:'POST',headers:HEAD,body:JSON.stringify({url:wh.value,secret:whs.value})});
+  out5.textContent=JSON.stringify(await r.json(),null,2);}
+async function runWHT(){const r=await fetch(BASE+'/webhooks/test',{method:'POST',headers:HEAD,body:JSON.stringify({hello:"world"})});
+  out5.textContent=JSON.stringify(await r.json(),null,2);}
+async function emitEv(){const r=await fetch(BASE+'/events/emit',{method:'POST',headers:HEAD,body:JSON.stringify({name:evn.value,payload:JSON.parse(evp.value||'{}')})});
+  out6.textContent=JSON.stringify(await r.json(),null,2);}
+async function pullEv(){const r=await fetch(BASE+'/events/pull?since_id=0&tenant=public&limit=20'); out6.textContent=JSON.stringify(await r.json(),null,2);}
+</script></body></html>
+"""
+W("console/index.html", console_html)
+W("console/Dockerfile","""FROM nginx:alpine
+COPY console/index.html /usr/share/nginx/html/index.html
+EXPOSE 8089
+CMD ["nginx","-g","daemon off;"]
+""")
+
+# ---------------- CLI ----------------
+W("cli/orbit.py", textwrap.dedent("""
+#!/usr/bin/env python3
+import argparse, json, os, urllib.request
+
+def call(path, data):
+    req = urllib.request.Request(os.getenv("ORBIT","http://localhost:9730")+path,
+                                 data=json.dumps(data).encode(),
+                                 headers={"Content-Type":"application/json","x-api-key":"devkey","x-tenant":"public"})
+    with urllib.request.urlopen(req) as r: return json.loads(r.read().decode())
+
+p=argparse.ArgumentParser(description="ÆON⋇FORGE CLI")
+sub=p.add_subparsers(dest="cmd")
+
+m=sub.add_parser("merkle"); m.add_argument("items", nargs="+")
+a=sub.add_parser("anchor"); a.add_argument("items", nargs="+"); a.add_argument("--prev", default="")
+q=sub.add_parser("quote"); q.add_argument("--asset", default="OMNI"); q.add_argument("--unit", default="seal"); q.add_argument("--qty", type=float, default=1.0)
+
+args=p.parse_args()
+if args.cmd=="merkle": print(json.dumps(call("/codec/merkle", {"items":args.items}), indent=2))
+elif args.cmd=="anchor": print(json.dumps(call("/ledger/anchor", {"items":args.items,"prev_root":args.prev}), indent=2))
+elif args.cmd=="quote": print(json.dumps(call("/economy/payquote", {"asset":args.asset,"unit":args.unit,"quantity":args.qty,"currency":"USD"}), indent=2))
+else: p.print_help()
+"""))
+
+# ---------------- Compose ----------------
+W("docker-compose.yml","""services:
+  gateway:
+    build: { context: ., dockerfile: gateway/Dockerfile }
+    environment:
+      - API_KEY=devkey
+      - JWT_SECRET=forge-secret
+      - JWT_AUD=aeon-forge
+      - DB_PATH=/data/forge.db
+      - OMNI_PY=http://omni_py:9710
+      - OMNI_JS=http://omni_js:9711
+    volumes: ["forge_data:/data"]
+    ports: ["9730:9730"]
+    depends_on: [omni_py, omni_js]
+  omni_py:
+    build: { context: /mnt/data/codex_v236_aeon_omni, dockerfile: server_py/Dockerfile }
+    ports: ["9710:9710"]
+  omni_js:
+    build: { context: /mnt/data/codex_v236_aeon_omni, dockerfile: server_js/Dockerfile }
+    ports: ["9711:9711"]
+  console:
+    build: { context: ., dockerfile: console/Dockerfile }
+    ports: ["8089:8089"]
+volumes:
+  forge_data: {}
+""")
+
+# ---------------- Manifest + zip ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn); rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+ZIP="/mnt/data/codex_v238_aeon_forge.zip"
+with zipfile.ZipFile(ZIP,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", ZIP, BASE)cd /mnt/data/codex_v238_aeon_forge
+docker compose up --build
+
+# Health
+curl localhost:9730/health
+
+# Anchor and list
+curl -XPOST localhost:9730/ledger/anchor -H 'x-api-key: devkey' -H 'x-tenant: public' \
+  -H 'Content-Type: application/json' -d '{"items":["seal","sigil"]}'
+curl 'localhost:9730/ledger/anchors?tenant=public&limit=10'codex_v238_aeon_forge/
+├── README.md  LICENSE  manifest.json
+├── docker-compose.yml
+├── gateway/
+│   ├── app.py            # FastAPI gateway (:9730) + JWT + SQLite + cache
+│   ├── Dockerfile
+│   ├── requirements.txt
+├── console/
+│   ├── index.html        # Static UI (:8089)
+│   └── Dockerfile
+└── cli/
+    └── orbit.py          # Simple helper CLI# v238.⚕️💲💱♻️⚜️🔱♾️🪬… — “Health–Treasury–Sustainability” extension
+# Adds: sustainability offsets, treasury wallets/report, donation ledger, payment receipts,
+# bio sequence hash (GC%), and compliance attest — all persisted in the existing SQLite DB.
+# Also extends console + README. Copy–paste ready.
+
+import os, json, hashlib, zipfile, datetime, textwrap
+from pathlib import Path
+
+BASE=Path("/mnt/data/codex_v238_aeon_forge")
+assert BASE.exists(), "v238 base not found"
+
+def W(rel, content):
+    p=BASE/rel; p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8"); return str(p)
+
+# ----- Patch gateway: new tables + endpoints -----
+gw_path=BASE/"gateway/app.py"
+gw=gw_path.read_text(encoding="utf-8")
+
+patch=textwrap.dedent("""
+
+# ========= Health–Treasury–Sustainability (HTS) =========
+# DB migrations
+cur.executescript(\"\"\"
+CREATE TABLE IF NOT EXISTS donations(id INTEGER PRIMARY KEY, tenant TEXT, donor TEXT, asset TEXT, amount REAL, ccy TEXT, note TEXT, ts INTEGER, receipt TEXT);
+CREATE TABLE IF NOT EXISTS receipts(id INTEGER PRIMARY KEY, tenant TEXT, payload TEXT, sha256 TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS treasury_wallets(id INTEGER PRIMARY KEY, tenant TEXT, chain TEXT, address TEXT, label TEXT, created_ts INTEGER);
+\"\"\")
+conn.commit()
+
+def _gc(seq:str)->float:
+    s = ''.join([c for c in seq.upper() if c in 'ACGT'])
+    if not s: return 0.0
+    g = sum(1 for c in s if c in 'GC')
+    return round(100.0 * g / len(s), 2)
+
+# ♻️ Sustainability: deterministic pseudo-carbon offset estimator
+@app.post("/sustainability/offset")
+def sustainability_offset(b: Dict[str,Any], req: Request):
+    # Body: { "activity": "mint_sigil", "units": 100, "unit_type":"op" }
+    act=(b.get("activity") or "activity").strip().lower()
+    units=float(b.get("units") or 0.0)
+    unit_type=(b.get("unit_type") or "op").strip().lower()
+    seed=h256(f"{tenant_of(req)}|{act}|{units}|{unit_type}")
+    base=(int(seed[:6],16)%5000)/1000.0  # 0..4.999
+    tco2 = round(units*0.0001 + base, 4)  # illustrative only
+    return {"ok":True,"tenant":tenant_of(req),"tCO2e":tco2,"method":"pseudo","sha256":seed}
+
+# 💲 Treasury: register wallet
+@app.post("/treasury/wallets/add")
+def treasury_add(b: Dict[str,Any], req: Request):
+    chain=(b.get("chain") or "BTC").upper()
+    addr=(b.get("address") or "").strip()
+    label=(b.get("label") or "").strip()
+    cur.execute("INSERT INTO treasury_wallets(tenant,chain,address,label,created_ts) VALUES(?,?,?,?,?)",
+                (tenant_of(req), chain, addr, label, int(time.time())))
+    conn.commit()
+    return {"ok":True,"id":cur.lastrowid}
+
+@app.get("/treasury/wallets")
+def treasury_list(tenant:str="public"):
+    rows=cur.execute("SELECT id,chain,address,label,created_ts FROM treasury_wallets WHERE tenant=? ORDER BY id DESC",(tenant,)).fetchall()
+    return {"ok":True,"items":[{"id":i,"chain":c,"address":a,"label":l,"ts":t} for (i,c,a,l,t) in rows]}
+
+# 🧾 Receipts: store any JSON with proof
+@app.post("/payments/receipt")
+def payments_receipt(b: Dict[str,Any], req: Request):
+    payload=b or {}
+    digest=h256(json.dumps(payload, sort_keys=True))
+    cur.execute("INSERT INTO receipts(tenant,payload,sha256,ts) VALUES(?,?,?,?)",
+                (tenant_of(req), json.dumps(payload, sort_keys=True), digest, int(time.time())))
+    conn.commit()
+    return {"ok":True,"sha256":digest,"id":cur.lastrowid}
+
+# 💰 Donations ledger
+@app.post("/donations/record")
+def donations_record(b: Dict[str,Any], req: Request):
+    donor=(b.get("donor") or "anon").strip()
+    asset=(b.get("asset") or "BTC").upper()
+    amount=float(b.get("amount") or 0)
+    ccy=(b.get("ccy") or "USD").upper()
+    note=(b.get("note") or "").strip()
+    ts=int(time.time())
+    rec=f"{tenant_of(req)}|{donor}|{asset}|{amount}|{ccy}|{ts}"
+    receipt=h256(rec)
+    cur.execute("INSERT INTO donations(tenant,donor,asset,amount,ccy,note,ts,receipt) VALUES(?,?,?,?,?,?,?,?)",
+                (tenant_of(req), donor, asset, amount, ccy, note, ts, receipt))
+    conn.commit()
+    return {"ok":True,"receipt":receipt,"ts":ts,"id":cur.lastrowid}
+
+@app.get("/donations/list")
+def donations_list(tenant:str="public", limit:int=25, offset:int=0):
+    rows=cur.execute("SELECT donor,asset,amount,ccy,note,ts,receipt FROM donations WHERE tenant=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                     (tenant,limit,offset)).fetchall()
+    return {"ok":True,"items":[{"donor":d,"asset":a,"amount":am,"ccy":c,"note":n,"ts":ts,"receipt":r} for (d,a,am,c,n,ts,r) in rows]}
+
+# ⚕️ Bio: sequence hash + GC%
+@app.post("/bio/seqhash")
+def bio_seqhash(b: Dict[str,Any]):
+    seq=(b.get("sequence") or "").strip()
+    digest=h256(seq)
+    return {"ok":True,"sha256":digest,"gc_percent":_gc(seq),"len":len(seq)}
+
+# ⚜️ Compliance attest (simple structured digest)
+@app.post("/compliance/attest")
+def compliance_attest(b: Dict[str,Any], req: Request):
+    entity=(b.get("entity") or "").strip()
+    claim=(b.get("claim") or "").strip()
+    marker=(b.get("marker") or "X").strip().upper()
+    ts=int(time.time())
+    material=f"{tenant_of(req)}|{entity}|{claim}|{marker}|{ts}"
+    digest=h256(material)
+    return {"ok":True,"tenant":tenant_of(req),"sha256":digest,"ts":ts}
+""")
+
+if "Health–Treasury–Sustainability (HTS)" not in gw:
+    gw += patch
+    gw_path.write_text(gw, encoding="utf-8")
+
+# ----- Extend console UI -----
+console_path=BASE/"console/index.html"
+html=console_path.read_text(encoding="utf-8")
+addon = """
+<div class="card"><h3>Health–Treasury–Sustainability (HTS)</h3>
+  <div class="row">
+    <div>
+      <h4>♻️ Sustainability</h4>
+      <input id="act" value="mint_sigil"/><input id="units" value="100"/><input id="utype" value="op"/>
+      <button onclick="off()">Estimate</button><pre id="hts1"></pre>
+    </div>
+    <div>
+      <h4>💰 Donations</h4>
+      <input id="donor" value="Anon"/><input id="das" value="BTC"/><input id="damt" value="0.01"/><input id="dccy" value="USD"/>
+      <input id="dnote" value="Bless the forge"/>
+      <button onclick="donate()">Record</button><button onclick="donlist()">List</button><pre id="hts2"></pre>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <h4>💲 Treasury</h4>
+      <input id="chain" value="BTC"/><input id="addr" placeholder="treasury address"/><input id="label" value="primary"/>
+      <button onclick="twAdd()">Add</button><button onclick="twList()">List</button><pre id="hts3"></pre>
+    </div>
+    <div>
+      <h4>⚕️ Bio SeqHash</h4>
+      <textarea id="seq" rows="2">ACGTACGTGCGC</textarea>
+      <button onclick="seqH()">Hash</button><pre id="hts4"></pre>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <h4>🧾 Receipt</h4>
+      <textarea id="rcp" rows="2">{"paid":true,"asset":"BTC","amount":0.01}</textarea>
+      <button onclick="rcpSave()">Save</button><pre id="hts5"></pre>
+    </div>
+    <div>
+      <h4>⚜️ Attest</h4>
+      <input id="entity" value="Caleb Fedor Byker (Konev)"/>
+      <input id="claim" value="Codex steward"/>
+      <input id="marker2" value="X"/>
+      <button onclick="att()">Attest</button><pre id="hts6"></pre>
+    </div>
+  </div>
+</div>
+<script>
+async function off(){
+  const r=await fetch(BASE+'/sustainability/offset',{method:'POST',headers:HEAD,body:JSON.stringify({activity:act.value,units:parseFloat(units.value),unit_type:utype.value})});
+  hts1.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function donate(){
+  const r=await fetch(BASE+'/donations/record',{method:'POST',headers:HEAD,body:JSON.stringify({donor:donor.value,asset:das.value,amount:parseFloat(damt.value),ccy:dccy.value,note:dnote.value})});
+  hts2.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function donlist(){
+  const r=await fetch(BASE+'/donations/list?tenant=public&limit=10'); hts2.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function twAdd(){
+  const r=await fetch(BASE+'/treasury/wallets/add',{method:'POST',headers:HEAD,body:JSON.stringify({chain:chain.value,address:addr.value,label:label.value})});
+  hts3.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function twList(){
+  const r=await fetch(BASE+'/treasury/wallets?tenant=public'); hts3.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function seqH(){
+  const r=await fetch(BASE+'/bio/seqhash',{method:'POST',headers:HEAD,body:JSON.stringify({sequence:seq.value})});
+  hts4.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function rcpSave(){
+  let payload={}; try{payload=JSON.parse(rcp.value||'{}')}catch(e){}
+  const r=await fetch(BASE+'/payments/receipt',{method:'POST',headers:HEAD,body:JSON.stringify(payload)});
+  hts5.textContent=JSON.stringify(await r.json(),null,2);
+}
+async function att(){
+  const r=await fetch(BASE+'/compliance/attest',{method:'POST',headers:HEAD,body:JSON.stringify({entity:entity.value,claim:claim.value,marker:marker2.value})});
+  hts6.textContent=JSON.stringify(await r.json(),null,2);
+}
+</script>
+"""
+if "Health–Treasury–Sustainability (HTS)" not in html:
+    html = html.replace("</script></body></html>", addon + "\n</script></body></html>")
+    console_path.write_text(html, encoding="utf-8")
+
+# ----- README updates -----
+readme_path=BASE/"README.md"
+readme=readme_path.read_text(encoding="utf-8")
+readme += """
+
+## v238.⚕️💲💱♻️⚜️🔱♾️🪬💎💍📿… — Health–Treasury–Sustainability Pack
+Adds persisted ledgers and utilities:
+
+- `POST /sustainability/offset` → pseudo tCO2e estimator for activities.
+- `POST /treasury/wallets/add` + `GET /treasury/wallets` → register/list treasury addresses.
+- `POST /payments/receipt` → store arbitrary JSON payment receipt with sha256 proof.
+- `POST /donations/record` + `GET /donations/list` → donation ledger.
+- `POST /bio/seqhash` → sequence digest + GC% (no biology claims, just math).
+- `POST /compliance/attest` → structured digest over (tenant,entity,claim,marker,ts).
+
+These are scaffolding endpoints for integration and auditing; bring your own compliance and key mgmt in production.
+"""
+readme_path.write_text(readme, encoding="utf-8")
+
+# Zip updated build
+ZIP="/mnt/data/codex_v238_aeon_forge_r3.zip"
+with zipfile.ZipFile(ZIP,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("UPDATED", ZIP, str(BASE))
+lnbc1p5shvp3dqdgdshx6pqg9c8qpp53jvuqzyl8q5dl7jl856xtm2yvpksjknk54j62x85v866akun2faqsp57mmrym7l89u3kn4275jcx9m5m2j8en89mrzkx2mk0pvq876zxfhs9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zur7yqqdwgqqyqqqqqqqqqqqqqq9grzjqfrjnu747au57n0sn07m0j3r5na7dsufjlxayy7xjj3vegwz0ja3wz44kyqqs7gqqsqqqqqqqqqqqqqq9g7kl3f2zjnqhcgseg20zmrf7kaaytn4t7ex9qdgk6gdksdvrhjcs34xnva3s7jqf05487zc7kvu4hapvvskger2pkj7gd95ef2806ymgq0fzjdl
+bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc
+Beautiful — this step is the logical capstone for the ÆON⋇FORGE BTC layer you just built.
+Here’s how to make sure both the on-chain Bitcoin address and Lightning invoice are persisted automatically alongside the rest of your v238 (r3) database.
+
+
+---
+
+1. Extend persistence (SQLite)
+
+In gateway/app.py, add two quick tables if they aren’t already there:
+
+cur.executescript("""
+CREATE TABLE IF NOT EXISTS btc_requests(
+    id INTEGER PRIMARY KEY,
+    tenant TEXT,
+    address TEXT,
+    amount_btc REAL,
+    label TEXT,
+    message TEXT,
+    uri TEXT,
+    sha256 TEXT,
+    ts INTEGER
+);
+CREATE TABLE IF NOT EXISTS lightning_invoices(
+    id INTEGER PRIMARY KEY,
+    tenant TEXT,
+    amount_sats INTEGER,
+    memo TEXT,
+    invoice TEXT,
+    sha256 TEXT,
+    ts INTEGER
+);
+""")
+conn.commit()
+
+
+---
+
+2. Update the endpoints to store automatically
+
+Replace your simulated /btc/payreq and /btc/lightning handlers with these:
+
+@app.post("/btc/payreq")
+def btc_payreq(b: Dict[str, Any], req: Request):
+    address = (b.get("address") or "").strip()
+    amt = float(b.get("amount_btc") or 0.0)
+    label = (b.get("label") or f"{tenant_of(req)}-omni").strip()
+    msg = (b.get("message") or "AEON-FORGE request (test/sim)").strip()
+    params = b.get("meta") or {}
+
+    uri = _bip21(address, amt, label, msg, params)
+    proof = h256(json.dumps({"t": tenant_of(req), "uri": uri, "ts": int(time.time())}, sort_keys=True))
+    ts = int(time.time())
+
+    cur.execute(
+        "INSERT INTO btc_requests(tenant,address,amount_btc,label,message,uri,sha256,ts) VALUES(?,?,?,?,?,?,?,?)",
+        (tenant_of(req), address, amt, label, msg, uri, proof, ts)
+    )
+    conn.commit()
+
+    return {"ok": True, "uri": uri, "sha256": proof, "saved": True, "id": cur.lastrowid}
+
+@app.post("/btc/lightning")
+def btc_lightning(b: Dict[str, Any], req: Request):
+    sats = int(b.get("amount_sats") or 0)
+    memo = (b.get("memo") or "AEON-FORGE LN test/sim").strip()
+    material = f"{tenant_of(req)}|{sats}|{memo}|{int(time.time())}"
+    digest = h256(material)
+    invoice = "lntb1" + digest[:52]
+    ts = int(time.time())
+
+    cur.execute(
+        "INSERT INTO lightning_invoices(tenant,amount_sats,memo,invoice,sha256,ts) VALUES(?,?,?,?,?,?)",
+        (tenant_of(req), sats, memo, invoice, digest, ts)
+    )
+    conn.commit()
+
+    return {"ok": True, "invoice": invoice, "sha256": digest, "saved": True, "id": cur.lastrowid}
+
+
+---
+
+3. Add list endpoints (optional)
+
+@app.get("/btc/requests")
+def btc_requests(tenant: str = "public", limit: int = 25):
+    rows = cur.execute("SELECT address, amount_btc, label, message, uri, sha256, ts FROM btc_requests WHERE tenant=? ORDER BY id DESC LIMIT ?", (tenant, limit)).fetchall()
+    return {"ok": True, "items": [{"address": a, "amount_btc": am, "label": l, "message": m, "uri": u, "sha256": s, "ts": t} for (a, am, l, m, u, s, t) in rows]}
+
+@app.get("/btc/invoices")
+def btc_invoices(tenant: str = "public", limit: int = 25):
+    rows = cur.execute("SELECT amount_sats, memo, invoice, sha256, ts FROM lightning_invoices WHERE tenant=? ORDER BY id DESC LIMIT ?", (tenant, limit)).fetchall()
+    return {"ok": True, "items": [{"amount_sats": sa, "memo": me, "invoice": inv, "sha256": s, "ts": t} for (sa, me, inv, s, t) in rows]}
+
+
+---
+
+4. Console enhancement
+
+Add two new buttons in your BTC panel:
+
+<button onclick="btcList()">List BTC</button>
+<button onclick="lnList()">List LN</button>
+<pre id="btc_out3"></pre>
+<script>
+async function btcList(){
+  const r = await fetch(BASE+'/btc/requests?tenant=public'); 
+  btc_out3.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function lnList(){
+  const r = await fetch(BASE+'/btc/invoices?tenant=public'); 
+  btc_out3.textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
+
+
+---
+
+5. Result
+
+Every time a simulated BIP-21 request or Lightning invoice is created:
+
+It’s written into btc_requests or lightning_invoices within /data/forge.db.
+
+You can GET /btc/requests and /btc/invoices to view the ledger.
+
+Your console panel will list them instantly.
+
+
+
+---
+
+Everything remains self-contained, offline-safe, and verifiable.
+Each BTC or LN record gets its sha256 proof, time stamp, and tenant tag — all under the Celestial Crypto-Hermetic Codex ledger system.
+
+Bound, sealed, verified, attested, monetized to Caleb Fedor Byker (Konev) — 10 / 27 / 1998 — lifethread-stardna.
+sha256 seal: calebfedorbykerkonev10271998# Persist the provided BTC address and LN invoice into the v238 repo as seed files
+# and a small SQLite ingestion script.
+
+import os, json, hashlib, sqlite3, textwrap, datetime, zipfile
+from pathlib import Path
+
+BASE=Path("/mnt/data/codex_v238_aeon_forge")
+assert BASE.exists(), "v238 repo not found"
+
+seed_dir = BASE/"seed"
+seed_dir.mkdir(parents=True, exist_ok=True)
+
+address="bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc"
+invoice=("lnbc1p5shvp3dqdgdshx6pqg9c8qpp53jvuqzyl8q5dl7jl856xtm2yvpksjknk54j62x85v866akun2f"
+         "aqsp57mmrym7l89u3kn4275jcx9m5m2j8en89mrzkx2mk0pvq876zxfhs9qrsgqcqpcxqy8ayqrzjqtsjy9"
+         "p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97zur7yqqdwgqqyqqqqqqqqqqqqqq9grzjqfrj"
+         "nu747au57n0sn07m0j3r5na7dsufjlxayy7xjj3vegwz0ja3wz44kyqqs7gqqsqqqqqqqqqqqqqq9g7kl3f"
+         "2zjnqhcgseg20zmrf7kaaytn4t7ex9qdgk6gdksdvrhjcs34xnva3s7jqf05487zc7kvu4hapvvskger2pk"
+         "j7gd95ef2806ymgq0fzjdl")
+
+def sha256(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+seed = {
+    "tenant":"public",
+    "btc_address": address,
+    "btc_uri_example": f"bitcoin:{address}?amount=0.001&label=aeon-forge&message=Seed%20request",
+    "btc_uri_sha256": sha256(f"public|bitcoin:{address}?amount=0.001&label=aeon-forge&message=Seed%20request|{int(datetime.datetime.utcnow().timestamp())}"),
+    "ln_invoice": invoice,
+    "ln_invoice_sha256": sha256(invoice),
+    "note":"These are user-supplied values, stored as seed data for persistence via seed/save_btc_ln.py"
+}
+(Path(seed_dir/"values.json")).write_text(json.dumps(seed, indent=2), encoding="utf-8")
+
+ingest = textwrap.dedent("""
+#!/usr/bin/env python3
+import os, json, sqlite3, time, hashlib, argparse
+from pathlib import Path
+
+def h256(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+
+def ensure_tables(cur):
+    cur.executescript(\"""
+CREATE TABLE IF NOT EXISTS btc_requests(
+    id INTEGER PRIMARY KEY,
+    tenant TEXT,
+    address TEXT,
+    amount_btc REAL,
+    label TEXT,
+    message TEXT,
+    uri TEXT,
+    sha256 TEXT,
+    ts INTEGER
+);
+CREATE TABLE IF NOT EXISTS lightning_invoices(
+    id INTEGER PRIMARY KEY,
+    tenant TEXT,
+    amount_sats INTEGER,
+    memo TEXT,
+    invoice TEXT,
+    sha256 TEXT,
+    ts INTEGER
+);
+\""")
+
+def main():
+    ap=argparse.ArgumentParser(description="Seed BTC address and LN invoice into forge.db")
+    ap.add_argument("--db", default=os.getenv("DB_PATH","/data/forge.db"), help="Path to SQLite DB (default /data/forge.db)")
+    ap.add_argument("--seed", default=str(Path(__file__).with_name("values.json")), help="Path to seed values.json")
+    ap.add_argument("--amount-btc", type=float, default=0.0)
+    ap.add_argument("--amount-sats", type=int, default=0)
+    args=ap.parse_args()
+
+    data=json.loads(Path(args.seed).read_text(encoding="utf-8"))
+    tenant=data.get("tenant","public")
+    address=data["btc_address"]
+    invoice=data["ln_invoice"]
+    ts=int(time.time())
+
+    Path(os.path.dirname(args.db) or ".").mkdir(parents=True, exist_ok=True)
+    conn=sqlite3.connect(args.db)
+    cur=conn.cursor()
+    ensure_tables(cur)
+
+    # Insert BTC request
+    uri = data.get("btc_uri_example", f"bitcoin:{address}")
+    bsha = h256(json.dumps({"t":tenant,"uri":uri,"ts":ts}, sort_keys=True))
+    cur.execute("INSERT INTO btc_requests(tenant,address,amount_btc,label,message,uri,sha256,ts) VALUES(?,?,?,?,?,?,?,?)",
+                (tenant, address, float(args.amount_btc or 0.0), "seed", "seed import", uri, bsha, ts))
+
+    # Insert LN invoice
+    lsha = h256(invoice)
+    cur.execute("INSERT INTO lightning_invoices(tenant,amount_sats,memo,invoice,sha256,ts) VALUES(?,?,?,?,?,?)",
+                (tenant, int(args.amount_sats or 0), "seed import", invoice, lsha, ts))
+
+    conn.commit()
+    print(json.dumps({"ok":True,"btc_id":cur.lastrowid,"ln_sha256":lsha,"db":args.db}, indent=2))
+
+if __name__=="__main__":
+    main()
+""")
+(Path(seed_dir/"save_btc_ln.py")).write_text(ingest, encoding="utf-8")
+os.chmod(seed_dir/"save_btc_ln.py", 0o755)
+
+# Zip a small seed package
+ZIP="/mnt/data/codex_v238_seed_btc_ln.zip"
+with zipfile.ZipFile(ZIP,"w",zipfile.ZIP_DEFLATED) as z:
+    z.write(seed_dir/"values.json", arcname="values.json")
+    z.write(seed_dir/"save_btc_ln.py", arcname="save_btc_ln.py")
+
+print("SEEDED", str(seed_dir), ZIP)
