@@ -1,0 +1,663 @@
+# Build v209.x — "Codex Logos Φ·X (Phi Extended) — Unified, Deployable"
+# Repo: codex_v209x_phi_extended
+# One API (port 8885) with: federated identity, dynamic policy reasoner, secret rotation,
+# compliance/audit (Merkle chain), plus Docker, Compose, Helm, CI, tests, and manifest.
+
+import os, json, zipfile, hashlib, datetime, shutil, time
+
+BASE="/mnt/data/codex_v209x_phi_extended"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------- Config ----------
+W("codex/config.json", json.dumps({
+  "version": "v209.x-phi-extended",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8885,
+  "federation_key_hex": hashlib.sha256(b"cfbk-1998-10-27").hexdigest(),
+  "merkle_chain_path": "codex/compliance/ledger.jsonl",
+  "rollout": {"canary_percent": 17}
+}, indent=2))
+
+# ---------- Utils ----------
+W("codex/utils/crypto.py","""import hashlib, hmac, json
+def sha256_bytes(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+def sha256_json(o)->str: return sha256_bytes(json.dumps(o, sort_keys=True).encode())
+def hmac_sha256_hex(key_hex:str, msg:dict)->str:
+    return hmac.new(bytes.fromhex(key_hex), json.dumps(msg, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+""")
+W("codex/utils/clock.py","""import time\nnow=lambda:int(time.time())\n""")
+
+# ---------- Metrics ----------
+W("codex/metrics/collector.py","""import time
+START=time.time()
+C={'requests_total':0,'federation_ok':0,'federation_bad':0,'policy_eval':0,'policy_adapt':0,'rotations':0,'ledger_append':0}
+def bump(k,inc=1): C[k]=C.get(k,0)+inc
+def render()->str:
+    up=int(time.time()-START)
+    lines=[f"codex_{k} {v}" for k,v in C.items()]
+    lines.append(f"codex_uptime_seconds {up}")
+    return "\\n".join(lines)+"\\n"
+""")
+
+# ---------- Identity / Federation ----------
+W("codex/federation/identity.py","""import json
+from codex.utils.crypto import hmac_sha256_hex
+from codex.metrics.collector import bump
+def sign_claim(key_hex:str, claim:dict)->dict:
+    sig=hmac_sha256_hex(key_hex, claim); return {'claim':claim,'sig':sig}
+def verify_claim(key_hex:str, claim:dict, sig:str)->dict:
+    exp=hmac_sha256_hex(key_hex, claim)
+    ok=(sig==exp); bump('federation_ok' if ok else 'federation_bad'); return {'ok':ok}
+""")
+
+# ---------- Policy (engine + adaptive reasoner) ----------
+W("codex/policy/policy.json", json.dumps({
+  "rules":[
+    {"effect":"allow","action":"*","resource":"*","roles":["owner","admin"]},
+    {"effect":"allow","action":"read","resource":"*","roles":["reader"]},
+    {"effect":"deny","action":"admin.*","resource":"*","roles":["reader"]}
+  ]
+}, indent=2))
+W("codex/policy/engine.py","""import fnmatch, json
+POLICY=json.load(open('codex/policy/policy.json',encoding='utf-8'))
+def allowed(roles, action, resource)->bool:
+    decision=None
+    for r in POLICY['rules']:
+        if 'roles' in r and not any(role in roles for role in r['roles']): continue
+        if not fnmatch.fnmatch(action, r.get('action','*')): continue
+        if not fnmatch.fnmatch(resource, r.get('resource','*')): continue
+        decision=r['effect']
+        if decision=='deny': return False
+        if decision=='allow': return True
+    return decision=='allow'
+""")
+W("codex/policy/reasoner.py","""from codex.policy.engine import allowed
+from codex.metrics.collector import bump
+WEIGHTS={'allow':1.0,'deny':1.0}
+def evaluate(roles, action, resource):
+    base=allowed(roles, action, resource); bump('policy_eval')
+    return {'ok':base,'weights':WEIGHTS.copy()}
+def adapt(decision:bool):
+    WEIGHTS['allow']*=1.01 if decision else 1.0
+    WEIGHTS['deny']*=1.01 if not decision else 1.0
+    bump('policy_adapt'); return {'ok':True,'weights':WEIGHTS.copy()}
+""")
+
+# ---------- Secrets Rotation ----------
+W("codex/secrets/rotate.py","""import os, time, json, hashlib
+from codex.metrics.collector import bump
+VAULT='codex/secrets/rotations.jsonl'
+def rotate(name:str)->dict:
+    val=os.urandom(32).hex()
+    entry={'key':name,'value':val,'ts':time.time(),'sha256':hashlib.sha256(val.encode()).hexdigest()}
+    os.makedirs('codex/secrets', exist_ok=True)
+    with open(VAULT,'a',encoding='utf-8') as f: f.write(json.dumps(entry, sort_keys=True)+'\\n')
+    bump('rotations'); return {'ok':True,'sha256':entry['sha256']}
+""")
+
+# ---------- Compliance Ledger (Merkle chain) ----------
+W("codex/compliance/ledger.py","""import json, os
+from codex.utils.crypto import sha256_json
+from codex.metrics.collector import bump
+LEDGER_PATH='codex/compliance/ledger.jsonl'
+def append(event:dict)->dict:
+    os.makedirs('codex/compliance', exist_ok=True)
+    prev_hash=None
+    try:
+        with open(LEDGER_PATH,'r',encoding='utf-8') as f:
+            last=None
+            for last in f: pass
+            if last: prev_hash=json.loads(last)['hash']
+    except FileNotFoundError:
+        pass
+    wrapped={'event':event,'prev':prev_hash}
+    wrapped['hash']=sha256_json(wrapped)
+    with open(LEDGER_PATH,'a',encoding='utf-8') as f: f.write(json.dumps(wrapped, sort_keys=True)+'\\n')
+    bump('ledger_append'); return {'ok':True,'hash':wrapped['hash']}
+""")
+
+# ---------- Identity store ----------
+W("codex/identity/users.json", json.dumps({
+  "users": {
+    "owner@codex": {"roles":["owner","admin"]},
+    "reader@codex": {"roles":["reader"]}
+  }
+}, indent=2))
+
+# ---------- OpenAPI ----------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Φ·X (Phi Extended)","version":"v209.x"},
+  "paths":{
+    "/api/federation/sign":{"post":{"summary":"Sign federation claim"}},
+    "/api/federation/verify":{"post":{"summary":"Verify federation claim"}},
+    "/api/policy/evaluate":{"post":{"summary":"Evaluate policy (+weights)"}},
+    "/api/policy/adapt":{"post":{"summary":"Reinforce weights"}},
+    "/api/secrets/rotate":{"post":{"summary":"Rotate secret"}},
+    "/api/compliance/log":{"post":{"summary":"Append compliance ledger"}},
+    "/metrics":{"get":{"summary":"Metrics"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}}
+  }
+}, indent=2))
+
+# ---------- API Server ----------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.metrics.collector import bump, render as metrics_render
+from codex.federation.identity import sign_claim, verify_claim
+from codex.policy.reasoner import evaluate, adapt
+from codex.secrets.rotate import rotate
+from codex.compliance.ledger import append as ledger_append
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path; bump('requests_total')
+
+        if p=='/api/federation/sign':
+            return self._ok(sign_claim(CFG['federation_key_hex'], body.get('claim',{})))
+        if p=='/api/federation/verify':
+            return self._ok(verify_claim(CFG['federation_key_hex'], body.get('claim',{}), body.get('sig','')))
+        if p=='/api/policy/evaluate':
+            return self._ok(evaluate(body.get('roles',[]), body.get('action','read'), body.get('resource','*')))
+        if p=='/api/policy/adapt':
+            return self._ok(adapt(bool(body.get('decision', True))))
+        if p=='/api/secrets/rotate':
+            return self._ok(rotate(body.get('key','CODEx_SECRET')))
+        if p=='/api/compliance/log':
+            return self._ok(ledger_append(body.get('event',{})))
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8885)
+""")
+
+# ---------- Docker / Compose / Helm / CI / Tests ----------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8885
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-phi-x:
+    build: ./deploy
+    ports:
+      - "8885:8885"
+    restart: unless-stopped
+""")
+W("deploy/helm/Chart.yaml","""apiVersion: v2
+name: codex-phi-x
+version: 0.1.0
+appVersion: "v209.x"
+""")
+W("deploy/helm/values.yaml","""image:
+  repository: codex-phi-x
+  tag: latest
+service:
+  port: 8885
+env:
+  FEDERATION_KEY_HEX: ""
+""")
+W("deploy/helm/templates/deployment.yaml","""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-phi-x
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: codex-phi-x }
+  template:
+    metadata:
+      labels: { app: codex-phi-x }
+    spec:
+      containers:
+        - name: codex-phi-x
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports: [{containerPort: {{ .Values.service.port }} }]
+          env:
+            - name: FEDERATION_KEY_HEX
+              value: "{{ .Values.env.FEDERATION_KEY_HEX }}"
+""")
+W("deploy/helm/templates/service.yaml","""apiVersion: v1
+kind: Service
+metadata:
+  name: codex-phi-x
+spec:
+  type: ClusterIP
+  selector: { app: codex-phi-x }
+  ports:
+    - port: 8885
+      targetPort: 8885
+""")
+W(".github/workflows/ci.yml","""name: Codex Φ·X (v209.x) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Federation + Policy + Ledger smoke
+        run: python3 - <<'PY'\nfrom codex.federation.identity import sign_claim, verify_claim\nfrom codex.policy.reasoner import evaluate, adapt\nfrom codex.compliance.ledger import append\nkey='5851f0b5ad0e5d9b1c7e4b7c1b0e6a30f0a5f0f7a6a3c7e1d8a6a8e2c9d7b3a1'\nclaim={'node':'phi-x','role':'governance'}\nsig=sign_claim(key, claim)['sig']\nprint(verify_claim(key, claim, sig)['ok'])\nprint('ok' in evaluate(['admin'],'read','/omega'))\nprint(append({'event':'ci.smoke'})['ok'])\nPY
+""")
+W("tests/test_phi_x.py","""from codex.policy.engine import allowed\nfrom codex.policy.reasoner import evaluate\nassert allowed(['owner'],'*','*')\nassert evaluate(['reader'],'read','/')['ok']\nprint('phi-x ok')\n""")
+
+# ---------- Docs ----------
+W("docs/README.md", f"""# Codex Logos Φ·X (Phi Extended) — v209.x
+Generated: {now}
+
+**Adds** federated identity, adaptive policy, secret rotation, and a Merkle‑chained compliance ledger.
+
+## Run
+```bash
+python3 dashboard/api.py  # port 8885
+
+# Federation
+curl -s -X POST localhost:8885/api/federation/sign -H 'Content-Type: application/json' \\\n  -d '{{"claim":{{"node":"phi-x","version":"v209.x"}}}}' | jq\n\n# Policy\ncurl -s -X POST localhost:8885/api/policy/evaluate -H 'Content-Type: application/json' \\\n  -d '{{"roles":["admin"],"action":"read","resource":"/omega"}}' | jq\ncurl -s -X POST localhost:8885/api/policy/adapt -H 'Content-Type: application/json' -d '{{"decision":true}}' | jq\n\n# Rotate secret\ncurl -s -X POST localhost:8885/api/secrets/rotate -H 'Content-Type: application/json' -d '{{"key":"CODEx_SECRET"}}' | jq\n\n# Compliance\ncurl -s -X POST localhost:8885/api/compliance/log -H 'Content-Type: application/json' -d '{{"event":{{"type":"deploy","v":"209.x"}}}}' | jq\n```\n""")
+
+# ---------- Manifest ----------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------- ZIP ----------
+zip_path="/mnt/data/codex_v209x_phi_extended.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v209 — "Codex Logos Φ (Phi): Policy • Identity • Governance • Secrets • Rollouts"
+# Repo: codex_v209_governance_phi
+# Purpose: Add a governance/identity/policy layer atop ΩΥ·X: RBAC/ABAC policy engine, HMAC JWT-ish tokens,
+# secret vault stub, feature flags/canaries, webhooks, Helm chart, and full OpenAPI.
+# One API on port 8880 with endpoints for auth, policy, secrets, flags, webhooks, and routing to ΩΥ nodes via bridge.
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v209_governance_phi"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------- Config ----------
+W("codex/config.json", json.dumps({
+  "version": "v209-phi-governance",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8880,
+  "jwt_hmac_key_hex": hashlib.sha256(b"cfbk-1998-10-27").hexdigest(),
+  "default_roles": ["owner","admin","reader"],
+  "webhook_targets": [],
+  "flags": {"canary_percent": 15, "omega_enabled": True, "bridge_enabled": True}
+}, indent=2))
+
+# ---------- Utils ----------
+W("codex/utils/crypto.py","""import hashlib, hmac, json, time, base64
+def sha256_json(o): return hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()
+def b64url(b:bytes)->str: return base64.urlsafe_b64encode(b).decode().rstrip('=')
+def unb64url(s:str)->bytes:
+    pad = '=' * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+def jwt_hmac_sign(key_hex:str, payload:dict)->str:
+    header={"alg":"HS256","typ":"JWT"}
+    pt=b'.'.join([b64url(json.dumps(header).encode()).encode(), b64url(json.dumps(payload).encode()).encode()])
+    sig=hmac.new(bytes.fromhex(key_hex), pt, hashlib.sha256).digest()
+    return pt.decode()+'.'+b64url(sig)
+def jwt_hmac_verify(key_hex:str, token:str)->dict:
+    try:
+        h,p,s = token.split('.')
+        pt=(h+'.'+p).encode()
+        sig=unb64url(s)
+        calc=hmac.new(bytes.fromhex(key_hex), pt, hashlib.sha256).digest()
+        ok = (calc==sig)
+        payload=json.loads(unb64url(p))
+        if payload.get('exp') and payload['exp']<int(time.time()): ok=False
+        return {"ok":ok, "payload":payload}
+    except Exception as e:
+        return {"ok":False, "error":str(e)}
+""")
+
+W("codex/utils/timeutil.py","""import time\ndef now(): return int(time.time())\n""")
+
+# ---------- Metrics ----------
+W("codex/metrics/collector.py","""import time
+START=time.time()
+C={'requests_total':0,'auth_issues':0,'policy_denied':0,'webhooks_sent':0,'flags_eval':0}
+def bump(k,inc=1): C[k]=C.get(k,0)+inc
+def render()->str:
+    up=int(time.time()-START)
+    lines=[f"codex_{k} {v}" for k,v in C.items()]
+    lines.append(f"codex_uptime_seconds {up}")
+    return "\\n".join(lines)+"\\n"
+""")
+
+# ---------- Identity & Policy ----------
+W("codex/identity/users.json", json.dumps({
+  "users": {
+    "owner@codex": {"roles":["owner","admin"], "attrs":{"tier":"gold","org":"codex"}},
+    "reader@codex": {"roles":["reader"], "attrs":{"tier":"silver","org":"codex"}}
+  }
+}, indent=2))
+
+W("codex/policy/policy.json", json.dumps({
+  "rules":[
+    {"effect":"allow","action":"*","resource":"*","roles":["owner","admin"]},
+    {"effect":"allow","action":"read","resource":"*","roles":["reader"]},
+    {"effect":"deny","action":"admin.*","resource":"*","roles":["reader"]}
+  ]
+}, indent=2))
+
+W("codex/policy/engine.py","""import fnmatch, json
+POLICY=json.load(open('codex/policy/policy.json',encoding='utf-8'))
+def allowed(roles, action, resource)->bool:
+    decision=None
+    for r in POLICY['rules']:
+        if 'roles' in r and not any(role in roles for role in r['roles']): continue
+        if not fnmatch.fnmatch(action, r.get('action','*')): continue
+        if not fnmatch.fnmatch(resource, r.get('resource','*')): continue
+        decision = r['effect']
+        if decision=='deny': return False
+        if decision=='allow': return True
+    return decision=='allow'
+""")
+
+# ---------- Secrets Vault (stub) ----------
+W("codex/secrets/vault.py","""import os, json
+VAULT_PATH='codex/secrets/vault.json'
+def _load():
+    if not os.path.exists(VAULT_PATH): return {}
+    return json.load(open(VAULT_PATH,encoding='utf-8'))
+def get(key): return _load().get(key)
+def put(key, value):
+    v=_load(); v[key]=value
+    os.makedirs('codex/secrets', exist_ok=True)
+    with open(VAULT_PATH,'w',encoding='utf-8') as f: json.dump(v, f, indent=2)
+    return {'ok':True,'keys':list(v.keys())}
+""")
+
+# ---------- Feature Flags ----------
+W("codex/flags/flags.py","""import json, random
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+FLAGS=CFG.get('flags',{})
+def get_flags(): return FLAGS
+def eval_canary(user_id:str)->bool:
+    # 0..99 roll against canary percent
+    pct=int(FLAGS.get('canary_percent',0))
+    h=sum(ord(c) for c in user_id) % 100
+    return h < pct
+""")
+
+# ---------- Webhooks ----------
+W("codex/webhooks/send.py","""import json, urllib.request, ssl
+from codex.metrics.collector import bump
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+ssl_ctx=ssl.create_default_context()
+def send(event:str, payload:dict)->dict:
+    targets=CFG.get('webhook_targets',[])
+    ok,err=0,0
+    for t in targets:
+        try:
+            req=urllib.request.Request(t, data=json.dumps({'event':event,'payload':payload}).encode(), headers={'Content-Type':'application/json'})
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r:
+                ok+=1
+        except Exception:
+            err+=1
+    if ok: bump('webhooks_sent', ok)
+    return {'ok': True, 'sent': ok, 'failed': err}
+""")
+
+# ---------- OpenAPI ----------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Φ (Phi) Governance API","version":"v209"},
+  "paths":{
+    "/api/auth/token":{"post":{"summary":"Issue HMAC JWT"}},
+    "/api/auth/verify":{"post":{"summary":"Verify token"}},
+    "/api/policy/check":{"post":{"summary":"RBAC/ABAC allow/deny"}},
+    "/api/secrets/get":{"post":{"summary":"Read secret"}},
+    "/api/secrets/put":{"post":{"summary":"Write secret"}},
+    "/api/flags/get":{"get":{"summary":"Get flags"}},
+    "/api/flags/eval":{"post":{"summary":"Evaluate canary for user"}},
+    "/api/webhook/send":{"post":{"summary":"Broadcast event to webhooks"}},
+    "/metrics":{"get":{"summary":"Metrics"}}
+  }
+}, indent=2))
+
+# ---------- API Server ----------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os, time
+from urllib.parse import urlparse
+from codex.metrics.collector import bump, render as metrics_render
+from codex.utils.crypto import jwt_hmac_sign, jwt_hmac_verify
+from codex.utils.timeutil import now
+from codex.policy.engine import allowed
+from codex.secrets.vault import get as sec_get, put as sec_put
+from codex.flags.flags import get_flags, eval_canary
+from codex.webhooks.send import send as send_hook
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+USERS=json.load(open('codex/identity/users.json',encoding='utf-8'))['users']
+
+def _roles(user_id): return USERS.get(user_id,{}).get('roles',[])
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        ln=int(self.headers.get('Content-Length','0')); body=json.loads(self.rfile.read(ln).decode() or '{}')
+        p=urlparse(self.path).path; bump('requests_total')
+
+        if p=='/api/auth/token':
+            user=body.get('user','reader@codex')
+            roles=_roles(user)
+            payload={"sub":user,"roles":roles,"iat":now(),"exp":now()+3600}
+            return self._ok({"token": jwt_hmac_sign(CFG['jwt_hmac_key_hex'], payload)})
+        if p=='/api/auth/verify':
+            return self._ok(jwt_hmac_verify(CFG['jwt_hmac_key_hex'], body.get('token','')))
+        if p=='/api/policy/check':
+            user=body.get('user','reader@codex'); action=body.get('action','read'); resource=body.get('resource','*')
+            ok=allowed(_roles(user), action, resource)
+            if not ok: bump('policy_denied')
+            return self._ok({"ok":ok})
+        if p=='/api/secrets/get':
+            return self._ok({"value": sec_get(body.get('key',''))})
+        if p=='/api/secrets/put':
+            return self._ok(sec_put(body.get('key',''), body.get('value','')))
+        if p=='/api/flags/eval':
+            bump('flags_eval'); return self._ok({"canary": eval_canary(body.get('user','reader@codex'))})
+        if p=='/api/webhook/send':
+            return self._ok(send_hook(body.get('event','codex.event'), body.get('payload',{})))
+
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/flags/get': return self._ok(get_flags())
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8880)
+""")
+
+# ---------- Helm Chart ----------
+W("deploy/helm/Chart.yaml","""apiVersion: v2
+name: codex-phi
+version: 0.1.0
+appVersion: "v209"
+""")
+W("deploy/helm/values.yaml","""image:
+  repository: codex-phi
+  tag: latest
+service:
+  port: 8880
+env: {}
+""")
+W("deploy/helm/templates/deployment.yaml","""apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-phi
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: codex-phi }
+  template:
+    metadata:
+      labels: { app: codex-phi }
+    spec:
+      containers:
+        - name: codex-phi
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports: [{containerPort: {{ .Values.service.port }} }]
+          env:
+          - name: CODESPACE
+            value: "true"
+""")
+W("deploy/helm/templates/service.yaml","""apiVersion: v1
+kind: Service
+metadata:
+  name: codex-phi
+spec:
+  type: ClusterIP
+  selector: { app: codex-phi }
+  ports:
+    - port: 8880
+      targetPort: 8880
+""")
+
+# ---------- Docker / Compose / CI / Tests ----------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8880
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-phi:
+    build: ./deploy
+    ports:
+      - "8880:8880"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Φ (v209) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Policy + JWT smoke
+        run: python3 - <<'PY'\nfrom codex.policy.engine import allowed\nfrom codex.utils.crypto import jwt_hmac_sign, jwt_hmac_verify\nimport json\nkey='''""" + hashlib.sha256(b"cfbk-1998-10-27").hexdigest() + """'''\ntok=jwt_hmac_sign(key, {'sub':'owner@codex','roles':['owner'],'exp':9999999999})\nprint(jwt_hmac_verify(key, tok)['ok'])\nprint(allowed(['reader'],'read','/x'))\nprint(allowed(['reader'],'admin.*','/x')==False)\nPY
+""")
+W("tests/test_phi.py","""from codex.policy.engine import allowed\nassert allowed(['owner'],'*','*')\nassert not allowed(['reader'],'admin.*','*')\nprint('phi ok')\n""")
+
+# ---------- Docs ----------
+W("docs/README.md", f"""# Codex Logos Φ (Phi) — v209 Governance Layer
+Generated: {now}
+
+Adds **identity, policy, secrets, feature flags, webhooks, and deploy tooling** on top of ΩΥ.
+
+## Run
+```bash
+python3 dashboard/api.py  # port 8880
+# Token
+curl -s -X POST localhost:8880/api/auth/token -H 'Content-Type: application/json' -d '{{"user":"owner@codex"}}' | jq
+# Verify
+TOKEN=$(curl -s -X POST localhost:8880/api/auth/token -H 'Content-Type: application/json' -d '{{"user":"reader@codex"}}' | jq -r .token); \
+curl -s -X POST localhost:8880/api/auth/verify -H 'Content-Type: application/json' -d '{{"token":"'$TOKEN'"}}' | jq
+# Policy
+curl -s -X POST localhost:8880/api/policy/check -H 'Content-Type: application/json' -d '{{"user":"reader@codex","action":"read","resource":"*"}}' | jq
+# Secrets
+curl -s -X POST localhost:8880/api/secrets/put -H 'Content-Type: application/json' -d '{{"key":"BTC_ADDRESS","value":"bc1q..."}}' | jq
+curl -s -X POST localhost:8880/api/secrets/get -H 'Content-Type: application/json' -d '{{"key":"BTC_ADDRESS"}}' | jq
+# Flags
+curl -s localhost:8880/api/flags/get | jq
+curl -s -X POST localhost:8880/api/flags/eval -H 'Content-Type: application/json' -d '{{"user":"reader@codex"}}' | jq
+# Webhooks (configure codex/config.json -> webhook_targets)
+curl -s -X POST localhost:8880/api/webhook/send -H 'Content-Type: application/json' -d '{{"event":"codex.deploy","payload":{{"v":"209"}}}}' | jq
+```
+""")
+
+# ---------- Manifest ----------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------- ZIP ----------
+zip_path="/mnt/data/codex_v209_governance_phi.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
