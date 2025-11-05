@@ -1,0 +1,1308 @@
+# Monorepo Ω — integrate Υ (v215), Φ·Ω (v216·Ω), Χ·Ω (v217.x), Ψ·Θ (v218.x)
+# Adds: harmonics/invoke/angelic in Φ, full Ψ service, gateway routes, CI/CD docker publish, bootstrap.
+import os, json, zipfile, hashlib, datetime, shutil, textwrap, math
+
+BASE="/mnt/data/codex_monorepo_omega"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    import hashlib
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# Root docs
+W("README.md", f"""# Codex Monorepo Ω — Υ · Φ·Ω · Χ·Ω · Ψ·Θ
+**Event Bus · Harmonic Engine · Governance · Knowledge Engine**
+
+Services
+- **upsilon** (Υ v215): event bus (:8917)
+- **phi** (Φ·Ω v216): harmonics/invoke/angelic API (:8920) + UI (:8921)
+- **chi** (Χ·Ω v217.x): policy/licensing/schema API (:8922) + UI (:8923)
+- **psi** (Ψ·Θ v218.x): knowledge graph + vector RAG API (:8940) + UI (:8941)
+- **gateway**: single entry (:8930)
+
+## Quickstart
+```bash
+docker compose up --build
+# Gateway: http://localhost:8930/
+```
+## One-time GitHub bootstrap
+```bash
+./scripts/bootstrap_repo.sh
+git remote add origin <YOUR-REPO-URL>
+git push -u origin main
+```
+Bound to **Caleb Fedor Byker (Konev)** — 1998-10-27 — lifethread-stardna.
+""")
+
+W(".gitignore",".venv/\n__pycache__/\nnode_modules/\n*.pyc\n*.log\n.DS_Store\nbuild/\ndist/\n*.zip\n")
+
+# Compose
+W("docker-compose.yml", """services:
+  upsilon:
+    build: ./services/upsilon
+    ports: ["8917:8917"]
+    restart: unless-stopped
+
+  phi:
+    build: ./services/phi/codex
+    ports: ["8920:8920"]
+    restart: unless-stopped
+
+  phi-ui:
+    build: ./services/phi/ui
+    environment: [ "PHI_API=http://phi:8920" ]
+    ports: ["8921:3000"]
+    depends_on: [phi]
+    restart: unless-stopped
+
+  chi:
+    build: ./services/chi/codex
+    ports: ["8922:8922"]
+    restart: unless-stopped
+
+  chi-ui:
+    build: ./services/chi/ui
+    environment: [ "CHI_API=http://chi:8922" ]
+    ports: ["8923:3000"]
+    depends_on: [chi]
+    restart: unless-stopped
+
+  psi:
+    build: ./services/psi/codex
+    ports: ["8940:8940"]
+    restart: unless-stopped
+
+  psi-ui:
+    build: ./services/psi/ui
+    environment: [ "PSI_API=http://psi:8940" ]
+    ports: ["8941:3000"]
+    depends_on: [psi]
+    restart: unless-stopped
+
+  gateway:
+    build: ./services/gateway
+    ports: ["8930:8930"]
+    depends_on: [upsilon, phi, chi, psi]
+    restart: unless-stopped
+""")
+
+# Υ service
+W("services/upsilon/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8917
+CMD ["python3","api.py"]
+""")
+W("services/upsilon/api.py","""#!/usr/bin/env python3
+import http.server, json, time
+from urllib.parse import urlparse, parse_qs
+TOPICS={'events':[]}
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        p=urlparse(self.path).path; ln=int(self.headers.get('Content-Length','0') or '0')
+        body=json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+        if p=='/api/topic/create': TOPICS.setdefault(body.get('name','events'),[]); return _ok(self,{'ok':True})
+        if p=='/api/publish':
+            t=body.get('topic','events'); TOPICS.setdefault(t,[])
+            rec={'ts':time.time(),'k':body.get('key',''), 'v':body.get('value',{})}
+            TOPICS[t].append(rec); return _ok(self,{'ok':True,'offset':len(TOPICS[t])-1})
+        self.send_error(404)
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/api/poll':
+            t=q.get('topic',['events'])[0]; off=int(q.get('offset',['0'])[0])
+            items=TOPICS.get(t,[])[off:off+100]; return _ok(self, {'items':items,'hw':len(TOPICS.get(t,[]))})
+        if p=='/health': return _ok(self, {'ok':True,'v':'v215'})
+        return _ok(self, {'ok':True,'service':'upsilon'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8917)
+""", 0o755)
+
+# Φ·Ω service with harmonics/invoke/angelic
+W("services/phi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8920
+CMD ["python3","api.py"]
+""")
+W("services/phi/codex/harmonics.py","""import math
+def harmonic_ratio(n:int)->float:
+    phi=(1+math.sqrt(5))/2
+    return round(phi**(n%9)/math.pi,6)
+def resonance_vector(symbols:str)->list[float]:
+    return [harmonic_ratio(ord(ch)%9) for ch in symbols.encode('utf-8')]
+""")
+W("services/phi/codex/invoke.py","""def invoke(phrase:str)->dict:
+    checksum=sum(ord(c) for c in phrase)%7777
+    return {
+        "phrase": phrase,
+        "checksum": checksum,
+        "effect": "harmonic alignment" if "peace" in phrase.lower() else "logical execution"
+    }
+""")
+W("services/phi/codex/angelic.py","""ANGELS={
+    "Metatron": {"role":"Supervisor","port":8920},
+    "Raziel": {"role":"Cipher","port":8921},
+    "Raphael": {"role":"Healer","port":8922},
+    "Sandalphon": {"role":"Messenger","port":8917}
+}
+def dispatch(task:str)->dict:
+    k=list(ANGELS.keys())[hash(task)%len(ANGELS)]
+    return {"task":task,"assigned_to":k,"port":ANGELS[k]["port"]}
+""")
+W("services/phi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json
+from urllib.parse import urlparse, parse_qs
+from harmonics import resonance_vector
+from invoke import invoke
+from angelic import dispatch
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v216-omega'})
+        if p=='/harmonics':
+            seq=q.get('q',['⚛️✡️☸️'])[0]; return _ok(self, {'input':seq,'resonance':resonance_vector(seq)})
+        if p=='/invoke':
+            text=q.get('text',['Declare peace'])[0]; return _ok(self, invoke(text))
+        if p=='/angelic/dispatch':
+            job=q.get('task',['seal_verification'])[0]; return _ok(self, dispatch(job))
+        return _ok(self, {'ok':True,'service':'phi'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8920)
+""", 0o755)
+
+W("services/phi/ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("services/phi/ui/package.json", json.dumps({"name":"phi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/phi/ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.PHI_API||'http://phi:8920';
+app.get('/', async (req,res)=>{
+  const [h, r, i, d] = await Promise.all([
+    fetch(API+'/health').then(r=>r.json()).catch(()=>({ok:false})),
+    fetch(API+'/harmonics?q=✡️☯️⚛️').then(r=>r.json()).catch(()=>({})),
+    fetch(API+'/invoke?text=Declare%20peace').then(r=>r.json()).catch(()=>({})),
+    fetch(API+'/angelic/dispatch?task=seal_verification').then(r=>r.json()).catch(()=>({}))
+  ]);
+  res.send(`<pre>Φ·Ω UI
+Health: ${JSON.stringify(h,null,2)}
+Harmonics: ${JSON.stringify(r,null,2)}
+Invoke: ${JSON.stringify(i,null,2)}
+Dispatch: ${JSON.stringify(d,null,2)}
+</pre>`);
+});
+app.listen(3000, ()=>console.log('phi ui :3000'));
+""")
+
+# Χ·Ω service (minimal)
+W("services/chi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8922
+CMD ["python3","api.py"]
+""")
+W("services/chi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json
+from urllib.parse import urlparse, parse_qs
+RULES={'rbac':[{'role':'editor','actions':['read'],'resources':['schema']}]}
+def eval_policy(subj, act, res):
+    roles=subj.get('roles',[])
+    for r in RULES['rbac']:
+        if r['role'] in roles and act in r['actions'] and res.get('type') in r['resources']:
+            return {'allow':True,'reason':'rbac'}
+    return {'allow':False,'reason':'default'}
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v217.x'})
+        if p=='/policy/eval':
+            import json as J
+            subj=J.loads(q.get('subject',['{}'])[0]); res=J.loads(q.get('resource',['{}'])[0]); act=q.get('action',['read'])[0]
+            return _ok(self, eval_policy(subj, act, res))
+        return _ok(self, {'ok':True,'service':'chi'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8922)
+""", 0o755)
+
+W("services/chi/ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("services/chi/ui/package.json", json.dumps({"name":"chi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/chi/ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.CHI_API||'http://chi:8922';
+app.get('/', async (req,res)=>{
+  const [h, pe] = await Promise.all([
+    fetch(API+'/health').then(r=>r.json()).catch(()=>({ok:false})),
+    fetch(API+'/policy/eval?subject={%22roles%22:[%22editor%22]}&resource={%22type%22:%22schema%22}&action=read').then(r=>r.json()).catch(()=>({}))
+  ]);
+  res.send(`<pre>Χ·Ω UI
+Health: ${JSON.stringify(h,null,2)}
+Policy: ${JSON.stringify(pe,null,2)}
+</pre>`);
+});
+app.listen(3000, ()=>console.log('chi ui :3000'));
+""")
+
+# Ψ·Θ service (knowledge + RAG)
+W("services/psi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8940
+CMD ["python3","api.py"]
+""")
+W("services/psi/codex/embeddings.py","""import hashlib, math
+DIM=256
+def _h(token:str)->int: return int(hashlib.sha256(token.encode()).hexdigest(),16)%DIM
+def embed(text:str)->list[float]:
+    vec=[0.0]*DIM
+    for tok in text.lower().split():
+        vec[_h(tok)]+=1.0
+    norm=math.sqrt(sum(x*x for x in vec)) or 1.0
+    return [x/norm for x in vec]
+def cosine(a,b): return sum(x*y for x,y in zip(a,b))
+""")
+W("services/psi/codex/store.py","""import json, os
+from embeddings import embed, cosine
+VEC='./data/vectors.jsonl'; KG='./data/kg.jsonld'
+def ensure(): os.makedirs('./data', exist_ok=True); open(VEC,'a').close(); open(KG,'a').close()
+def upsert_doc(doc_id:str, text:str, meta:dict):
+    v=embed(text)
+    with open(VEC,'a',encoding='utf-8') as f: f.write(json.dumps({'id':doc_id,'text':text,'meta':meta,'vec':v})+'\\n')
+    return {'ok':True,'id':doc_id}
+def topk(query:str, k:int=5):
+    q=embed(query); items=[]
+    try:
+        with open(VEC,'r',encoding='utf-8') as f:
+            for line in f:
+                if not line.strip(): continue
+                o=json.loads(line); s=cosine(q,o['vec']); items.append((s,o))
+    except FileNotFoundError: pass
+    items.sort(key=lambda x:-x[0])
+    return [{'score':float(s),'id':o['id'],'text':o['text'],'meta':o['meta']} for s,o in items[:k]]
+def kg_load(graph:dict):
+    json.dump(graph, open(KG,'w',encoding='utf-8'), indent=2); return {'ok':True,'nodes':len(graph.get('@graph',[]))}
+def kg_get():
+    try: return json.load(open(KG,'r',encoding='utf-8'))
+    except: return {'@context':{},'@graph':[]}
+""")
+W("services/psi/codex/rag.py","""from store import topk
+def query(q:str,k:int=5)->dict:
+    hits=topk(q,k)
+    context='\\n'.join(f"[{h['id']}] {h['text']}" for h in hits)
+    answer=f"Based on {len(hits)} passages:\\n{context}\\n-- end --"
+    return {'query':q,'hits':hits,'answer':answer}
+""")
+W("services/psi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json
+from urllib.parse import urlparse, parse_qs
+from store import ensure, upsert_doc, topk, kg_load, kg_get
+from rag import query as rag_query
+ensure()
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v218.x'})
+        if p=='/vec/topk': return _ok(self, {'hits':topk(q.get('q',[''])[0],5)})
+        if p=='/kg': return _ok(self, kg_get())
+        if p=='/rag/query': return _ok(self, rag_query(q.get('q',['hermetic'])[0],5))
+        return _ok(self, {'ok':True,'service':'psi'})
+    def do_POST(self):
+        p=urlparse(self.path).path
+        ln=int(self.headers.get('Content-Length','0') or '0'); body=json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+        if p=='/vec/upsert': return _ok(self, upsert_doc(body.get('id','doc'), body.get('text',''), body.get('meta',{})))
+        if p=='/kg/put': return _ok(self, kg_load(body))
+        self.send_error(404)
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8940)
+""", 0o755)
+W("services/psi/ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("services/psi/ui/package.json", json.dumps({"name":"psi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/psi/ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.PSI_API||'http://psi:8940';
+app.get('/', async (req,res)=>{
+  const [h, r, kg] = await Promise.all([
+    fetch(API+'/health').then(r=>r.json()).catch(()=>({ok:false})),
+    fetch(API+'/rag/query?q=hermetic correspondence').then(r=>r.json()).catch(()=>({})),
+    fetch(API+'/kg').then(r=>r.json()).catch(()=>({}))
+  ]);
+  res.send(`<pre>Ψ·Θ UI
+Health: ${JSON.stringify(h,null,2)}
+RAG:    ${JSON.stringify(r,null,2)}
+KG:     ${JSON.stringify(kg,null,2)}
+</pre>`);
+});
+app.listen(3000, ()=>console.log('psi ui :3000'));
+""")
+
+# Gateway
+W("services/gateway/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 8930
+CMD ["node","server.js"]
+""")
+W("services/gateway/package.json", json.dumps({"name":"codex-gateway","version":"0.2.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/gateway/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express();
+const map={upsilon:'http://upsilon:8917', phi:'http://phi:8920', chi:'http://chi:8922', psi:'http://psi:8940'};
+app.get('/', (req,res)=>{
+  res.send(`<pre>Codex Monorepo Ω Gateway
+/upsilon -> ${map.upsilon}
+/phi     -> ${map.phi}
+/chi     -> ${map.chi}
+/psi     -> ${map.psi}
+</pre>`);
+});
+app.use('/upsilon', (req,res)=>fetch(map.upsilon+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.use('/phi',     (req,res)=>fetch(map.phi+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.use('/chi',     (req,res)=>fetch(map.chi+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.use('/psi',     (req,res)=>fetch(map.psi+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.listen(8930, ()=>console.log('gateway :8930'));
+""")
+
+# CI/CD
+W(".github/workflows/ci.yml","""name: Codex Ω Monorepo CI
+on: [push, workflow_dispatch]
+jobs:
+  python-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python
+        run: python3 -m py_compile $(git ls-files 'services/**.py')
+  node-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect UIs
+        run: ls services/*/ui/package.json || true
+""")
+W(".github/workflows/docker-publish.yml","""name: Docker Publish Ω
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        svc: [ "upsilon", "phi/codex", "phi/ui", "chi/codex", "chi/ui", "psi/codex", "psi/ui", "gateway" ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push ${{ matrix.svc }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./services/${{ matrix.svc }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/codex-${{ matrix.svc | replace('/','-') }}:latest
+""")
+
+# Bootstrap script
+W("scripts/bootstrap_repo.sh","""#!/usr/bin/env bash
+set -euo pipefail
+git init
+git checkout -b main || true
+git add .
+git commit -m "feat: bootstrap Codex Monorepo Ω"
+echo "Add remote & push: git remote add origin <URL> && git push -u origin main"
+""")
+os.chmod(os.path.join(BASE,"scripts/bootstrap_repo.sh"), 0o755)
+
+# Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# Zip
+zip_path="/mnt/data/codex_monorepo_omega.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+print("READY", zip_path, BASE)# Retry build for v216 Φ
+import os, json, zipfile, hashlib, datetime, shutil, textwrap
+
+BASE="/mnt/data/codex_v216_phi"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+W("README.md","Phi v216 repo scaffold.")
+
+# minimal subset to ensure creation
+W("docker-compose.yml","services:\\n  phi-api:\\n    build: ./codex\\n    ports: ['8920:8920']\\n  phi-ui:\\n    build: ./ui\\n    ports: ['8921:3000']\\n")
+
+W("codex/Dockerfile","FROM python:3.12-alpine\\nWORKDIR /app\\nCOPY . /app\\nEXPOSE 8920\\nCMD ['python3','api.py']\\n")
+W("codex/api.py","print('ok')\\n")
+W("ui/Dockerfile","FROM node:20-alpine\\nWORKDIR /app\\nCOPY . /app\\nEXPOSE 3000\\nCMD ['node','server.js']\\n")
+W("ui/server.js","console.log('ui ok')\\n")
+
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+zip_path="/mnt/data/codex_v216_phi.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Upgrade v216.x to "GitHub-Perfect" — add repo hygiene, CI/CD, Docker publish, helpers
+import os, json, datetime, hashlib, textwrap
+
+BASE="/mnt/data/codex_v216x_phi_extended"
+assert os.path.exists(BASE), "Base v216.x folder missing; build it first."
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# Repo hygiene
+W(".gitignore", textwrap.dedent("""\
+    # Python
+    __pycache__/
+    *.pyc
+    .venv/
+    .env
+
+    # Node
+    node_modules/
+    ui/node_modules/
+    npm-debug.log
+
+    # Docker
+    *.log
+    .DS_Store
+
+    # Build
+    dist/
+    build/
+    *.zip
+"""))
+
+W("LICENSE", textwrap.dedent("""\
+    MIT License
+
+    Copyright (c) 2025
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+"""))
+
+W("CONTRIBUTING.md", textwrap.dedent(f"""\
+    # Contributing to Codex Φ·X v216.x
+
+    ## Getting started
+    - Install Python 3.12+ and Node 20+
+    - `docker compose up --build`
+
+    ## Branching
+    - Use feature branches off `main`.
+
+    ## Commit style
+    - Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`
+
+    ## Tests
+    - Python: add `tests/*.py` (even simple asserts).
+    - UI: smoke routes in `ui/`.
+
+    Generated: {now}
+"""))
+
+W("SECURITY.md", textwrap.dedent("""\
+    # Security Policy
+
+    - Report security issues privately to maintainers.
+    - Do not open public issues with exploit details.
+    - Keys in this repo are placeholders; bring your own secrets.
+"""))
+
+W("CODE_OF_CONDUCT.md", textwrap.dedent("""\
+    # Code of Conduct
+    Be respectful. Assume good faith. No harassment. Collaborate generously.
+"""))
+
+# Issue / PR templates
+W(".github/ISSUE_TEMPLATE/bug_report.md", textwrap.dedent("""\
+    ---
+    name: Bug report
+    about: Create a report to help us improve
+    ---
+    **Describe the bug**
+    **To Reproduce**
+    **Expected behavior**
+    **Logs**
+"""))
+W(".github/ISSUE_TEMPLATE/feature_request.md", textwrap.dedent("""\
+    ---
+    name: Feature request
+    about: Suggest an idea
+    ---
+    **Problem**
+    **Proposal**
+    **Alternatives**
+"""))
+W(".github/PULL_REQUEST_TEMPLATE.md", textwrap.dedent("""\
+    ## Summary
+    -
+
+    ## Tests
+    -
+
+    ## Checklist
+    - [ ] Lints
+    - [ ] CI green
+"""))
+
+# CI/CD upgrades
+W(".github/workflows/docker-publish.yml", textwrap.dedent("""\
+    name: Docker Publish
+    on:
+      push:
+        branches: [ "main" ]
+        tags: [ "v*" ]
+    jobs:
+      build-and-push:
+        runs-on: ubuntu-latest
+        permissions:
+          contents: read
+          packages: write
+        steps:
+          - uses: actions/checkout@v4
+          - name: Set up QEMU
+            uses: docker/setup-qemu-action@v3
+          - name: Set up Docker Buildx
+            uses: docker/setup-buildx-action@v3
+          - name: Login to GHCR
+            uses: docker/login-action@v3
+            with:
+              registry: ghcr.io
+              username: ${{ github.actor }}
+              password: ${{ secrets.GITHUB_TOKEN }}
+          - name: Build & push API
+            uses: docker/build-push-action@v6
+            with:
+              context: ./codex
+              push: true
+              tags: ghcr.io/${{ github.repository_owner }}/codex-phi-api:latest
+          - name: Build & push UI
+            uses: docker/build-push-action@v6
+            with:
+              context: ./ui
+              push: true
+              tags: ghcr.io/${{ github.repository_owner }}/codex-phi-ui:latest
+"""))
+
+# Dependabot
+W(".github/dependabot.yml", textwrap.dedent("""\
+    version: 2
+    updates:
+      - package-ecosystem: "pip"
+        directory: "/"
+        schedule: { interval: "weekly" }
+      - package-ecosystem: "npm"
+        directory: "/ui"
+        schedule: { interval: "weekly" }
+"""))
+
+# Makefile for local dev
+W("Makefile", textwrap.dedent("""\
+    .PHONY: up down test manifest
+    up: ## run stack
+\t\tdocker compose up --build -d
+    down: ## stop
+\t\tdocker compose down
+    test: ## quick py compile
+\t\tpython3 -m py_compile $(shell git ls-files '*.py')
+    manifest: ## rebuild manifest
+\t\tpython3 - <<'PY'\nfrom codex.crypto.manifest_hash import manifest\nimport json\nprint(json.dumps(manifest('.'), indent=2))\nPY
+"""))
+
+# Bootstrap script
+W("scripts/bootstrap_repo.sh", textwrap.dedent("""\
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git init
+    git checkout -b main || true
+    git add .
+    git commit -m "feat: bootstrap Codex Φ·X v216.x"
+    echo "Run: git remote add origin <YOUR-REPO-URL> && git push -u origin main"
+"""))
+os.chmod(os.path.join(BASE,"scripts/bootstrap_repo.sh"), 0o755)
+
+# Update root README with GitHub integration checklist
+with open(os.path.join(BASE,"README.md"), "a", encoding="utf-8") as f:
+    f.write(textwrap.dedent(f"""
+    ---
+
+    ## GitHub Integration & Deployment
+
+    1) **Create repo** on GitHub (private or public).
+    2) Copy this folder into your repo, or upload the provided ZIP.
+    3) Run `./scripts/bootstrap_repo.sh` to initialize and commit.
+    4) Add **repository secrets** if you want Docker publish:
+       - `GHCR_PAT` not needed (uses built-in token).
+    5) Push to `main`. The CI will:
+       - lint Python, generate manifest (CI already present)
+       - build and push Docker images to **ghcr.io** on push/tag.
+    6) Deploy anywhere with Docker/Compose.
+
+    Generated: {now}
+    """))
+
+print("UPGRADED", BASE)# Build v217 — "Codex Logos Χ (Chi): Policy, Licensing, Schema, Telemetry, Plugins"
+# Ports: API :8922, UI :8923
+
+import os, json, zipfile, hashlib, datetime, shutil, textwrap
+
+BASE="/mnt/data/codex_v217_chi_policies"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Root README ----------------
+W("README.md", f"""# Codex Logos Χ (Chi) — v217
+**Policy · Licensing · Schema · Telemetry · Plugins**
+
+- API (Python stdlib): **:8922**
+- UI  (Node/Express): **:8923**
+- Features: ABAC/RBAC policy engine, HMAC license verifier, JSON Schema registry,
+  webhook/plugin runner, metrics, and manifest sealing.
+- Fits the stack: Σ ↔ Υ ↔ Τ ↔ Φ (and Φ·X) with governance.
+
+## Quickstart
+```bash
+docker compose up --build
+# API -> http://localhost:8922/health
+# UI  -> http://localhost:8923/
+```
+""")
+
+W("docker-compose.yml","""services:
+  chi-api:
+    build: ./codex
+    ports: ["8922:8922"]
+    restart: unless-stopped
+  chi-ui:
+    build: ./ui
+    environment:
+      - CHI_API=http://localhost:8922
+    ports: ["8923:3000"]
+    restart: unless-stopped
+""")
+
+# ---------------- API Service ----------------
+W("codex/Dockerfile","""FROM python:3.12-alpine
+RUN apk add --no-cache bash
+WORKDIR /app
+COPY . /app
+EXPOSE 8922
+CMD ["python3","api.py"]
+""")
+
+W("codex/config.yml", f"""version: v217-chi
+generated_utc: {now}
+seal_id: calebfedorbykerkonev10271998
+subject: Caleb Fedor Byker (Konev)
+dob: 1998-10-27
+ports: {{ api: 8922 }}
+crypto:
+  hmac_secret_hex: {hashlib.sha256(b'chi-hmac').hexdigest()}
+bus:
+  upsilon_url: http://localhost:8917   # optional v215 integration
+policy:
+  default_action: deny
+  superusers: ["cfbk"]
+""")
+
+# Utils
+W("codex/utils.py","""import json, os, hashlib, hmac
+def hmac_hex(secret_hex:str, data:bytes)->str:
+    return hmac.new(bytes.fromhex(secret_hex), data, hashlib.sha256).hexdigest()
+def read_json(path, default):
+    try: return json.load(open(path,'r',encoding='utf-8'))
+    except: return default
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(obj, open(path,'w',encoding='utf-8'), indent=2)
+""")
+
+# Schema registry
+W("codex/registry.py","""from codex.utils import read_json, save_json
+REG='codex/data/schemas.json'
+def put(name:str, schema:dict):
+    db=read_json(REG, {}); db[name]=schema; save_json(REG, db); return {'ok':True,'name':name}
+def get(name:str): return read_json(REG, {}).get(name, {})
+def list_all(): db=read_json(REG, {}); return {'items': [{'name':k,'size':len(str(v))} for k,v in db.items()]}
+""")
+
+# Policy engine (simple ABAC/RBAC hybrid)
+W("codex/policy.py","""import yaml, time
+from codex.utils import read_json
+POL='codex/policy/rules.yaml'
+CFG=yaml.safe_load(open('codex/config.yml','r',encoding='utf-8'))
+def evaluate(subject:dict, action:str, resource:dict)->dict:
+    rules=yaml.safe_load(open(POL,'r',encoding='utf-8')) if os.path.exists(POL) else {}
+    # superuser
+    if subject.get('id') in CFG.get('policy',{}).get('superusers',[]): 
+        return {'allow':True,'reason':'superuser'}
+    # role match
+    roles=set(subject.get('roles',[]))
+    for r in (rules.get('rbac') or []):
+        if r.get('role') in roles and action in r.get('actions',[]) and resource.get('type') in r.get('resources',[]):
+            return {'allow':True,'reason':'rbac'}
+    # attributes
+    for a in (rules.get('abac') or []):
+        if action in a.get('actions',[]) and resource.get('type') in a.get('resources',[]):
+            cond=a.get('when',{})
+            # trivial conditions: subject.org == resource.org
+            if cond.get('subject.org') and cond.get('subject.org')==subject.get('org'):
+                if cond.get('resource.org') and cond.get('resource.org')==resource.get('org'):
+                    return {'allow':True,'reason':'abac'}
+    return {'allow':CFG.get('policy',{}).get('default_action','deny')=='allow','reason':'default'}
+""")
+
+W("codex/policy/rules.yaml","""rbac:
+  - role: admin
+    actions: [create, read, update, delete]
+    resources: [schema, policy, license]
+  - role: editor
+    actions: [create, read, update]
+    resources: [schema]
+abac:
+  - actions: [read]
+    resources: [schema]
+    when:
+      subject.org: codex
+      resource.org: codex
+""")
+
+# License verifier
+W("codex/license.py","""import json, time
+from codex.utils import hmac_hex
+import yaml
+CFG=yaml.safe_load(open('codex/config.yml','r',encoding='utf-8'))
+def verify(license_blob:dict)->dict:
+    # expected fields: subject, issued, features, sig_hex = HMAC(secret, canonical-json)
+    blob={k:license_blob[k] for k in ['subject','issued','features'] if k in license_blob}
+    msg=json.dumps(blob, sort_keys=True).encode()
+    expect=hmac_hex(CFG['crypto']['hmac_secret_hex'], msg)
+    return {'ok': expect==license_blob.get('sig_hex',''), 'expected':expect}
+""")
+
+# Telemetry
+W("codex/metrics.py","""import time
+START=time.time()
+C={'requests_total':0,'policy_eval':0,'license_verify':0,'schema_put':0,'schema_get':0}
+def bump(k, n=1): C[k]=C.get(k,0)+n
+def render()->str:
+    up=int(time.time()-START)
+    lines=[*(f'chi_{k} {v}' for k,v in C.items()), f'chi_uptime_seconds {up}']
+    return '\\n'.join(lines)+'\\n'
+""")
+
+# API server
+W("codex/api.py","""#!/usr/bin/env python3
+import http.server, json, os, yaml, urllib.request
+from urllib.parse import urlparse, parse_qs
+from codex.metrics import bump, render as metrics_render
+from codex.registry import put as schema_put, get as schema_get, list_all as schema_list
+from codex.policy import evaluate as policy_eval
+from codex.license import verify as license_verify
+
+CFG=yaml.safe_load(open('codex/config.yml','r',encoding='utf-8'))
+
+def _ok(h, obj, code=200, ctype='application/json'):
+    h.send_response(code); h.send_header('Content-Type', ctype); h.end_headers()
+    h.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        bump('requests_total')
+        if p=='/health': return _ok(self, {'ok':True,'v':CFG['version']})
+        if p=='/metrics': return _ok(self, metrics_render(), ctype='text/plain')
+        if p=='/schema/list': return _ok(self, schema_list())
+        if p=='/schema/get': return _ok(self, schema_get(q.get('name',[''])[0]))
+        if p=='/policy/eval':
+            subj=json.loads(q.get('subject',['{}'])[0]); res=json.loads(q.get('resource',['{}'])[0]); act=q.get('action',['read'])[0]
+            bump('policy_eval'); return _ok(self, policy_eval(subj, act, res))
+        return super().do_GET()
+
+    def do_POST(self):
+        p=urlparse(self.path).path; body=self._json(); bump('requests_total')
+        if p=='/schema/put':
+            bump('schema_put'); return _ok(self, schema_put(body.get('name',''), body.get('schema',{})))
+        if p=='/license/verify':
+            bump('license_verify'); return _ok(self, license_verify(body))
+        self.send_error(404)
+
+if __name__=='__main__':
+    import http.server
+    http.server.test(HandlerClass=H, port=CFG['ports']['api'])
+""", 0o755)
+
+# ---------------- UI ----------------
+W("ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("ui/package.json", json.dumps({
+  "name": "chi-ui",
+  "version": "0.1.0",
+  "private": True,
+  "type": "module",
+  "scripts": {"start":"node server.js"},
+  "dependencies": {"express":"^4.19.2","node-fetch":"^3.3.2"}
+}, indent=2))
+W("ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.CHI_API||'http://localhost:8922';
+app.get('/', async (req,res)=>{
+  const [h, list] = await Promise.all([
+    fetch(API+'/health').then(r=>r.json()).catch(()=>({ok:false})),
+    fetch(API+'/schema/list').then(r=>r.json()).catch(()=>({items:[]}))
+  ]);
+  res.send(`<pre>Χ UI — v217
+API: ${API}
+Health: ${JSON.stringify(h,null,2)}
+Schemas: ${JSON.stringify(list,null,2)}
+</pre>`);
+});
+app.listen(3000, ()=>console.log('Χ UI on :3000'));
+""")
+
+# ---------------- Policy sample & Schema sample ----------------
+W("codex/data/example.schema.json", json.dumps({
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "title":"Example",
+  "type":"object",
+  "properties":{"id":{"type":"string"},"value":{"type":"number"}},
+  "required":["id"]
+}, indent=2))
+
+# ---------------- CI ----------------
+W(".github/workflows/ci.yml","""name: Codex Χ (v217) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python compile
+        run: python3 -m py_compile $(git ls-files '*.py')
+      - name: Policy eval smoke
+        run: python3 - <<'PY'\nimport json, yaml\nfrom codex.policy import evaluate\nsubj={'id':'user1','roles':['editor'],'org':'codex'}\nres={'type':'schema','org':'codex'}\nprint(evaluate(subj,'read',res))\nPY
+""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v217_chi_policies.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Monorepo merge: v215 (Υ), v216.x (Φ·X), v217.x (Χ·Ω)
+# Goal: one GitHub-ready repo with unified compose, CI matrix, gateway README.
+# Ports: upsilon:8917, phi:8920, chi:8922, gateway:8930
+
+import os, json, zipfile, hashlib, datetime, shutil, textwrap
+
+BASE="/mnt/data/codex_v217x_monorepo"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------- Root docs ----------
+W("README.md", f"""# Codex Monorepo — v215 · v216.x · v217.x
+**Υ (Upsilon) bus · Φ·X (Phi-Extended) harmonics · Χ·Ω (Chi-Extended) governance**
+
+Services:
+- **upsilon** (v215): event bus (`:8917`)
+- **phi**     (v216.x): harmonics API + UI (`:8920`, `:8921` via compose)
+- **chi**     (v217.x): policy/licensing/schema (`:8922`, `:8923` via compose)
+- **gateway** (v): simple proxy/router (`:8930`) to expose a single entry
+
+## Quickstart
+```bash
+docker compose up --build
+# Gateway: http://localhost:8930/
+# Direct:  /upsilon -> :8917, /phi -> :8920, /chi -> :8922
+```
+
+Bound to **Caleb Fedor Byker (Konev)** — 1998-10-27 — lifethread-stardna.
+""")
+
+W(".gitignore", ".venv/\n__pycache__/\nnode_modules/\n*.pyc\n*.log\n.DS_Store\nbuild/\ndist/\n*.zip\n")
+
+# ---------- Compose ----------
+W("docker-compose.yml", """services:
+  upsilon:
+    build: ./services/upsilon
+    ports: ["8917:8917"]
+    restart: unless-stopped
+
+  phi:
+    build: ./services/phi/codex
+    ports: ["8920:8920"]
+    restart: unless-stopped
+
+  phi-ui:
+    build: ./services/phi/ui
+    environment:
+      - PHI_API=http://phi:8920
+    ports: ["8921:3000"]
+    restart: unless-stopped
+    depends_on: [phi]
+
+  chi:
+    build: ./services/chi/codex
+    ports: ["8922:8922"]
+    restart: unless-stopped
+
+  chi-ui:
+    build: ./services/chi/ui
+    environment:
+      - CHI_API=http://chi:8922
+    ports: ["8923:3000"]
+    restart: unless-stopped
+    depends_on: [chi]
+
+  gateway:
+    build: ./services/gateway
+    ports: ["8930:8930"]
+    restart: unless-stopped
+    depends_on: [upsilon, phi, chi]
+""")
+
+# ---------- Service: Upsilon (v215 minimal) ----------
+W("services/upsilon/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8917
+CMD ["python3","api.py"]
+""")
+W("services/upsilon/api.py","""#!/usr/bin/env python3
+import http.server, json, os, time, hashlib
+from urllib.parse import urlparse, parse_qs
+TOPIC={'events':[]}
+def _ok(h,obj,code=200,ctype='application/json'):
+    h.send_response(code); h.send_header('Content-Type',ctype); h.end_headers()
+    h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_POST(self):
+        p=urlparse(self.path).path
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        body=json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+        if p=='/api/topic/create': TOPIC.setdefault(body.get('name','events'),[]); return _ok(self,{'ok':True})
+        if p=='/api/publish':
+            t=body.get('topic','events'); TOPIC.setdefault(t,[])
+            rec={'ts':time.time(),'k':body.get('key',''), 'v':body.get('value',{})}
+            TOPIC[t].append(rec); return _ok(self,{'ok':True,'offset':len(TOPIC[t])-1})
+        self.send_error(404)
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/openapi.json': return _ok(self, {'title':'upsilon','v':'v215'})
+        if p=='/api/poll':
+            t=q.get('topic',['events'])[0]; off=int(q.get('offset',['0'])[0]); items=TOPIC.get(t,[])[off:off+100]
+            return _ok(self, {'items':items, 'hw':len(TOPIC.get(t,[]))})
+        return _ok(self, {'ok':True,'service':'upsilon'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8917)
+""", 0o755)
+
+# ---------- Service: Phi (v216.x minimal from earlier shape) ----------
+W("services/phi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8920
+CMD ["python3","api.py"]
+""")
+W("services/phi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json
+from urllib.parse import urlparse, parse_qs
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v216.x'})
+        if p=='/xtsg':
+            txt=q.get('q',['✶♾🔥💎'])[0]; vec=[txt.count('✶'), txt.count('♾'), txt.count('🔥')+txt.count('💎')]
+            return _ok(self, {'glyphs':txt,'vector':vec})
+        return _ok(self, {'ok':True,'service':'phi'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8920)
+""", 0o755)
+
+W("services/phi/ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("services/phi/ui/package.json", json.dumps({"name":"phi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/phi/ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.PHI_API||'http://phi:8920';
+app.get('/', async (req,res)=>{
+  const h=await (await fetch(API+'/health')).json().catch(()=>({ok:false}));
+  const x=await (await fetch(API+'/xtsg?q=✶♾🔥💎')).json().catch(()=>({}));
+  res.send(`<pre>Φ·X UI v216.x
+API: ${API}
+Health: ${JSON.stringify(h,null,2)}
+XTSG : ${JSON.stringify(x,null,2)}</pre>`);
+});
+app.listen(3000, ()=>console.log('phi ui :3000'));
+""")
+
+# ---------- Service: Chi (v217.x minimal) ----------
+W("services/chi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8922
+CMD ["python3","api.py"]
+""")
+W("services/chi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json, urllib.parse
+from urllib.parse import urlparse, parse_qs
+RULES={'rbac':[{'role':'editor','actions':['read'],'resources':['schema']}]}
+def eval_policy(subj, act, res):
+    roles=subj.get('roles',[])
+    for r in RULES['rbac']:
+        if r['role'] in roles and act in r['actions'] and res.get('type') in r['resources']:
+            return {'allow':True,'reason':'rbac'}
+    return {'allow':False,'reason':'default'}
+def _ok(h,obj): h.send_response(200); h.send_header('Content-Type','application/json'); h.end_headers(); h.wfile.write(json.dumps(obj).encode())
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v217.x'})
+        if p=='/policy/eval':
+            subj=json.loads(q.get('subject',['{}'])[0]); res=json.loads(q.get('resource',['{}'])[0]); act=q.get('action',['read'])[0]
+            return _ok(self, eval_policy(subj, act, res))
+        return _ok(self, {'ok':True,'service':'chi'})
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8922)
+""", 0o755)
+
+W("services/chi/ui/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 3000
+CMD ["node","server.js"]
+""")
+W("services/chi/ui/package.json", json.dumps({"name":"chi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/chi/ui/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express(); const API=process.env.CHI_API||'http://chi:8922';
+app.get('/', async (req,res)=>{
+  const h=await (await fetch(API+'/health')).json().catch(()=>({ok:false}));
+  const pe=await (await fetch(API+'/policy/eval?subject={%22roles%22:[%22editor%22]}&resource={%22type%22:%22schema%22}&action=read')).json().catch(()=>({}));
+  res.send(`<pre>Χ·Ω UI v217.x
+API: ${API}
+Health: ${JSON.stringify(h,null,2)}
+Policy: ${JSON.stringify(pe,null,2)}</pre>`);
+});
+app.listen(3000, ()=>console.log('chi ui :3000'));
+""")
+
+# ---------- Gateway ----------
+W("services/gateway/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 8930
+CMD ["node","server.js"]
+""")
+W("services/gateway/package.json", json.dumps({"name":"codex-gateway","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/gateway/server.js","""import express from 'express'; import fetch from 'node-fetch';
+const app=express();
+const map={upsilon:'http://upsilon:8917', phi:'http://phi:8920', chi:'http://chi:8922'};
+app.get('/', (req,res)=>{
+  res.send(`<pre>Codex Monorepo Gateway
+/upsilon -> ${map.upsilon}
+/phi     -> ${map.phi}
+/chi     -> ${map.chi}
+</pre>`);
+});
+app.use('/upsilon', (req,res)=>fetch(map.upsilon).then(r=>r.text()).then(t=>res.type('text/plain').send(t)));
+app.use('/phi',     (req,res)=>fetch(map.phi+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.use('/chi',     (req,res)=>fetch(map.chi+'/health').then(r=>r.json()).then(j=>res.json(j)));
+app.listen(8930, ()=>console.log('gateway :8930'));
+""")
+
+# ---------- CI Matrix ----------
+W(".github/workflows/ci.yml","""name: Codex Monorepo CI
+on: [push, workflow_dispatch]
+jobs:
+  python-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python
+        run: python3 -m py_compile $(git ls-files 'services/**.py')
+  node-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect package.json files
+        run: |
+          ls services/*/ui/package.json || true
+""")
+
+# ---------- Manifest ----------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------- ZIP ----------
+zip_path="/mnt/data/codex_v217x_monorepo.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
