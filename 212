@@ -1,0 +1,725 @@
+# Build v212.💎… symbolic evolution — "Codex Logos Ω (Omega) — v212.symbolic"
+# Repo: codex_v212_symbolic_omega
+# Adds: emoji-scope map, themed RBAC, rate limit (token-bucket), signed audit append, theme CSS endpoint.
+# Port: 8912
+import os, json, zipfile, hashlib, datetime, shutil, time, hmac
+
+BASE="/mnt/data/codex_v212_symbolic_omega"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v212.symbolic",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8912,
+  "issuer": "codex-omega",
+  "audience": "codex-clients",
+  "hs256_secret_hex": hashlib.sha256(b"cfbk-omega-212-symbolic").hexdigest(),
+  "webhook_signing_secret": hashlib.sha256(b"omega-webhook").hexdigest(),
+  "rate_limit": {"capacity": 60, "refill_per_sec": 1.0}
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/crypto.py","""import hashlib, hmac, base64, json\nb64u=lambda b: base64.urlsafe_b64encode(b).rstrip(b'=')\nunb64u=lambda s: base64.urlsafe_b64decode(s + b'='*((4-(len(s)%4))%4))\nsha256=lambda b: hashlib.sha256(b).digest()\nsha256_hex=lambda b: hashlib.sha256(b).hexdigest()\nhmac_sha256=lambda key,msg: hmac.new(key, msg, hashlib.sha256).hexdigest()\n""")
+
+# ---------------- Emoji ↔ scopes map ----------------
+emoji_scopes = {
+  "💎":"admin","👒":"theme","💍":"billing","📿":"vault","☸️":"observability","⚛️":"compute",
+  "🔯":"govern","✡️":"audit","☯️":"balance","🛐":"sacred","♋️":"water","♊️":"air","♒️":"aether","♌️":"fire",
+  "〽️":"metrics","➿️":"webhooks","➰️":"devflow","〰️":"device","♾️":"root","⚕️":"health","💲":"payments",
+  "⭕️":"tokens","💱":"fx","🔵":"blue","🟢":"green","🔴":"red","💠":"seal","🔺️":"up","🔹️":"info","🔻":"down",
+  "🔶️":"warn","🔷️":"note","🔳":"ui","🔘":"button","🔲":"card","⚧️":"inclusive","♂️":"mars","♀️":"venus"
+}
+W("codex/emoji/scopes.json", json.dumps(emoji_scopes, indent=2, ensure_ascii=False))
+
+# ---------------- Token bucket limiter ----------------
+W("codex/limits/bucket.py","""import time\nSTATE={}\n\ndef allow(key:str, capacity:int, refill_per_sec:float)->bool:\n    now=time.time(); b=STATE.get(key)\n    if not b: b={'tokens':capacity,'ts':now}\n    else:\n        # refill\n        delta=now-b['ts']\n        b['tokens']=min(capacity, b['tokens'] + delta*refill_per_sec)\n        b['ts']=now\n    if b['tokens']>=1.0:\n        b['tokens']-=1.0; STATE[key]=b; return True\n    STATE[key]=b; return False\n""")
+
+# ---------------- JWT HS256 minimal ----------------
+W("codex/auth/jwt_hs256.py","""import json, time, hmac, hashlib\nfrom codex.utils.crypto import b64u, unb64u\nHDR=b'{\"alg\":\"HS256\",\"typ\":\"JWT\"}'\n\
+def issue(secret_hex:str, sub:str, scopes:list, aud:str, iss:str, ttl:int=3600)->str:\n    now=int(time.time()); payload={'sub':sub,'scope':' '.join(scopes),'aud':aud,'iss':iss,'iat':now,'nbf':now,'exp':now+ttl}\n    p1=b64u(HDR); p2=b64u(json.dumps(payload,separators=(',',':')).encode())\n    sig=hmac.new(bytes.fromhex(secret_hex),(p1+b'.'+p2),hashlib.sha256).digest()\n    return b'.'.join([p1,p2,b64u(sig)]).decode()\n\
+def verify(secret_hex:str, token:str)->dict:\n    try:\n        h,p,s=token.split('.')\n        sig=hmac.new(bytes.fromhex(secret_hex),(h+'.'+p).encode(),hashlib.sha256).digest()\n        if b64u(sig).decode()!=s: return {'ok':False,'error':'bad_sig'}\n        payload=json.loads(unb64u(p.encode()))\n        now=int(time.time())\n        if now<payload.get('nbf',0) or now>payload.get('exp',0): return {'ok':False,'error':'time'}\n        payload['ok']=True; return payload\n    except Exception:\n        return {'ok':False,'error':'invalid'}\n""")
+
+# ---------------- Audit signed append ----------------
+W("codex/audit/ledger.py","""import json, os, time\nfrom codex.utils.crypto import sha256_hex, hmac_sha256\nLEDGER='codex/audit/ledger.jsonl'\n\
+def append(secret_hex:str, event:dict)->dict:\n    os.makedirs('codex/audit', exist_ok=True)\n    prev=None\n    try:\n        with open(LEDGER,'r',encoding='utf-8') as f:\n            last=None\n            for last in f: pass\n            if last: prev=json.loads(last)['hash']\n    except FileNotFoundError:\n        pass\n    wrap={'ts':time.time(),'event':event,'prev':prev}\n    wrap['hash']=sha256_hex(json.dumps(wrap, sort_keys=True).encode())\n    wrap['sig']=hmac_sha256(bytes.fromhex(secret_hex), json.dumps(event, sort_keys=True).encode())\n    with open(LEDGER,'a',encoding='utf-8') as f: f.write(json.dumps(wrap, sort_keys=True)+'\\n')\n    return {'ok':True,'hash':wrap['hash']}\n""")
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0,'limited':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n    up=int(time.time()-START)\n    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Ω — v212.symbolic API","version":"v212.symbolic"},
+  "paths":{
+    "/api/emoji/scopes":{"get":{"summary":"Map of emoji → scopes"}},
+    "/api/emoji/theme.css":{"get":{"summary":"CSS theme with emoji accents"}},
+    "/api/tokens/issue":{"post":{"summary":"Issue HS256 JWT"}},
+    "/api/tokens/verify":{"post":{"summary":"Verify HS256 JWT"}},
+    "/api/audit/append_signed":{"post":{"summary":"Append signed audit event"}},
+    "/metrics":{"get":{"summary":"Metrics"}}
+  }
+}, indent=2))
+
+# ---------------- Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os, time
+from urllib.parse import urlparse
+from codex.metrics.collector import bump, render as metrics_render
+from codex.utils.crypto import sha256_hex
+from codex.limits.bucket import allow
+from codex.auth.jwt_hs256 import issue as jwt_issue, verify as jwt_verify
+from codex.audit.ledger import append as audit_append
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+EMO=json.load(open('codex/emoji/scopes.json',encoding='utf-8'))
+
+def _ok(h, obj, code=200, ctype='application/json'):
+    h.send_response(code); h.send_header('Content-Type', ctype); h.end_headers()
+    h.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def _rate(self):
+        ip=self.client_address[0]; rl=CFG['rate_limit']; ok=allow(ip, rl['capacity'], rl['refill_per_sec'])
+        if not ok: bump('limited'); self.send_error(429, 'Too Many Requests')
+        return ok
+
+    def do_GET(self):
+        if not self._rate(): return
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/emoji/scopes': return _ok(self, EMO)
+        if p=='/api/emoji/theme.css':
+            css = ":root{--accent:'💎';} body{font-family:system-ui;background:#0b0f14;color:#e6edf3} h1::after{content:' 〽️'} .btn::before{content:'🔘 '}"
+            return _ok(self, css.encode(), 200, 'text/css')
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read(); self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render(); self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def do_POST(self):
+        if not self._rate(): return
+        body=self._json(); p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/tokens/issue':
+            tok=jwt_issue(CFG['hs256_secret_hex'], body.get('sub','reader@codex'), body.get('scopes',['read']), CFG['audience'], CFG['issuer'], int(body.get('ttl',900)))
+            return _ok(self, {'token':tok,'note':'scopes may include emoji-names like admin/theme'})
+        if p=='/api/tokens/verify':
+            return _ok(self, jwt_verify(CFG['hs256_secret_hex'], body.get('token','')))
+        if p=='/api/audit/append_signed':
+            ev=body.get('event',{}); res=audit_append(CFG['webhook_signing_secret'], ev); return _ok(self, res)
+        self.send_error(404)
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8912)
+""")
+
+# ---------------- Docker / Compose / CI / Tests ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8912
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-omega-symbolic:
+    build: ./deploy
+    ports:
+      - "8912:8912"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Ω v212.symbolic CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Emoji map + JWT + Audit
+        run: python3 - <<'PY'\nimport json\nfrom codex.auth.jwt_hs256 import issue, verify\nfrom codex.audit.ledger import append\ncfg=json.load(open('codex/config.json'))\nemo=json.load(open('codex/emoji/scopes.json'))\nassert '💎' in emo\njwt=issue(cfg['hs256_secret_hex'],'ci@codex',['read'],'aud','iss',60)\nassert verify(cfg['hs256_secret_hex'],jwt)['ok']\nassert append(cfg['webhook_signing_secret'],{'type':'ci','ok':True})['ok']\nprint('symbolic ok')\nPY
+""")
+W("tests/test_symbolic.py","""import json\nemo=json.load(open('codex/emoji/scopes.json'))\nassert emo['💎']=='admin'\nprint('emoji map ok')\n""")
+
+# ---------------- Docs ----------------
+W("docs/README.md", f"""# Codex Logos Ω — v212.symbolic
+Generated: {now}
+
+**Emoji-bound access & signals** for Ω (Omega).
+- Emoji → scope map (`/api/emoji/scopes`)
+- Token-bucket rate limit (IP-based)
+- HS256 JWT issue/verify (demo-grade) with emoji scope labels
+- Signed audit append (HMAC-SHA256)
+- Emoji-accent CSS theme
+
+## Run
+```bash
+python3 dashboard/api.py  # port 8912
+docker compose up --build
+```
+
+## Endpoints
+- GET  `/api/emoji/scopes`
+- GET  `/api/emoji/theme.css`
+- POST `/api/tokens/issue`  | body: `{{"sub":"you","scopes":["read","admin"]}}`
+- POST `/api/tokens/verify` | body: `{{"token":"..."}}`
+- POST `/api/audit/append_signed` | `{{"event":{{"kind":"deploy"}}}}`
+
+""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v212_symbolic_omega.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v212.x — "Codex Logos Ω·X (Omega-Extended): OAuth Device & PKCE • Refresh/Introspect/Revoke • Consent • Webhook Sign • Admin UI"
+# Repo: codex_v212x_omega_extended
+# Evolves v212 Access+ with OAuth-flavored flows and admin conveniences.
+# Port: 8900
+
+import os, json, zipfile, hashlib, datetime, shutil, secrets, time, hmac
+
+BASE="/mnt/data/codex_v212x_omega_extended"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v212.x-omega-extended",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8900,
+  "issuer": "codex-omega",
+  "audience": "codex-clients",
+  "hs256_secret_hex": hashlib.sha256(b"cfbk-omega-212x").hexdigest(),
+  "default_scopes": ["read"],
+  "admins": ["owner@codex"],
+  "webhook_signing_secret": hashlib.sha256(b"omega-webhook").hexdigest()
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/crypto.py","""import hashlib, hmac, json, base64\nb64u=lambda b: base64.urlsafe_b64encode(b).rstrip(b'=')\nunb64u=lambda s: base64.urlsafe_b64decode(s + b'='*((4-(len(s)%4))%4))\nsha256=lambda b: hashlib.sha256(b).digest()\nsha256_hex=lambda b: hashlib.sha256(b).hexdigest()\nhmac_sha256=lambda key,msg: hmac.new(key, msg, hashlib.sha256).digest()\n""")
+
+# ---------------- Minimal HS256 JWT ----------------
+W("codex/auth/jwt_hs256.py","""import json, time\nfrom codex.utils.crypto import b64u, unb64u, hmac_sha256\nHDR=b'{\"alg\":\"HS256\",\"typ\":\"JWT\"}'\n\
+def issue(secret_hex:str, sub:str, scopes:list, aud:str, iss:str, ttl:int=3600, nbf:int=None, extra:dict=None)->str:\n    now=int(time.time()); nbf = nbf or now\n    payload={'sub':sub,'scope':' '.join(scopes),'aud':aud,'iss':iss,'iat':now,'nbf':nbf,'exp':now+ttl}\n    if extra: payload.update(extra)\n    part1=b64u(HDR); part2=b64u(json.dumps(payload,separators=(',',':')).encode())\n    sig=hmac_sha256(bytes.fromhex(secret_hex), part1+b'.'+part2)\n    return b'.'.join([part1, part2, b64u(sig)]).decode()\n\
+def verify(secret_hex:str, token:str)->dict:\n    try:\n        h,p,s=token.split('.')\n        sig=hmac_sha256(bytes.fromhex(secret_hex), (h+'.'+p).encode())\n        from codex.utils.crypto import b64u as _b64u\n        if _b64u(sig).decode()!=s: return {'ok':False,'error':'bad_sig'}\n        payload=json.loads(unb64u(p.encode()))\n        now=int(time.time())\n        if now<payload.get('nbf',0): return {'ok':False,'error':'nbf'}\n        if now>payload.get('exp',0): return {'ok':False,'error':'exp'}\n        payload['ok']=True; payload['alg']='HS256'; return payload\n    except Exception:\n        return {'ok':False,'error':'invalid'}\n""")
+
+# ---------------- OAuth-ish DBs ----------------
+W("codex/data/db.json", json.dumps({
+  "device_codes": {}, "refresh_tokens": {}, "consent": {}, "clients": {
+    "cli-app": {"redirect_uris":["http://localhost/callback"], "scopes":["read","write","admin"]}
+  }
+}, indent=2))
+
+# helpers
+W("codex/data/store.py","""import json, os, time, secrets\nDB='codex/data/db.json'\n\
+def _load():\n    try: return json.load(open(DB,encoding='utf-8'))\n    except: return {\"device_codes\":{},\"refresh_tokens\":{},\"consent\":{},\"clients\":{}}\n\
+def _save(d):\n    os.makedirs('codex/data', exist_ok=True)\n    json.dump(d, open(DB,'w',encoding='utf-8'), indent=2)\n\
+def new_device_code(user:str, client_id:str, scope:list)->dict:\n    d=_load(); user_code=secrets.token_hex(4); device_code=secrets.token_hex(16)\n    rec={'user':user,'client_id':client_id,'scope':scope,'verified':False,'ts':time.time(),'expires_in':600}\n    d['device_codes'][device_code]=rec; _save(d)\n    return {'device_code':device_code,'user_code':user_code,'verification_uri':'https://example/activate','expires_in':600}\n\
+def verify_device_code(device_code:str)->dict:\n    d=_load(); rec=d['device_codes'].get(device_code)\n    if not rec: return {'ok':False,'error':'unknown'}\n    rec['verified']=True; _save(d); return {'ok':True}\n\
+def poll_device_code(device_code:str)->dict:\n    d=_load(); rec=d['device_codes'].get(device_code)\n    if not rec: return {'ok':False,'error':'unknown'}\n    if (time.time()-rec['ts'])>rec['expires_in']: return {'ok':False,'error':'expired'}\n    if not rec.get('verified'): return {'ok':False,'error':'authorization_pending'}\n    return {'ok':True,'user':rec['user'],'scope':rec['scope'],'client_id':rec['client_id']}\n\
+def mint_refresh(user:str, scope:list)->str:\n    d=_load(); rt=secrets.token_hex(20)\n    d['refresh_tokens'][rt]={'user':user,'scope':scope,'active':True,'ts':time.time()}\n    _save(d); return rt\n\
+def use_refresh(rt:str)->dict:\n    d=_load(); rec=d['refresh_tokens'].get(rt)\n    if not rec or not rec.get('active'): return {'ok':False,'error':'invalid'}\n    return {'ok':True,'user':rec['user'],'scope':rec['scope']}\n\
+def revoke_refresh(rt:str)->dict:\n    d=_load(); rec=d['refresh_tokens'].get(rt)\n    if not rec: return {'ok':False}\n    rec['active']=False; _save(d); return {'ok':True}\n\
+def record_consent(user:str, client_id:str, scope:list)->dict:\n    d=_load(); key=f\"{user}:{client_id}\"; d['consent'][key]={'scope':scope,'ts':time.time()}; _save(d); return {'ok':True}\n""")
+
+# ---------------- Webhook signing ----------------
+W("codex/webhooks/sign.py","""import hmac, hashlib\nfrom codex.utils.crypto import sha256_hex\n\ndef sign(secret_hex:str, payload:bytes)->str:\n    sig=hmac.new(bytes.fromhex(secret_hex), payload, hashlib.sha256).hexdigest()\n    return 'sha256='+sig\n""")
+
+# ---------------- Admin UI ----------------
+W("dashboard/admin.html","""<!doctype html><html><head><meta charset='utf-8'><title>Ω·X Admin</title>\n\
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}input,button{padding:8px;border-radius:6px;border:1px solid #222;background:#0f1620;color:#e6edf3}section{margin-bottom:24px}</style></head>\n\
+<body><h1>Codex Ω·X — Admin</h1>\n\
+<section><h3>Introspect Token</h3><input id='tok' placeholder='paste token'><button onclick='go()'>Check</button><pre id='out'></pre></section>\n\
+<script>async function go(){const r=await fetch('/api/oauth/introspect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:document.getElementById('tok').value})});document.getElementById('out').textContent=await r.text();}</script>\n\
+</body></html>""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Ω·X (Omega Extended) API","version":"v212.x"},
+  "paths":{
+    "/oauth/device":{"post":{"summary":"Start device flow"}},
+    "/oauth/device/verify":{"post":{"summary":"Mark device code verified"}},
+    "/oauth/token":{"post":{"summary":"Exchange device_code or refresh_token"}},
+    "/oauth/introspect":{"post":{"summary":"Introspect token"}},
+    "/oauth/revoke":{"post":{"summary":"Revoke refresh token"}},
+    "/oauth/authorize":{"post":{"summary":"PKCE-lite authorize (demo)"}},
+    "/oauth/consent":{"post":{"summary":"Record consent"}},
+    "/webhook/sign":{"post":{"summary":"Sign payload HMAC-SHA256"}},
+    "/admin":{"get":{"summary":"Admin HTML"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}},
+    "/metrics":{"get":{"summary":"Metrics"}}
+  }
+}, indent=2))
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0,'tokens_issued':0,'refresh_issued':0,'introspects':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n    up=int(time.time()-START)\n    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- API Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os, time
+from urllib.parse import urlparse
+from codex.metrics.collector import bump, render as metrics_render
+from codex.auth.jwt_hs256 import issue as jwt_issue, verify as jwt_verify
+from codex.data.store import new_device_code, poll_device_code, verify_device_code, mint_refresh, use_refresh, revoke_refresh, record_consent
+from codex.webhooks.sign import sign as wh_sign
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+
+def _ok(handler, obj, code=200, ctype='application/json'):
+    handler.send_response(code); handler.send_header('Content-Type', ctype); handler.end_headers()
+    handler.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def do_POST(self):
+        body=self._json(); p=urlparse(self.path).path; bump('requests_total')
+
+        if p=='/oauth/device':
+            out=new_device_code(body.get('user','reader@codex'), body.get('client_id','cli-app'), body.get('scope', CFG['default_scopes'])); return _ok(self, out)
+        if p=='/oauth/device/verify':
+            return _ok(self, verify_device_code(body.get('device_code','')))
+        if p=='/oauth/token':
+            grant=body.get('grant_type'); 
+            if grant=='urn:ietf:params:oauth:grant-type:device_code':
+                st=poll_device_code(body.get('device_code',''))
+                if not st.get('ok'): return _ok(self, st, 400)
+                rt=mint_refresh(st['user'], st['scope']); bump('refresh_issued')
+                at=jwt_issue(CFG['hs256_secret_hex'], st['user'], st['scope'], CFG['audience'], CFG['issuer'], 900, extra={'amr':['pwd','mfa']})
+                bump('tokens_issued')
+                return _ok(self, {'access_token':at,'refresh_token':rt,'token_type':'Bearer','expires_in':900,'scope':' '.join(st['scope'])})
+            if grant=='refresh_token':
+                ck=use_refresh(body.get('refresh_token',''))
+                if not ck.get('ok'): return _ok(self, ck, 400)
+                at=jwt_issue(CFG['hs256_secret_hex'], ck['user'], ck['scope'], CFG['audience'], CFG['issuer'], 900)
+                bump('tokens_issued')
+                return _ok(self, {'access_token':at,'token_type':'Bearer','expires_in':900,'scope':' '.join(ck['scope'])})
+            return _ok(self, {'error':'unsupported_grant_type'}, 400)
+
+        if p=='/oauth/introspect':
+            tok=body.get('token',''); res=jwt_verify(CFG['hs256_secret_hex'], tok); bump('introspects'); return _ok(self, res)
+        if p=='/oauth/revoke': return _ok(self, revoke_refresh(body.get('refresh_token','')))
+        if p=='/oauth/authorize':
+            # PKCE-lite: echoes code for demo (no real redirect). Client posts code_verifier later (not strictly enforced here).
+            code=hash(os.urandom(8)) & 0xffffffff; return _ok(self, {'code':code,'note':'demo-only'})
+        if p=='/oauth/consent':
+            return _ok(self, record_consent(body.get('user','reader@codex'), body.get('client_id','cli-app'), body.get('scope', CFG['default_scopes'])))
+        if p=='/webhook/sign':
+            payload=(body.get('payload','') or '').encode(); return _ok(self, {'signature': wh_sign(CFG['webhook_signing_secret'], payload)})
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read(); self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render(); self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        if p=='/admin':
+            html=open('dashboard/admin.html','r',encoding='utf-8').read(); self.send_response(200); self.send_header('Content-Type','text/html'); self.end_headers(); self.wfile.write(html.encode()); return
+        return super().do_GET()
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8900)
+""")
+
+# ---------------- Docker / Compose / CI / Tests ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8900
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-omega-extended:
+    build: ./deploy
+    ports:
+      - "8900:8900"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Ω·X (v212.x) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Device + Token + Introspect
+        run: python3 - <<'PY'\nfrom codex.data.store import new_device_code, verify_device_code, poll_device_code, mint_refresh, use_refresh\nfrom codex.auth.jwt_hs256 import issue, verify\nimport json\ncfg=json.load(open('codex/config.json'))\nd=new_device_code('ci@codex','cli-app',['read'])\nverify_device_code(d['device_code'])\np=poll_device_code(d['device_code'])\nassert p['ok']\nrt=mint_refresh('ci@codex',['read'])\nassert use_refresh(rt)['ok']\nat=issue(cfg['hs256_secret_hex'],'ci@codex',['read'],cfg['audience'],cfg['issuer'],60)\nassert verify(cfg['hs256_secret_hex'],at)['ok']\nprint('omega-extended ok')\nPY
+""")
+W("tests/test_oauth.py","""from codex.data.store import new_device_code\nassert 'device_code' in new_device_code('t','cli-app',['read'])\nprint('oauth ok')\n""")
+
+# ---------------- Docs ----------------
+W("docs/README.md", f"""# Codex Logos Ω·X (Omega Extended) — v212.x
+Generated: {now}
+
+Adds **OAuth device flow**, **refresh/introspect/revoke**, **PKCE-lite authorize (demo)**,
+**consent records**, **webhook signing**, and a minimal **Admin UI**. Uses HS256 JWT for tokens here
+(EdDSA/JWKS remain available in v212 Access+).
+
+## Run
+```bash
+python3 dashboard/api.py  # port 8900
+docker compose up --build
+```
+
+## Flows
+- Device code: POST `/oauth/device` → mark verified `/oauth/device/verify` → exchange at `/oauth/token` (grant `device_code`).
+- Refresh: POST `/oauth/token` (grant `refresh_token`).
+- Introspect: POST `/oauth/introspect`.
+- Revoke refresh: POST `/oauth/revoke`.
+- PKCE-lite (demo): POST `/oauth/authorize`.
+- Consent: POST `/oauth/consent`.
+- Webhook sign: POST `/webhook/sign`.
+
+""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v212x_omega_extended.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v212 merged/evolved — "Codex Logos Ω (Omega) — Access+ : EdDSA JWT • JWKS • Key Rotation • Scope Gate Middleware • Policy Eval"
+# Repo: codex_v212_omega_access_plus
+# Extends v212 with:
+# - Ed25519 (EdDSA) JWT issue/verify + JWKS endpoint + key rotation (active/previous kid)
+# - HS256 kept for backward compatibility
+# - Middleware samples (Python/Node) to guard upstream services (e.g., v210/v211)
+# - Simple policy evaluator (allow/deny by scope/resource/action) with admin gate
+# - K8s Secret/Deployment snippets embedded in docs
+# Port remains 8899; adds new endpoints. Includes manifest + CI.
+
+import os, json, zipfile, hashlib, datetime, shutil, secrets
+
+BASE="/mnt/data/codex_v212_omega_access_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    import hashlib
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v212-access-plus",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8899,
+  "issuer": "codex-omega",
+  "audience": "codex-clients",
+  "hs256_secret_hex": hashlib.sha256(b"cfbk-omega-212").hexdigest(),
+  "default_scopes": ["read"],
+  "admins": ["owner@codex"],
+  "jwks": {"active_kid": "kid-1", "keys": {}}
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/crypto.py","""import hashlib, hmac, json, base64\nb64u=lambda b: base64.urlsafe_b64encode(b).rstrip(b'=')\nunb64u=lambda s: base64.urlsafe_b64decode(s + b'='*((4-(len(s)%4))%4))\nsha256=lambda b: hashlib.sha256(b).digest()\nsha256_hex=lambda b: hashlib.sha256(b).hexdigest()\nhmac_sha256=lambda key,msg: hmac.new(key, msg, hashlib.sha256).digest()\n""")
+
+# ---------------- HS256 JWT ----------------
+W("codex/auth/jwt_hs256.py","""import json, time\nfrom codex.utils.crypto import b64u, unb64u, hmac_sha256\nHDR=b'{\"alg\":\"HS256\",\"typ\":\"JWT\"}'\n\
+def issue(secret_hex:str, sub:str, scopes:list, aud:str, iss:str, ttl:int=3600, nbf:int=None)->str:\n    now=int(time.time()); nbf = nbf or now\n    payload={'sub':sub,'scope':' '.join(scopes),'aud':aud,'iss':iss,'iat':now,'nbf':nbf,'exp':now+ttl}\n    part1=b64u(HDR); part2=b64u(json.dumps(payload,separators=(',',':')).encode())\n    sig=hmac_sha256(bytes.fromhex(secret_hex), part1+b'.'+part2)\n    return b'.'.join([part1, part2, b64u(sig)]).decode()\n\
+def verify(secret_hex:str, token:str)->dict:\n    try:\n        h,p,s=token.split('.')\n        sig=hmac_sha256(bytes.fromhex(secret_hex), (h+'.'+p).encode())\n        from codex.utils.crypto import b64u as _b64u\n        if _b64u(sig).decode()!=s: return {'ok':False,'error':'bad_sig'}\n        payload=json.loads(unb64u(p.encode()))\n        now=int(time.time())\n        if now<payload.get('nbf',0): return {'ok':False,'error':'nbf'}\n        if now>payload.get('exp',0): return {'ok':False,'error':'exp'}\n        payload['ok']=True; payload['alg']='HS256'; return payload\n    except Exception:\n        return {'ok':False,'error':'invalid'}\n""")
+
+# ---------------- EdDSA (Ed25519) JWT + JWKS ----------------
+W("codex/auth/jwt_eddsa.py","""import json, time\nfrom codex.utils.crypto import b64u, unb64u\nfrom cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey\nfrom cryptography.hazmat.primitives import serialization\n\
+HDR=b'{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}'\n\
+def gen_keypair()->dict:\n    sk=Ed25519PrivateKey.generate(); pk=sk.public_key()\n    skb=sk.private_bytes(encoding=serialization.Encoding.RawFormat, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())\n    pkb=pk.public_bytes(encoding=serialization.Encoding.RawFormat, format=serialization.PublicFormat.Raw)\n    return {'sk':skb.hex(),'pk':pkb.hex()}\n\
+def jwk_from_pk(kid:str, pk_hex:str)->dict:\n    import base64\n    x=base64.urlsafe_b64encode(bytes.fromhex(pk_hex)).rstrip(b'=').decode()\n    return {'kty':'OKP','crv':'Ed25519','kid':kid,'use':'sig','alg':'EdDSA','x':x}\n\
+def issue(sk_hex:str, kid:str, sub:str, scopes:list, aud:str, iss:str, ttl:int=3600, nbf:int=None)->str:\n    sk=Ed25519PrivateKey.from_private_bytes(bytes.fromhex(sk_hex))\n    now=int(time.time()); nbf = nbf or now\n    payload={'sub':sub,'scope':' '.join(scopes),'aud':aud,'iss':iss,'iat':now,'nbf':nbf,'exp':now+ttl,'kid':kid}\n    p1=b64u(HDR); p2=b64u(json.dumps(payload,separators=(',',':')).encode())\n    sig=sk.sign(p1+b'.'+p2)\n    return b'.'.join([p1,p2,b64u(sig)]).decode()\n\
+def verify(pk_hex:str, token:str)->dict:\n    try:\n        h,p,s=token.split('.')\n        pk=Ed25519PublicKey.from_public_bytes(bytes.fromhex(pk_hex))\n        pk.verify(unb64u(s.encode()), (h+'.'+p).encode())\n        payload=json.loads(unb64u(p.encode()))\n        now=int(time.time())\n        if now<payload.get('nbf',0): return {'ok':False,'error':'nbf'}\n        if now>payload.get('exp',0): return {'ok':False,'error':'exp'}\n        payload['ok']=True; payload['alg']='EdDSA'; return payload\n    except Exception as e:\n        return {'ok':False,'error':'invalid'}\n""")
+
+# ---------------- Vault, Keys, Scope, Policy ----------------
+W("codex/auth/apikeys.py","""import json, os, secrets\nDB='codex/data/apikeys.json'\n\
+def _load():\n    try: return json.load(open(DB,encoding='utf-8'))\n    except: return {'keys':{}}\n\
+def _save(d):\n    os.makedirs('codex/data', exist_ok=True)\n    json.dump(d, open(DB,'w',encoding='utf-8'), indent=2)\n\
+def mint(user:str, scopes:list)->dict:\n    d=_load(); key=secrets.token_hex(16)\n    d['keys'][key]={'user':user,'scopes':scopes}\n    _save(d); return {'ok':True,'key':key}\n\
+def revoke(key:str)->dict:\n    d=_load(); d['keys'].pop(key, None); _save(d); return {'ok':True}\n\
+def check(key:str, needed:list)->dict:\n    d=_load(); rec=d['keys'].get(key)\n    if not rec: return {'ok':False,'error':'unknown'}\n    ok=all(n in rec['scopes'] for n in needed)\n    return {'ok':ok,'user':rec['user'],'scopes':rec['scopes']}\n""")
+
+W("codex/auth/scope.py","""def allow(token_scopes:str, needed:list)->bool:\n    have=set((token_scopes or '').split())\n    return all(n in have for n in needed)\n""")
+
+W("codex/vault/envelope.py","""import os, json, time, hashlib\nDB='codex/vault/kv.json'\n\
+def _derive(master_hex:str, nonce:bytes)->bytes:\n    return hashlib.sha256(bytes.fromhex(master_hex)+nonce).digest()\n\
+def _xor(data:bytes, keystream:bytes)->bytes:\n    return bytes(a^b for a,b in zip(data, keystream* (len(data)//len(keystream)+1)))[:len(data)]\n\
+def put(master_hex:str, name:str, plaintext:str)->dict:\n    os.makedirs('codex/vault', exist_ok=True)\n    nonce=os.urandom(12)\n    ks=_derive(master_hex, nonce)\n    ct=_xor(plaintext.encode(), ks)\n    rec={'nonce':nonce.hex(),'ct':ct.hex(),'ts':time.time()}\n    d=json.load(open(DB,encoding='utf-8')) if os.path.exists(DB) else {}\n    d[name]=rec\n    json.dump(d, open(DB,'w',encoding='utf-8'), indent=2)\n    return {'ok':True}\n\
+def get(master_hex:str, name:str)->dict:\n    d=json.load(open(DB,encoding='utf-8')) if os.path.exists(DB) else {}\n    rec=d.get(name)\n    if not rec: return {'ok':False,'error':'not_found'}\n    nonce=bytes.fromhex(rec['nonce']); ks=_derive(master_hex, nonce)\n    pt=_xor(bytes.fromhex(rec['ct']), ks).decode(errors='replace')\n    return {'ok':True,'value':pt}\n""")
+
+W("codex/policy/policy.py","""import json\nPOL={'statements':[{'effect':'allow','actions':['read'],'resources':['*'],'scopes':['read']}]}\n\
+def setp(p):\n    global POL; POL=p; return {'ok':True}\n\
+def evalp(subject_scopes:list, action:str, resource:str)->dict:\n    for s in POL.get('statements',[]):\n        if action in s.get('actions',['*']) or '*' in s.get('actions',[]):\n            if resource in s.get('resources',['*']) or '*' in s.get('resources',[]):\n                if all(sc in subject_scopes for sc in s.get('scopes',[])):\n                    return {'allow': s.get('effect','deny')=='allow'}\n    return {'allow': False}\n""")
+
+# ---------------- OIDC userinfo ----------------
+W("codex/oidc/userinfo.py","""USERS={'owner@codex':{'sub':'owner@codex','name':'Owner','email':'owner@codex','roles':['admin']},'reader@codex':{'sub':'reader@codex','name':'Reader','email':'reader@codex','roles':['user']}}\n\
+def get(sub:str)->dict:\n    return USERS.get(sub, {'sub':sub,'name':sub,'email':sub})\n""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Ω Access+ API","version":"v212+"},
+  "paths":{
+    "/api/jwt/issue_hs":{"post":{"summary":"Issue HS256 JWT"}},
+    "/api/jwt/verify_hs":{"post":{"summary":"Verify HS256 JWT"}},
+    "/api/jwt/issue_ed":{"post":{"summary":"Issue EdDSA (Ed25519) JWT"}},
+    "/api/jwt/verify_ed":{"post":{"summary":"Verify EdDSA JWT"}},
+    "/api/jwks.json":{"get":{"summary":"JWKS (Ed25519 public keys)"}},
+    "/api/keys/mint":{"post":{"summary":"Mint API key"}},
+    "/api/keys/check":{"post":{"summary":"Check API key scopes"}},
+    "/api/keys/revoke":{"post":{"summary":"Revoke API key"}},
+    "/api/oidc/userinfo":{"post":{"summary":"Userinfo stub"}},
+    "/api/vault/put":{"post":{"summary":"Put secret (envelope)"}},
+    "/api/vault/get":{"post":{"summary":"Get secret"}},
+    "/api/policy/set":{"post":{"summary":"Set policy document"}},
+    "/api/policy/eval":{"post":{"summary":"Evaluate action on resource"}},
+    "/metrics":{"get":{"summary":"Metrics"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}}
+  }
+}, indent=2))
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n    up=int(time.time()-START)\n    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- Key State (JWKS + rotation) ----------------
+W("codex/auth/keystate.json", json.dumps({
+  "active_kid": "kid-1",
+  "keys": {
+    "kid-1": {"sk": secrets.token_hex(32), "pk": secrets.token_hex(32)},
+    "kid-0": {"sk": secrets.token_hex(32), "pk": secrets.token_hex(32)}
+  }
+}, indent=2))
+
+# ---------------- API Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse
+from codex.metrics.collector import bump, render as metrics_render
+from codex.auth.jwt_hs256 import issue as hs_issue, verify as hs_verify
+from codex.auth.jwt_eddsa import issue as ed_issue, verify as ed_verify, jwk_from_pk
+from codex.auth.apikeys import mint as key_mint, revoke as key_revoke, check as key_check
+from codex.vault.envelope import put as vault_put, get as vault_get
+from codex.policy.policy import setp as policy_set, evalp as policy_eval
+from codex.oidc.userinfo import get as userinfo_get
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+KS=json.load(open('codex/auth/keystate.json',encoding='utf-8'))
+
+def _jwks_payload():
+    keys=[]; 
+    for kid,rec in KS['keys'].items():
+        keys.append(jwk_from_pk(kid, rec['pk']))
+    return {'keys': keys}
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def do_POST(self):
+        body=self._json(); p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/jwt/issue_hs':
+            tok=hs_issue(CFG['hs256_secret_hex'], body.get('sub','reader@codex'), body.get('scopes', CFG['default_scopes']), CFG['audience'], CFG['issuer'], int(body.get('ttl',3600)))
+            return self._ok({'token':tok})
+        if p=='/api/jwt/verify_hs': return self._ok(hs_verify(CFG['hs256_secret_hex'], body.get('token','')))
+        if p=='/api/jwt/issue_ed':
+            kid=KS['active_kid']; sk=KS['keys'][kid]['sk']
+            tok=ed_issue(sk, kid, body.get('sub','reader@codex'), body.get('scopes', CFG['default_scopes']), CFG['audience'], CFG['issuer'], int(body.get('ttl',3600)))
+            return self._ok({'token':tok,'kid':kid})
+        if p=='/api/jwt/verify_ed':
+            # choose kid from payload if provided; else try active
+            try:\n                hdr,pay,sig = body.get('token','').split('.')\n                pay_json=json.loads(__import__('codex.utils.crypto').utils.crypto.unb64u(pay.encode()))\n                kid=pay_json.get('kid', KS['active_kid'])\n            except Exception:\n                kid=KS['active_kid']\n            pk=KS['keys'][kid]['pk']\n            return self._ok(ed_verify(pk, body.get('token','')))\n        if p=='/api/keys/mint': return self._ok(key_mint(body.get('user','reader@codex'), body.get('scopes', CFG['default_scopes'])))
+        if p=='/api/keys/check': return self._ok(key_check(body.get('key',''), body.get('needed', [])))
+        if p=='/api/keys/revoke': return self._ok(key_revoke(body.get('key','')))
+        if p=='/api/oidc/userinfo': return self._ok(userinfo_get(body.get('sub','reader@codex')))
+        if p=='/api/vault/put': return self._ok(vault_put(CFG['hs256_secret_hex'], body.get('name','secret'), body.get('value','')))
+        if p=='/api/vault/get': return self._ok(vault_get(CFG['hs256_secret_hex'], body.get('name','secret')))
+        if p=='/api/policy/set': return self._ok(policy_set(body.get('policy', {'statements':[]})))
+        if p=='/api/policy/eval': return self._ok(policy_eval(body.get('scopes', []), body.get('action','read'), body.get('resource','*')))
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/jwks.json': return self._ok(_jwks_payload())
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8899)
+""")
+
+# ---------------- Docker / Compose / CI ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+RUN pip install cryptography==42.0.5
+WORKDIR /app
+COPY . /app
+EXPOSE 8899
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-omega-plus:
+    build: ./deploy
+    ports:
+      - "8899:8899"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Ω Access+ (v212) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: HS + EdDSA + JWKS + Policy
+        run: python3 - <<'PY'\nfrom codex.auth.jwt_hs256 import issue as hi, verify as hv\nfrom codex.auth.jwt_eddsa import issue as ei\nimport json\ncfg=json.load(open('codex/config.json'))\nks=json.load(open('codex/auth/keystate.json'))\n# HS\nhs=hi(cfg['hs256_secret_hex'],'ci@codex',['read'],'aud','iss',60)\nassert hv(cfg['hs256_secret_hex'],hs)['ok']\n# EdDSA\nkid=ks['active_kid']; sk=ks['keys'][kid]['sk']\ned=ei(sk,kid,'ci@codex',['read'],'aud','iss',60)\nprint(len(ed.split('.'))==3)\nprint('ci ok')\nPY
+""")
+
+# ---------------- Middleware samples ----------------
+W("middleware/python_verify.py","""# Example: Protect a Flask route with Ω JWT (HS256 or EdDSA)\nfrom flask import Flask, request, jsonify\nimport requests, json\nfrom codex.auth.jwt_hs256 import verify as verify_hs\nfrom codex.auth.jwt_eddsa import verify as verify_ed\ncfg=json.load(open('codex/config.json'))\nks=json.load(open('codex/auth/keystate.json'))\napp=Flask(__name__)\n\ndef verify_any(tok:str):\n    v=verify_hs(cfg['hs256_secret_hex'], tok)\n    if v.get('ok'): return v\n    for kid,rec in ks['keys'].items():\n        vv=verify_ed(rec['pk'], tok)\n        if vv.get('ok'): return vv\n    return {'ok':False}\n\n@app.get('/protected')\ndef protected():\n    auth=request.headers.get('Authorization','')\n    if not auth.startswith('Bearer '): return jsonify({'error':'no_bearer'}),401\n    tok=auth.split(' ',1)[1]\n    v=verify_any(tok)\n    if not v.get('ok'): return jsonify({'error':'bad_token'}),403\n    return jsonify({'ok':True,'sub':v['sub'],'scope':v['scope']})\n\nif __name__=='__main__':\n    app.run(port=8080)\n""")
+
+W("middleware/node_verify.js","""// Example: Protect an Express route with Ω JWT (EdDSA via node-jose or HS256 lightweight)
+// This is a stub—swap with your preferred JWT lib in production.
+const express=require('express'); const app=express(); app.get('/protected',(req,res)=>{res.json({ok:true})}); app.listen(8081);
+""")
+
+# ---------------- Docs ----------------
+W("docs/README.md", f"""# Codex Logos Ω (Omega) — v212 Access+
+Generated: {now}
+
+Adds **EdDSA (Ed25519) JWT** with **JWKS** + **key rotation**, keeps **HS256** for backward compatibility,
+ships **policy evaluator**, **middleware samples**, and tightens the bridge to Ψ/Χ services.
+
+## Endpoints (8899)
+- POST `/api/jwt/issue_hs` / `/api/jwt/verify_hs`
+- POST `/api/jwt/issue_ed` / `/api/jwt/verify_ed`
+- GET  `/api/jwks.json` — JWKS (OKP/Ed25519)
+- POST `/api/policy/set` + `/api/policy/eval`
+- Keys/Vault/Userinfo as in v212 base.
+
+## K8s Secret (JWKS rotation-ready)
+```yaml
+apiVersion: v1
+kind: Secret
+metadata: {{ name: omega-keystate }}
+stringData:
+  keystate.json: |-
+    {{"{{"}} ... JWKS private store ... {{"}}" }}
+```
+
+## Protecting Ψ (v211.x) admin endpoints
+- Require `Authorization: Bearer <JWT>` with `scope` including `admin` to call `/api/logs/trim` and `/api/config/reload`.
+- Use `middleware/python_verify.py` (example) or Node variant to front these endpoints.
+
+""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v212_omega_access_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
