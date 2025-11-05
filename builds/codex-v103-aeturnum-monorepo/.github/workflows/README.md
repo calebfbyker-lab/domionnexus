@@ -1,0 +1,1 @@
+This directory contains reusable CI workflows used by the monorepo. The YAMLs are intentionally simple and designed as examples for local CI.
