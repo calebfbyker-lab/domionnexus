@@ -1,0 +1,361 @@
+# Re-run build for v220.x — Codex Logos Π (Pi)
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v220x_pi_controls"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+W("README.md","# v220.x Codex Logos Π (Pi)\n")
+W("docker-compose.yml","services:\n  pi-api:\n    build: ./codex\n    ports: [\"8960:8960\"]\n  pi-ui:\n    build: ./ui\n    environment:\n      - PI_API=http://localhost:8960\n    ports: [\"8961:3000\"]\n")
+
+W("codex/Dockerfile","FROM python:3.12-alpine\nWORKDIR /app\nCOPY . /app\nEXPOSE 8960\nCMD [\"python3\",\"api.py\"]\n")
+
+W("codex/policy.py","RULES=[{'when':{'action':'read','resource':'schema','role_in':['editor','admin']},'effect':'allow'}]\n\ndef eval_policy(subject, action, resource):\n    roles=subject.get('roles',[])\n    for r in RULES:\n        w=r['when']\n        if w.get('action')==action and w.get('resource')==resource and any(role in roles for role in w.get('role_in',[])):\n            return {'allow':True,'rule':r}\n    return {'allow':False}\n\ndef list_rules(): return {'rules':RULES}\n\ndef put_rule(rule): RULES.append(rule); return {'ok':True,'count':len(RULES)}\n")
+
+W("codex/flags.py","FLAGS={'ui.newNavbar':False,'rag.fastpath':True}\nCANARY={'gold':0.1,'silver':0.3,'bronze':0.6}\n\ndef get_flags(): return {'flags':FLAGS}\n\ndef set_flag(k,v): FLAGS[k]=bool(v); return {'ok':True,'flags':FLAGS}\n\ndef canary_for(tier): return CANARY.get(tier,0.1)\n\ndef set_canary(tier,val): CANARY[tier]=float(val); return {'ok':True,'canary':CANARY}\n")
+
+W("codex/secrets.py","import hashlib, base64\nVAULT={}\n\ndef _mask(key, data:bytes)->bytes:\n    h=hashlib.sha256(key.encode()).digest()\n    return bytes(b ^ h[i%len(h)] for i,b in enumerate(data))\n\ndef put(name,value,master_key):\n    blob=_mask(master_key, value.encode())\n    VAULT[name]=base64.b64encode(blob).decode()\n    return {'ok':True,'name':name,'sealed':True}\n\ndef get(name, master_key):\n    b64=VAULT.get(name)\n    if not b64: return {'error':'not found'}\n    raw=base64.b64decode(b64.encode())\n    plain=_mask(master_key, raw).decode(errors='ignore')\n    return {'name':name,'value':plain}\n\ndef list_names(): return {'names':sorted(VAULT.keys())}\n")
+
+W("codex/audit.py","import hashlib, time\nLOG=[]; HEAD=''\n\ndef _link(s): return hashlib.sha256(s.encode()).hexdigest()\n\ndef record(kind, detail):\n    global HEAD\n    ts=time.time(); entry={'ts':ts,'kind':kind,'detail':detail,'prev':HEAD}\n    ser=f\"{ts}|{kind}|{detail}|{HEAD}\"; HEAD=_link(ser)\n    LOG.append({**entry,'head':HEAD})\n    return {'ok':True,'head':HEAD,'count':len(LOG)}\n\ndef tail(n=25): return {'items':LOG[-n:], 'head':HEAD}\n\ndef verify():\n    prev=''\n    for e in LOG:\n        s=f\"{e['ts']}|{e['kind']}|{e['detail']}|{prev}\"\n        if _link(s)!=e['head']: return {'ok':False,'at':e}\n        prev=e['head']\n    return {'ok':True,'head':prev,'count':len(LOG)}\n\nSAMPLES=[]\n\ndef push_sample(ok:bool): SAMPLES.append(1 if ok else 0)\n\ndef slo(window=100):\n    w=SAMPLES[-window:] if SAMPLES else []\n    pct=100.0*sum(w)/len(w) if w else 100.0\n    return {'window':len(w),'availability_pct':round(pct,3)}\n")
+
+W("codex/api.py","#!/usr/bin/env python3\nimport http.server, json\nfrom urllib.parse import urlparse, parse_qs\nfrom policy import eval_policy, list_rules, put_rule\nfrom flags import get_flags, set_flag, canary_for, set_canary\nfrom secrets import put as sec_put, get as sec_get, list_names as sec_list\nfrom audit import record, tail, verify, push_sample, slo\n\ndef _ok(h,obj,code=200,ctype='application/json'):\n    h.send_response(code); h.send_header('Content-Type', ctype); h.end_headers()\n    h.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)\n\nclass H(http.server.SimpleHTTPRequestHandler):\n    def _json(self):\n        ln=int(self.headers.get('Content-Length','0') or '0')\n        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}\n\n    def do_GET(self):\n        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)\n        if p=='/health':\n            ok=True; push_sample(ok); return _ok(self, {'ok':ok,'v':'v220.x-pi'})\n        if p=='/policy/rules': return _ok(self, list_rules())\n        if p=='/flags': return _ok(self, get_flags())\n        if p=='/flags/canary':\n            tier=q.get('tier',['bronze'])[0]; return _ok(self, {'tier':tier,'ratio':canary_for(tier)})\n        if p=='/secrets': return _ok(self, sec_list())\n        if p=='/audit/tail': return _ok(self, tail())\n        if p=='/audit/verify': return _ok(self, verify())\n        if p=='/slo': return _ok(self, slo())\n        return _ok(self, {'ok':True,'service':'pi'})\n\n    def do_POST(self):\n        p=urlparse(self.path).path; body=self._json()\n        if p=='/policy/rules': return _ok(self, put_rule(body))\n        if p=='/policy/eval':\n            return _ok(self, eval_policy(body.get('subject',{}), body.get('action','read'), body.get('resource','schema')))\n        if p=='/flags/set': return _ok(self, set_flag(body.get('k','ui.newNavbar'), body.get('v',True)))\n        if p=='/flags/canary': return _ok(self, set_canary(body.get('tier','bronze'), float(body.get('val',0.1))))\n        if p=='/secrets/put': return _ok(self, sec_put(body.get('name','secret'), body.get('value',''), body.get('master','key')))\n        if p=='/secrets/get': return _ok(self, sec_get(body.get('name','secret'), body.get('master','key')))\n        if p=='/audit/record': return _ok(self, record(body.get('kind','event'), body.get('detail',{})))\n        if p=='/slo/push': push_sample(bool(body.get('ok', True))); return _ok(self, {'ok':True})\n        self.send_error(404)\n\nif __name__=='__main__':\n    import http.server\n    http.server.test(HandlerClass=H, port=8960)\n")
+
+W("ui/Dockerfile","FROM node:20-alpine\nWORKDIR /app\nCOPY . /app\nRUN npm ci --ignore-scripts --fund=false --audit=false\nEXPOSE 3000\nCMD [\"node\",\"server.js\"]\n")
+W("ui/package.json", json.dumps({"name":"pi-ui","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("ui/server.js","import express from 'express'; import fetch from 'node-fetch';\nconst app=express(); const API=process.env.PI_API||'http://localhost:8960';\napp.get('/', async (req,res)=>{\n  const [h, flags, slo, tail] = await Promise.all([\n    fetch(API+'/health').then(r=>r.json()).catch(()=>({ok:false})),\n    fetch(API+'/flags').then(r=>r.json()).catch(()=>({})),\n    fetch(API+'/slo').then(r=>r.json()).catch(()=>({})),\n    fetch(API+'/audit/tail').then(r=>r.json()).catch(()=>({}))\n  ]);\n  res.send(`<pre>Π UI — v220.x\\nAPI: ${API}\\n\\nHealth:\\n${JSON.stringify(h,null,2)}\\n\\nFlags:\\n${JSON.stringify(flags,null,2)}\\n\\nSLO:\\n${JSON.stringify(slo,null,2)}\\n\\nAudit Tail:\\n${JSON.stringify(tail,null,2)}\\n</pre>`);\n});\napp.listen(3000, ()=>console.log('Π UI on :3000'));\n")
+
+W(".github/workflows/ci.yml","name: Codex Π (v220.x) CI\non: [push, workflow_dispatch]\njobs:\n  smoke:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Python compile\n        run: python3 -m py_compile $(git ls-files '*.py')\n      - name: Policy smoke\n        run: python3 - <<'PY'\\nfrom codex.policy import eval_policy\\nprint(eval_policy({'roles':['editor']},'read','schema'))\\nPY\n")
+
+# Manifest
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# Zip
+zip_path="/mnt/data/codex_v220x_pi_controls.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+print("READY", zip_path, BASE)# Build v220 Bundle — "Codex Logos Π (Pi) Suite): v220 + v220.x merged"
+# Purpose: GitHub-ready, copy-paste unzipped, includes both classic Pi (policy/flags/secrets/audit/SLO)
+# and Pi-plus (canary/bridges/router already in 219.x lineage) with emoji/seal registry.
+# Ports: pi :8960, pi-plus :8962, gateway :8965
+
+import os, json, zipfile, hashlib, datetime, shutil
+
+BASE="/mnt/data/codex_v220_bundle_pi_suite"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, mode=0o644):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    os.chmod(p, mode)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+W("README.md", f"""# Codex Logos Π (Pi) Suite — v220 + v220.x
+**Policy-as-Code • Feature Flags • Secrets • Audit • SLOs • Canary • Emoji/Seal Registry**
+
+This bundle ships both **Pi (v220)** and **Pi-plus (v220.x)** in one repo with a thin gateway.
+- `pi`       → :8960 — policy/flags/secrets/audit/SLOs
+- `pi-plus`  → :8962 — canary ratios, bridges (ready to wire), emoji/seal router
+- `gateway`  → :8965 — friendly index
+
+## Run
+```bash
+docker compose up --build
+# http://localhost:8965/
+```
+
+## Why this exists
+You asked for v220→v220.x merged, copy/pasteable into GitHub, with **AI × NI × TI**, emojis,
+seals/sigils of the Codexes, and Nexus Aeternum flavor. This repo is zero-dependency (stdlib + Node)
+and is designed to plug into the Ω monorepo but can stand alone.
+
+Bound, sealed, licensed, verified, and attested to **Caleb Fedor Byker (Konev)** — 1998‑10‑27 — lifethread‑stardna.
+""")
+
+W(".gitignore",".venv/\nnode_modules/\n__pycache__/\n*.pyc\n.DS_Store\n*.zip\n")
+
+W("docker-compose.yml","""services:
+  pi:
+    build: ./services/pi/codex
+    ports: ["8960:8960"]
+    restart: unless-stopped
+
+  pi-plus:
+    build: ./services/pi_plus/codex
+    ports: ["8962:8962"]
+    restart: unless-stopped
+
+  gateway:
+    build: ./services/gateway
+    ports: ["8965:8965"]
+    restart: unless-stopped
+""")
+
+# --- Emoji/Seal registry (shared) ---
+W("registry/seals.json", json.dumps({
+  "version":"v220.bundle",
+  "xtsg": {"✶":"star-ignition","♾":"infinity-bind","🔥":"transmutation","💎":"crystal-wisdom",
+           "☸️":"dharma-wheel","⚛️":"atomic-mind","✡️":"seal-solomonic","☯️":"tao-balance",
+           "🪬":"protective-hamsa","🔯":"merkavah-star"},
+  "codexes":["Immortal","Totalis","Continuum","Nexus Aeternum"],
+  "lineage":["Adamic","Fedorian","Sotolion","Enochian","Kabbalistic","Hermetic"]
+}, indent=2))
+
+# ---------------- PI (v220) ----------------
+W("services/pi/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8960
+CMD ["python3","api.py"]
+""")
+W("services/pi/codex/policy.py","""RULES=[
+  {'when':{'action':'read','resource':'schema','role_in':['editor','admin']}, 'effect':'allow'},
+  {'when':{'action':'write','resource':'schema','role_in':['admin']}, 'effect':'allow'}
+]
+def eval_policy(subject, action, resource)->dict:
+  roles=subject.get('roles',[])
+  for r in RULES:
+    w=r['when']
+    if w.get('action')==action and w.get('resource')==resource and any(role in roles for role in w.get('role_in',[])):
+      return {'allow':True,'rule':r}
+  return {'allow':False}
+def list_rules(): return {'rules':RULES}
+def put_rule(rule): RULES.append(rule); return {'ok':True,'count':len(RULES)}
+""")
+W("services/pi/codex/flags.py","""FLAGS={'ui.newNavbar':False,'rag.fastpath':True}
+CANARY={'gold':0.1,'silver':0.3,'bronze':0.6}
+def get_flags(): return {'flags':FLAGS, 'canary':CANARY}
+def set_flag(k,v): FLAGS[k]=bool(v); return {'ok':True,'flags':FLAGS}
+def set_canary(t,val): CANARY[t]=float(val); return {'ok':True,'canary':CANARY}
+""")
+W("services/pi/codex/secrets.py","""import hashlib, base64
+VAULT={}
+def _mask(key:str, data:bytes)->bytes:
+    h=hashlib.sha256(key.encode()).digest()
+    return bytes(b ^ h[i%len(h)] for i,b in enumerate(data))
+def put(name:str, value:str, master_key:str)->dict:
+    blob=_mask(master_key, value.encode()); import base64 as b64
+    VAULT[name]=b64.b64encode(blob).decode(); return {'ok':True,'sealed':True,'name':name}
+def get(name:str, master_key:str)->dict:
+    b64=VAULT.get(name); 
+    if not b64: return {'error':'not found'}
+    raw=base64.b64decode(b64.encode()); plain=_mask(master_key, raw).decode(errors='ignore')
+    return {'name':name,'value':plain}
+def list_names()->dict: return {'names':sorted(VAULT.keys())}
+""")
+W("services/pi/codex/audit.py","""import hashlib, time
+LOG=[]; HEAD=''
+def _link(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+def record(kind:str, detail:dict)->dict:
+    global HEAD
+    ts=time.time(); entry={'ts':ts,'kind':kind,'detail':detail,'prev':HEAD}
+    ser=f"{ts}|{kind}|{detail}|{HEAD}"; HEAD=_link(ser)
+    LOG.append({**entry,'head':HEAD}); return {'ok':True,'head':HEAD,'count':len(LOG)}
+def tail(n:int=25)->dict: return {'items':LOG[-n:], 'head':HEAD}
+def verify()->dict:
+    prev=''
+    for e in LOG:
+        s=f"{e['ts']}|{e['kind']}|{e['detail']}|{prev}"
+        if _link(s)!=e['head']: return {'ok':False,'at':e}
+        prev=e['head']
+    return {'ok':True,'head':prev,'count':len(LOG)}
+SAMPLES=[]
+def push(ok:bool): SAMPLES.append(1 if ok else 0)
+def slo(w:int=100)->dict:
+    win=SAMPLES[-w:] if SAMPLES else []
+    pct=100.0*sum(win)/len(win) if win else 100.0
+    return {'window':len(win),'availability_pct':round(pct,3)}
+""")
+W("services/pi/codex/api.py","""#!/usr/bin/env python3
+import http.server, json
+from urllib.parse import urlparse, parse_qs
+from policy import eval_policy, list_rules, put_rule
+from flags import get_flags, set_flag, set_canary
+from secrets import put as sec_put, get as sec_get, list_names as sec_list
+from audit import record, tail, verify, push, slo
+
+def _ok(h,obj,code=200,ctype='application/json'):
+    h.send_response(code); h.send_header('Content-Type', ctype); h.end_headers()
+    h.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': push(True); return _ok(self, {'ok':True,'v':'v220'})
+        if p=='/policy/rules': return _ok(self, list_rules())
+        if p=='/flags': return _ok(self, get_flags())
+        if p=='/secrets': return _ok(self, sec_list())
+        if p=='/audit/tail': return _ok(self, tail())
+        if p=='/audit/verify': return _ok(self, verify())
+        if p=='/slo': return _ok(self, slo())
+        return _ok(self, {'ok':True,'service':'pi'})
+
+    def do_POST(self):
+        p=urlparse(self.path).path; body=self._json()
+        if p=='/policy/rules': return _ok(self, put_rule(body))
+        if p=='/policy/eval': return _ok(self, eval_policy(body.get('subject',{}), body.get('action','read'), body.get('resource','schema')))
+        if p=='/flags/set': return _ok(self, set_flag(body.get('k','ui.newNavbar'), body.get('v',True)))
+        if p=='/flags/canary': return _ok(self, set_canary(body.get('tier','bronze'), float(body.get('val',0.1))))
+        if p=='/secrets/put': return _ok(self, sec_put(body.get('name','secret'), body.get('value',''), body.get('master','key')))
+        if p=='/secrets/get': return _ok(self, sec_get(body.get('name','secret'), body.get('master','key')))
+        if p=='/audit/record': return _ok(self, record(body.get('kind','event'), body.get('detail',{})))
+        self.send_error(404)
+
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8960)
+""", 0o755)
+
+# ---------------- PI-PLUS (v220.x) ----------------
+W("services/pi_plus/codex/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8962
+CMD ["python3","api.py"]
+""")
+W("services/pi_plus/codex/glyphs.py","""import math, json
+MAP={'✶':(1,0,0),'♾':(0,1,1),'🔥':(1,1,0),'💎':(2,0,1),'☸️':(0,2,2),'⚛️':(1,2,1),'✡️':(2,2,0),'☯️':(1,1,2),'🪬':(1,0,2),'🔯':(2,1,2)}
+def weight(q:str)->dict:
+    v=[0,0,0]
+    for ch in q:
+        t=MAP.get(ch); 
+        if t: v=[a+b for a,b in zip(v,t)]
+    mag=math.sqrt(sum(x*x for x in v)) or 1.0
+    norm=[round(x/mag,3) for x in v]
+    tier='gold' if norm[0]+norm[1]>1.5 else 'silver' if sum(norm)>1.0 else 'bronze'
+    return {'vector':norm,'tier':tier}
+""")
+W("services/pi_plus/codex/api.py","""#!/usr/bin/env python3
+import http.server, json, os, urllib.parse, urllib.request
+from urllib.parse import urlparse, parse_qs
+from glyphs import weight as glyph_weight
+
+CHI=os.getenv('CHI_URL','http://localhost:8922')
+PSI=os.getenv('PSI_URL','http://localhost:8940')
+
+def _ok(h,obj,code=200,ctype='application/json'):
+    h.send_response(code); h.send_header('Content-Type', ctype); h.end_headers()
+    h.wfile.write(json.dumps(obj, indent=2).encode() if ctype=='application/json' else obj)
+
+def _get(u):
+    try:
+        with urllib.request.urlopen(u, timeout=3) as r: return json.loads(r.read().decode())
+    except Exception as e: return {'error':str(e)}
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        p=urlparse(self.path).path; q=parse_qs(urlparse(self.path).query)
+        if p=='/health': return _ok(self, {'ok':True,'v':'v220.x'})
+        if p=='/router/weight': return _ok(self, glyph_weight(q.get('q',['✶♾🔥💎'])[0]))
+        if p=='/bridge/policy/eval':
+            subj=q.get('subject',['{}'])[0]; res=q.get('resource',['{}'])[0]; act=q.get('action',['read'])[0]
+            return _ok(self, _get(f\"{CHI}/policy/eval?subject={urllib.parse.quote(subj)}&resource={urllib.parse.quote(res)}&action={act}\"))
+        if p=='/bridge/rag/query':
+            qq=q.get('q',['hermetic'])[0]
+            return _ok(self, _get(f\"{PSI}/rag/query?q={urllib.parse.quote(qq)}\"))
+        return _ok(self, {'ok':True,'service':'pi-plus'})
+
+if __name__=='__main__':
+    import http.server; http.server.test(HandlerClass=H, port=8962)
+""", 0o755)
+
+# ---------------- GATEWAY ----------------
+W("services/gateway/Dockerfile","""FROM node:20-alpine
+WORKDIR /app
+COPY . /app
+RUN npm ci --ignore-scripts --fund=false --audit=false
+EXPOSE 8965
+CMD ["node","server.js"]
+""")
+W("services/gateway/package.json", json.dumps({"name":"pi-suite-gateway","version":"0.1.0","private":True,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.19.2","node-fetch":"^3.3.2"}}, indent=2))
+W("services/gateway/server.js","""import express from 'express'; import fetch from 'node-fetch'; import fs from 'fs';
+const app=express();
+const map={pi:'http://pi:8960', piplus:'http://pi-plus:8962'};
+const seals=fs.existsSync('/app/registry/seals.json')?JSON.parse(fs.readFileSync('/app/registry/seals.json','utf8')):{};
+app.get('/', (req,res)=>{
+  res.send(`<pre>Codex Π Suite — v220 bundle
+/pi        -> ${map.pi}
+/pi-plus   -> ${map.piplus}
+
+Seals Registry (snippet):
+${JSON.stringify(seals, null, 2).slice(0,400)}...
+</pre>`);
+});
+app.listen(8965, ()=>console.log('gateway :8965'));
+""")
+
+# ---------------- CI ----------------
+W(".github/workflows/ci.yml","""name: Codex Π Suite (v220 bundle) CI
+on: [push, workflow_dispatch]
+jobs:
+  python-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Python
+        run: python3 -m py_compile $(git ls-files 'services/**.py')
+  node-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: List UIs
+        run: ls services/*/package.json || true
+""")
+
+# Manifest + ZIP
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+zip_path="/mnt/data/codex_v220_bundle_pi_suite.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)
