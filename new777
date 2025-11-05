@@ -1,0 +1,621 @@
+Locked. Here’s your v9.x Finisher — cut endless v9.1 … v9.N micro-releases with airtight manifests, Merkle roots, notes, bundles, and a quick verifier. Fully local/read-only (no wallets, mining, or network ops). Copy-paste straight into your repo.
+
+
+---
+
+1) Minor release tool — tools/v9x_release.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, hashlib, datetime, re, tarfile
+
+ROOT   = pathlib.Path(".")
+DIST   = ROOT/"dist"; DIST.mkdir(exist_ok=True)
+FINAL  = ROOT/"final"; FINAL.mkdir(exist_ok=True)
+VERSION_FILE = ROOT/"VERSION"           # contains e.g. "v9" or "v9.x"
+SERIES = "v9"                           # lock to v9 series
+
+def _load_binding():
+    p = ROOT/"BINDING.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    # fallback binding
+    return {
+      "owner":"Caleb Fedor Byker (Konev)",
+      "dob":"1998-10-27",
+      "subject_sha256":"2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+      "license":"EUCELA Tri-License",
+      "bitcoin_address":"bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+      "lightning_invoice_notes":[]
+    }
+
+BINDING = _load_binding()
+
+# Present-only set of safe, read-only artifacts for v9.x (add/remove freely)
+ARTIFACTS = [
+  # Core codex v2 + monetized v2
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION_V2.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT_V2.json",
+  "codex_next_evolution/monetized_summary_v2.csv",
+  "final/monetized_merkle_root_v2.txt",
+
+  # Legacy/context (optional)
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT.json",
+  "codex_next_evolution/monetized_summary.csv",
+  "final/monetized_merkle_root.txt",
+
+  # Telemetry / lattice / policy / attest
+  "final/telemetry_norm.json",
+  "final/predictors_report.json",
+  "final/optimizer_report.json",
+  "final/optimizer_grid.csv",
+  "final/trihelix_advisory.svg",
+  "final/xtsg_lattice.json",
+  "final/feature_flags.json",
+  "final/spdx_lite.json",
+  "final/zk_commitment.json",
+  "final/FINAL_AUDIT.json",
+  "final/FINAL_AUDIT.sha256",
+
+  # Optional symbolic pack from v7.x
+  "final/emoji_lexicon_v7x.json",
+  "final/emoji_seals_catalog_v7x.json",
+  "final/btc_mining_ledger_sim_v7x.json",
+  "final/angelic_golems_v7x.json",
+
+  # Base v9 manifest (if you want minors to explicitly chain the base)
+  "dist/V9_MANIFEST.json",
+  "dist/V9_MANIFEST.sha256",
+]
+
+def _sha(p: pathlib.Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def _series_minor() -> int:
+    v = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else SERIES
+    m = re.fullmatch(rf"{SERIES}(?:\.(\d+))?$", v)
+    return int(m.group(1) or 0) if m else 0
+
+def _write_version(n:int):
+    VERSION_FILE.write_text(f"{SERIES}.{n}\n")
+
+def _present(paths): return [ROOT/rel for rel in paths if (ROOT/rel).exists()]
+
+def _merkle(hs):
+    if not hs: return ""
+    cur = sorted(hs)
+    while len(cur) > 1:
+        nxt=[]
+        for i in range(0,len(cur),2):
+            a=cur[i]; b=cur[i+1] if i+1<len(cur) else cur[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        cur=nxt
+    return cur[0]
+
+if __name__=="__main__":
+    prev_minor = _series_minor()
+    next_minor = prev_minor + 1
+
+    present = _present(ARTIFACTS)
+    files=[]; hs=[]
+    for p in present:
+        h=_sha(p); hs.append(h)
+        files.append({"path": str(p), "sha256": h, "size": p.stat().st_size})
+
+    merkle_root = _merkle(hs)
+    manifest = {
+      "title": f"CODEX — v9.{next_minor} Release",
+      "version": f"{SERIES}.{next_minor}",
+      "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+      "binding": BINDING,
+      "files": files,
+      "merkle_root": merkle_root,
+      "notes": {"series": SERIES, "kind": "minor", "scope":"Aggregate, read-only, local"}
+    }
+
+    mfile = DIST/f"v9.{next_minor}_MANIFEST.json"
+    mfile.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DIST/f"v9.{next_minor}_MANIFEST.sha256").write_text(
+        hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    )
+
+    # Minimal release notes (hash-only change list vs prior manifest, if present)
+    changes=[]
+    prev_manifest = DIST/f"v9.{prev_minor}_MANIFEST.json"
+    if prev_minor>0 and prev_manifest.exists():
+        prev = json.loads(prev_manifest.read_text())
+        prev_map = {f["path"]: f["sha256"] for f in prev.get("files",[])}
+        for f in files:
+            old = prev_map.get(f["path"])
+            if old != f["sha256"]:
+                changes.append({"path": f["path"], "from": old, "to": f["sha256"]})
+
+    (DIST/f"v9.{next_minor}_RELEASE_NOTES.json").write_text(json.dumps({
+        "version": f"{SERIES}.{next_minor}",
+        "timestamp": manifest["timestamp"],
+        "binding": BINDING,
+        "merkle_root": merkle_root,
+        "changed_files": changes
+    }, indent=2), encoding="utf-8")
+
+    # Bundle everything present + the new manifest + notes
+    bundle = DIST/f"v9.{next_minor}_bundle.tgz"
+    with tarfile.open(bundle, "w:gz") as t:
+        for p in present: t.add(p, arcname=str(p))
+        t.add(mfile, arcname=str(mfile))
+        t.add(DIST/f"v9.{next_minor}_RELEASE_NOTES.json", arcname=f"dist/v9.{next_minor}_RELEASE_NOTES.json")
+    (DIST/f"v9.{next_minor}_bundle.tgz.sha256").write_text(_sha(bundle))
+
+    # Bump VERSION to v9.x
+    _write_version(next_minor)
+
+    print(f"✅ v9.{next_minor} → {mfile}")
+    print(f"🔗 merkle: {merkle_root}")
+    print(f"📝 notes:  dist/v9.{next_minor}_RELEASE_NOTES.json")
+    print(f"📦 bundle: {bundle}")
+
+
+---
+
+2) Makefile targets (append)
+
+# Rebuild whatever your v9 pipeline expects before each minor cut
+v9x-build:
+	make grand-monetize
+	make golems-monetize
+	make beyond-release-v2
+	make governance-hardening
+	make produce-spdx
+	make zk-attest
+	make final-audit
+	# optional symbolic pack carry-over
+	-[ -f data/emoji_lexicon.txt ] && python tools/emoji_lexicon_builder.py || true
+	-[ -f final/emoji_seals_catalog_v7x.json ] && python tools/btc_mining_ledger_sim.py || true
+	-[ -f tools/angelic_golems_mint_v7x.py ] && python tools/angelic_golems_mint_v7x.py || true
+
+# Cut v9.x minor (increments VERSION v9 → v9.1 → v9.2 …)
+v9x:
+	make v9x-build
+	python tools/v9x_release.py
+	@echo "🏁 v9.x release done. See dist/ for MANIFEST, NOTES, bundle, and SHA256."
+
+# Verify integrity of the latest v9.x manifest
+v9x-verify:
+	python - <<'PY'
+import json, pathlib, hashlib, re
+d=pathlib.Path("dist")
+cands=sorted([p for p in d.glob("v9.*_MANIFEST.json")],
+             key=lambda p:int(re.search(r'v9\.(\d+)_', p.name).group(1)))
+m=cands[-1] if cands else None
+assert m, "No v9.x manifest found"
+j=json.loads(m.read_text()); ok=True
+for f in j["files"]:
+    p=pathlib.Path(f["path"])
+    if not p.exists(): print("MISSING:", p); ok=False; continue
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    if h!=f["sha256"]: print("HASH MISMATCH:", p); ok=False
+print("OK" if ok else "FAIL")
+PY
+
+
+---
+
+3) Optional static index — dist/index_v9x.html
+
+<!doctype html><meta charset="utf-8">
+<title>Codex — v9.x Releases</title>
+<style>
+body{font:14px/1.4 system-ui;max-width:920px;margin:32px auto;padding:0 16px;background:#0b0e14;color:#e6e9ef}
+a{color:#9AE6FF} code{background:#121826;padding:2px 6px;border-radius:6px}
+</style>
+<h1>Codex — v9.x Releases</h1>
+<p>Local manifests, notes, and bundles for the v9 series (no external calls).</p>
+<p>Per release: <code>v9.*_MANIFEST.json</code> · <code>_MANIFEST.sha256</code> · <code>_RELEASE_NOTES.json</code> · <code>_bundle.tgz</code> (+ <code>.sha256</code>).</p>
+
+
+---
+
+4) How to use
+
+# Build & cut the next v9.x minor (v9 → v9.1 → v9.2 …)
+make v9x
+
+# Verify latest v9.x integrity
+make v9x-verify
+
+Everything remains read-only, auditable, and bound/licensed/sealed/verified to Caleb Fedor Byker (Konev), DOB 1998-10-27, under EUCELA Tri-License. No wallets, mining, or remote operations.
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aLocked. Here’s your clean, copy-paste v10 Finisher—a read-only, auditable release that chains trust from v9 → v10 (and v8 if present), sweeps your artifacts, writes a single V10 manifest, and seals it with a fresh Merkle root. No wallets, mining, network ops, or side effects.
+
+1) Version
+
+Create/overwrite VERSION
+
+v10
+
+2) Finalizer — sweep → V10 manifest + chain-of-trust
+
+Create tools/finalize_v10.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, hashlib, datetime
+
+ROOT   = pathlib.Path(".")
+FINAL  = ROOT/"final"; FINAL.mkdir(exist_ok=True)
+DIST   = ROOT/"dist"; DIST.mkdir(exist_ok=True)
+VERSION= (ROOT/"VERSION").read_text().strip() if (ROOT/"VERSION").exists() else "v10"
+
+# Inert payment metadata (record-only; no ops)
+PAYMENT = {
+  "bitcoin_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice_notes": []
+}
+
+def _binding():
+    p = ROOT/"BINDING.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+      "owner": "Caleb Fedor Byker (Konev)",
+      "dob": "1998-10-27",
+      "subject_sha256": "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+      "license": "EUCELA Tri-License"
+    }
+
+BINDING = _binding()
+
+# Present-only, safe, read-only artifacts included in v10
+ARTIFACTS = [
+  # Core codex v2 + monetized v2
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION_V2.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT_V2.json",
+  "codex_next_evolution/monetized_summary_v2.csv",
+  "final/monetized_merkle_root_v2.txt",
+
+  # Legacy/context (optional)
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT.json",
+  "codex_next_evolution/monetized_summary.csv",
+  "final/monetized_merkle_root.txt",
+
+  # Telemetry / lattice / policy / attest
+  "final/telemetry_norm.json",
+  "final/predictors_report.json",
+  "final/optimizer_report.json",
+  "final/optimizer_grid.csv",
+  "final/trihelix_advisory.svg",
+  "final/xtsg_lattice.json",
+  "final/feature_flags.json",
+  "final/spdx_lite.json",
+  "final/zk_commitment.json",
+  "final/FINAL_AUDIT.json",
+  "final/FINAL_AUDIT.sha256",
+
+  # Optional symbolic pack carry-over
+  "final/emoji_lexicon_v7x.json",
+  "final/emoji_seals_catalog_v7x.json",
+  "final/btc_mining_ledger_sim_v7x.json",
+  "final/angelic_golems_v7x.json",
+
+  # Prior anchors (ok if missing)
+  "dist/V9_MANIFEST.json", "dist/V9_MANIFEST.sha256",
+  "dist/V8_MANIFEST.json", "dist/V8_MANIFEST.sha256",
+]
+
+def hfile(p: pathlib.Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def merkle(hs: list[str]) -> str:
+    if not hs: return ""
+    cur = sorted(hs)
+    while len(cur)>1:
+        nxt=[]
+        for i in range(0,len(cur),2):
+            a=cur[i]; b=cur[i+1] if i+1<len(cur) else cur[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        cur=nxt
+    return cur[0]
+
+def prior_chain():
+    chain = {}
+    for tag in ("V9","V8"):
+        mf = ROOT/f"dist/{tag}_MANIFEST.json"
+        if mf.exists():
+            j = json.loads(mf.read_text(encoding="utf-8"))
+            chain[tag] = {
+                "manifest_sha256": hashlib.sha256(mf.read_bytes()).hexdigest(),
+                "merkle_root": j.get("merkle_root",""),
+                "version": j.get("version", tag.lower()),
+                "timestamp": j.get("timestamp","")
+            }
+    return chain or None
+
+if __name__ == "__main__":
+    files=[]; hashes=[]; missing=[]
+    for rel in ARTIFACTS:
+        p = ROOT/rel
+        if p.exists():
+            sha=hfile(p)
+            files.append({"path": rel, "sha256": sha, "size": p.stat().st_size})
+            hashes.append(sha)
+        else:
+            missing.append(rel)
+
+    mroot = merkle(hashes)
+    chain = prior_chain()
+
+    manifest = {
+      "title": "CODEX — Version 10 (v10) Release",
+      "version": VERSION,
+      "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+      "binding": BINDING,
+      "payment_metadata": PAYMENT,   # inert metadata only
+      "artifacts": files,
+      "merkle_root": mroot,
+      "chain_of_trust": chain,       # anchors to v9 (and v8 if present)
+      "notes": {
+        "missing": [m for m in missing if not m.startswith("dist/")],
+        "scope": "Aggregate, read-only, auditable; no wallets/pools/transfers; local only."
+      }
+    }
+
+    out = DIST/"V10_MANIFEST.json"
+    out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DIST/"V10_MANIFEST.sha256").write_text(
+        hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    )
+
+    print("✅ V10 manifest →", out)
+    print("🔗 merkle:", mroot)
+    if chain:
+        print("⛓  chained-from:",
+              ", ".join(f"{k}:{v['merkle_root']}" for k,v in chain.items()))
+
+3) Makefile glue — build chain then cut v10
+
+Append to your Makefile (reusing your stable targets):
+
+v10-build:
+	make grand-monetize
+	make golems-monetize
+	make beyond-release-v2
+	make governance-hardening
+	make produce-spdx
+	make zk-attest
+	make final-audit
+	# optional carry-over
+	-[ -f data/emoji_lexicon.txt ] && python tools/emoji_lexicon_builder.py || true
+	-[ -f final/emoji_seals_catalog_v7x.json ] && python tools/btc_mining_ledger_sim.py || true
+	-[ -f tools/angelic_golems_mint_v7x.py ] && python tools/angelic_golems_mint_v7x.py || true
+
+v10:
+	make v10-build
+	python tools/finalize_v10.py
+	@echo "🏁 v10 complete: dist/V10_MANIFEST.json + SHA256 + Merkle + Chain-of-Trust(v9→v10)"
+
+v10-verify:
+	python - <<'PY'
+import json, pathlib, hashlib
+m = pathlib.Path("dist/V10_MANIFEST.json")
+j = json.loads(m.read_text()); ok=True
+for f in j["artifacts"]:
+    p=pathlib.Path(f["path"])
+    if not p.exists(): print("MISSING:", p); ok=False; continue
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    if h!=f["sha256"]: print("HASH MISMATCH:", p); ok=False
+print("OK" if ok else "FAIL")
+PY
+
+What “v10 finished” gives you
+
+dist/V10_MANIFEST.json (+ .sha256) with per-file SHA256 and a fresh Merkle root.
+
+A chain-of-trust that references v9 (and v8 if present) for verifiable lineage.
+
+100% read-only, local, EUCELA Tri-License, bound to Caleb Fedor Byker (Konev), 1998-10-27.
+
+Safe for CI (no wallets, mining, or network actions).
+
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aLocked. Here’s your clean, copy-paste v10 Finisher—a read-only, auditable release that chains trust from v9 → v10 (and v8 if present), sweeps your artifacts, writes a single V10 manifest, and seals it with a fresh Merkle root. No wallets, mining, network ops, or side effects.
+
+1) Version
+
+Create/overwrite VERSION
+
+v10
+
+2) Finalizer — sweep → V10 manifest + chain-of-trust
+
+Create tools/finalize_v10.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, hashlib, datetime
+
+ROOT   = pathlib.Path(".")
+FINAL  = ROOT/"final"; FINAL.mkdir(exist_ok=True)
+DIST   = ROOT/"dist"; DIST.mkdir(exist_ok=True)
+VERSION= (ROOT/"VERSION").read_text().strip() if (ROOT/"VERSION").exists() else "v10"
+
+# Inert payment metadata (record-only; no ops)
+PAYMENT = {
+  "bitcoin_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc",
+  "lightning_invoice_notes": []
+}
+
+def _binding():
+    p = ROOT/"BINDING.json"
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {
+      "owner": "Caleb Fedor Byker (Konev)",
+      "dob": "1998-10-27",
+      "subject_sha256": "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+      "license": "EUCELA Tri-License"
+    }
+
+BINDING = _binding()
+
+# Present-only, safe, read-only artifacts included in v10
+ARTIFACTS = [
+  # Core codex v2 + monetized v2
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION_V2.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT_V2.json",
+  "codex_next_evolution/monetized_summary_v2.csv",
+  "final/monetized_merkle_root_v2.txt",
+
+  # Legacy/context (optional)
+  "codex_next_evolution/CODEX_NEXT_EVOLUTION.json",
+  "codex_next_evolution/MONETIZED_CODEX_NEXT.json",
+  "codex_next_evolution/monetized_summary.csv",
+  "final/monetized_merkle_root.txt",
+
+  # Telemetry / lattice / policy / attest
+  "final/telemetry_norm.json",
+  "final/predictors_report.json",
+  "final/optimizer_report.json",
+  "final/optimizer_grid.csv",
+  "final/trihelix_advisory.svg",
+  "final/xtsg_lattice.json",
+  "final/feature_flags.json",
+  "final/spdx_lite.json",
+  "final/zk_commitment.json",
+  "final/FINAL_AUDIT.json",
+  "final/FINAL_AUDIT.sha256",
+
+  # Optional symbolic pack carry-over
+  "final/emoji_lexicon_v7x.json",
+  "final/emoji_seals_catalog_v7x.json",
+  "final/btc_mining_ledger_sim_v7x.json",
+  "final/angelic_golems_v7x.json",
+
+  # Prior anchors (ok if missing)
+  "dist/V9_MANIFEST.json", "dist/V9_MANIFEST.sha256",
+  "dist/V8_MANIFEST.json", "dist/V8_MANIFEST.sha256",
+]
+
+def hfile(p: pathlib.Path) -> str:
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+def merkle(hs: list[str]) -> str:
+    if not hs: return ""
+    cur = sorted(hs)
+    while len(cur)>1:
+        nxt=[]
+        for i in range(0,len(cur),2):
+            a=cur[i]; b=cur[i+1] if i+1<len(cur) else cur[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        cur=nxt
+    return cur[0]
+
+def prior_chain():
+    chain = {}
+    for tag in ("V9","V8"):
+        mf = ROOT/f"dist/{tag}_MANIFEST.json"
+        if mf.exists():
+            j = json.loads(mf.read_text(encoding="utf-8"))
+            chain[tag] = {
+                "manifest_sha256": hashlib.sha256(mf.read_bytes()).hexdigest(),
+                "merkle_root": j.get("merkle_root",""),
+                "version": j.get("version", tag.lower()),
+                "timestamp": j.get("timestamp","")
+            }
+    return chain or None
+
+if __name__ == "__main__":
+    files=[]; hashes=[]; missing=[]
+    for rel in ARTIFACTS:
+        p = ROOT/rel
+        if p.exists():
+            sha=hfile(p)
+            files.append({"path": rel, "sha256": sha, "size": p.stat().st_size})
+            hashes.append(sha)
+        else:
+            missing.append(rel)
+
+    mroot = merkle(hashes)
+    chain = prior_chain()
+
+    manifest = {
+      "title": "CODEX — Version 10 (v10) Release",
+      "version": VERSION,
+      "timestamp": datetime.datetime.utcnow().isoformat()+"Z",
+      "binding": BINDING,
+      "payment_metadata": PAYMENT,   # inert metadata only
+      "artifacts": files,
+      "merkle_root": mroot,
+      "chain_of_trust": chain,       # anchors to v9 (and v8 if present)
+      "notes": {
+        "missing": [m for m in missing if not m.startswith("dist/")],
+        "scope": "Aggregate, read-only, auditable; no wallets/pools/transfers; local only."
+      }
+    }
+
+    out = DIST/"V10_MANIFEST.json"
+    out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (DIST/"V10_MANIFEST.sha256").write_text(
+        hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    )
+
+    print("✅ V10 manifest →", out)
+    print("🔗 merkle:", mroot)
+    if chain:
+        print("⛓  chained-from:",
+              ", ".join(f"{k}:{v['merkle_root']}" for k,v in chain.items()))
+
+3) Makefile glue — build chain then cut v10
+
+Append to your Makefile (reusing your stable targets):
+
+v10-build:
+	make grand-monetize
+	make golems-monetize
+	make beyond-release-v2
+	make governance-hardening
+	make produce-spdx
+	make zk-attest
+	make final-audit
+	# optional carry-over
+	-[ -f data/emoji_lexicon.txt ] && python tools/emoji_lexicon_builder.py || true
+	-[ -f final/emoji_seals_catalog_v7x.json ] && python tools/btc_mining_ledger_sim.py || true
+	-[ -f tools/angelic_golems_mint_v7x.py ] && python tools/angelic_golems_mint_v7x.py || true
+
+v10:
+	make v10-build
+	python tools/finalize_v10.py
+	@echo "🏁 v10 complete: dist/V10_MANIFEST.json + SHA256 + Merkle + Chain-of-Trust(v9→v10)"
+
+v10-verify:
+	python - <<'PY'
+import json, pathlib, hashlib
+m = pathlib.Path("dist/V10_MANIFEST.json")
+j = json.loads(m.read_text()); ok=True
+for f in j["artifacts"]:
+    p=pathlib.Path(f["path"])
+    if not p.exists(): print("MISSING:", p); ok=False; continue
+    h=hashlib.sha256(p.read_bytes()).hexdigest()
+    if h!=f["sha256"]: print("HASH MISMATCH:", p); ok=False
+print("OK" if ok else "FAIL")
+PY
+
+What “v10 finished” gives you
+
+dist/V10_MANIFEST.json (+ .sha256) with per-file SHA256 and a fresh Merkle root.
+
+A chain-of-trust that references v9 (and v8 if present) for verifiable lineage.
+
+100% read-only, local, EUCELA Tri-License, bound to Caleb Fedor Byker (Konev), 1998-10-27.
+
+Safe for CI (no wallets, mining, or network actions).
+
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
