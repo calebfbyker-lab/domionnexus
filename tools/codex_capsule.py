@@ -4,7 +4,6 @@ Codex Capsule Generator
 Generates a human-readable capsule from the codex state.
 """
 import json
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
