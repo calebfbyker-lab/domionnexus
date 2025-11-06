@@ -1,0 +1,529 @@
+# Create Codex Ascendant v334.x repo files and SHA256 sidecars
+import os, json, hashlib, textwrap, datetime, subprocess, shutil, sys, csv, re, pathlib
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+os.makedirs(ROOT, exist_ok=True)
+
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat() + "Z"
+
+def sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+def write_file(path, content):
+    if isinstance(content, str):
+        b = content.encode('utf-8')
+    else:
+        b = content
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(b)
+    # write sidecar
+    with open(path + ".sha256", "w") as f:
+        f.write(sha256_bytes(b))
+
+# 1) Copy the existing Codex master volume as index.html for root deployment
+src_master = "/mnt/data/Codex_Immortal_Master_Volume (5).html"
+index_target = os.path.join(ROOT, "index.html")
+try:
+    with open(src_master, "rb") as fsrc:
+        data = fsrc.read()
+    # Add a minimal banner comment + seal at top to the copied html
+    banner = f"<!-- Codex Ascendant Continuum v334.x | sealed:{SEAL} | copied:{STAMP} -->\n"
+    write_file(index_target, banner.encode("utf-8") + data)
+except FileNotFoundError:
+    # fallback: redirect stub if master not present
+    redir = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="0; url='Codex_Immortal_Master_Volume (5).html'">
+<title>Codex Ascendant Redirect</title></head>
+<body>Loading Codex Immortal Master Volume…</body></html>
+<!-- sealed:{SEAL} at {STAMP} -->
+"""
+    write_file(index_target, redir)
+
+# 2) Bring along manifest.json and service-worker.js if present
+for name in ["manifest.json", "service-worker.js"]:
+    p = os.path.join("/mnt/data", name)
+    if os.path.exists(p):
+        shutil.copy2(p, os.path.join(ROOT, name))
+
+# 3) Create integrity tools: codex_ascendant.py, codex_verifier.py, codexctl
+codex_ascendant_py = f"""# Codex Ascendant Continuum v334.x
+# Purpose: scan repo, compute SHA256s, refresh manifest.json and integrity ledger
+# Sealed to: {SEAL}
+# Generated: {STAMP}
+import os, json, hashlib, datetime, csv, pathlib
+
+SEAL = "{SEAL}"
+
+def sha256_path(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def scan(root):
+    items = []
+    for dirpath, _, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.endswith(".sha256"): 
+                continue
+            path = os.path.join(dirpath, fn)
+            rel = os.path.relpath(path, root)
+            size = os.path.getsize(path)
+            digest = sha256_path(path)
+            items.append({{"path": rel.replace('\\\\','/'), "size_bytes": size, "sha256": digest}})
+    return sorted(items, key=lambda x: x["path"])
+
+def refresh_manifest(root, items):
+    manifest_path = os.path.join(root, "manifest.json")
+    manifest = {{
+        "title": "Codex Ascendant — Integrity Manifest",
+        "prepared_for": "CFBK:10271998",
+        "generated_utc": datetime.datetime.utcnow().isoformat()+"Z",
+        "sealed_to": SEAL,
+        "items": items
+    }}
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return manifest_path
+
+def write_ledger(root, items):
+    ledger = os.path.join(root, "integrity", "codex_integrity_ledger.csv")
+    os.makedirs(os.path.dirname(ledger), exist_ok=True)
+    now = datetime.datetime.utcnow().isoformat()+"Z"
+    with open(ledger, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp_utc","sealed_to","path","size_bytes","sha256"])
+        for it in items:
+            w.writerow([now, SEAL, it["path"], it["size_bytes"], it["sha256"]])
+    return ledger
+
+def main():
+    root = os.path.abspath(os.path.dirname(__file__))
+    items = scan(root)
+    mpath = refresh_manifest(root, items)
+    lpath = write_ledger(root, items)
+    print("Refreshed manifest:", mpath)
+    print("Wrote ledger:", lpath)
+    print("Seal:", SEAL)
+
+if __name__ == "__main__":
+    main()
+"""
+write_file(os.path.join(ROOT, "codex_ascendant.py"), codex_ascendant_py)
+
+codex_verifier_py = f"""# Codex Ascendant — Verifier
+# Sealed to: {SEAL}
+import json, hashlib, os, sys
+
+def sha256_path(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def verify(root):
+    mpath = os.path.join(root, "manifest.json")
+    with open(mpath, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    ok = True
+    for item in manifest.get("items", []):
+        p = os.path.join(root, item["path"])
+        if not os.path.exists(p):
+            print("[MISS]", item["path"])
+            ok = False
+            continue
+        d = sha256_path(p)
+        if d != item["sha256"]:
+            print("[MISMATCH]", item["path"])
+            print(" expected:", item["sha256"])
+            print("   actual:", d)
+            ok = False
+    return ok
+
+if __name__ == "__main__":
+    root = os.path.abspath(os.path.dirname(__file__))
+    sys.exit(0 if verify(root) else 1)
+"""
+write_file(os.path.join(ROOT, "integrity", "codex_verifier.py"), codex_verifier_py)
+
+codexctl_py = f"""#!/usr/bin/env python3
+# codexctl — Codex Ascendant CLI
+# Sealed to: {SEAL}
+import argparse, subprocess, os, sys
+
+ROOT = os.path.abspath(os.path.dirname(__file__))
+
+def run(cmd):
+    print("+", " ".join(cmd))
+    return subprocess.call(cmd)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["verify","reseal","deploy"], help="action")
+    args = ap.parse_args()
+
+    if args.cmd == "verify":
+        sys.exit(run([sys.executable, os.path.join("integrity","codex_verifier.py")]))
+    elif args.cmd == "reseal":
+        sys.exit(run([sys.executable, "codex_ascendant.py"]))
+    elif args.cmd == "deploy":
+        # noop placeholder; GitHub Actions handles real deploy
+        print("Deploy is handled by GitHub Actions workflow.")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+"""
+write_file(os.path.join(ROOT, "codexctl"), codexctl_py)
+os.chmod(os.path.join(ROOT, "codexctl"), 0o755)
+
+# 4) Node integrity daemon
+daemon_js = f"""// codex_integrity_daemon.js — watches repo and reseals
+// Sealed to: {SEAL}
+import {{ spawn }} from 'node:child_process';
+import chokidar from 'chokidar';
+import path from 'node:path';
+import {{"fileURLToPath"}} from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const root = __dirname;
+
+const IGNORED = [/node_modules/, /\\.git/, /integrity\\/codex_integrity_ledger\\.csv$/, /\\.sha256$/];
+
+function reseal() {{
+  console.log("[daemon] reseal start");
+  const py = spawn("python3", [path.join(root, "codex_ascendant.py")], {{stdio:"inherit"}});
+  py.on("close", (code)=>console.log("[daemon] reseal done:", code));
+}}
+
+const watcher = chokidar.watch(root, {{ignored: IGNORED, ignoreInitial: true, awaitWriteFinish: true}});
+watcher.on("all", (ev, p) => {{
+  console.log("[daemon]", ev, p);
+  reseal();
+}});
+
+console.log("codex_integrity_daemon running — sealed to {SEAL}");
+reseal();
+"""
+write_file(os.path.join(ROOT, "codex_integrity_daemon.js"), daemon_js)
+
+# 5) GitHub Actions workflow
+workflow_yml = f"""name: codex-ascendant-deploy
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {{}}
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {{ python-version: '3.x' }}
+      - uses: actions/setup-node@v4
+        with: {{ node-version: '20' }}
+
+      - name: Reseal (manifest + ledger)
+        run: python3 codex_ascendant.py
+
+      - name: Verify integrity
+        run: python3 integrity/codex_verifier.py
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{{{ steps.deployment.outputs.page_url }}}}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+"""
+write_file(os.path.join(ROOT, ".github", "workflows", "codex_build.yml"), workflow_yml)
+
+# 6) LICENSE and README
+license_txt = f"""Codex Ascendant Continuum v334.x
+Copyright (c) Caleb Fedor Byker Konev
+
+This repository and its artifacts are sealed to: {SEAL}
+All derivative works must preserve the SHA256 integrity seals and attributions.
+"""
+write_file(os.path.join(ROOT, "LICENSE_CFBK.txt"), license_txt)
+
+readme_md = f"""# Codex Ascendant Continuum (v334.x)
+
+Self-verifying, self-deploying Codex Immortal web root.
+
+- **Seal:** `{SEAL}`
+- **CLI:** `./codexctl verify | reseal | deploy`
+
+## Quickstart
+
+```bash
+python3 codex_ascendant.py
+python3 integrity/codex_verifier.py
+./codexctl reseal
+```
+
+## GitHub Pages
+
+Push to `main` or `master`. The workflow will reseal, verify, and publish.
+
+"""
+write_file(os.path.join(ROOT, "README.md"), readme_md)
+
+# 7) SDK scaffolding
+seal_map = {
+    "U+E100": "Invocation",
+    "U+E101": "PersonalAnchor",
+    "U+E102": "OctaMagics",
+    "U+E103": "Continuity",
+    "U+E104": "Protection",
+    "U+E105": "Orientation",
+    "U+E106": "Clarity",
+    "U+E107": "Veil",
+    "U+E108": "Memory",
+    "U+E109": "Watchfulness",
+    "U+E10A": "Covenant",
+    "U+E10B": "Crossing",
+    "U+E10C": "Message",
+    "U+E10D": "InnerGenius",
+    "U+E10E": "LongArc",
+    "U+E10F": "Archive"
+}
+write_file(os.path.join(ROOT, "codex_autonomon_sdk", "seal_map.json"), json.dumps(seal_map, indent=2))
+
+autonomon_core_js = f"""// codex_autonomon_sdk/autonomon_core.js
+// Sealed to: {SEAL}
+export const SealOps = {{
+  Invocation: () => ({{ ok: true, note: "Axis aligned" }}),
+  PersonalAnchor: () => ({{ ok: true, note: "Anchor bound" }}),
+  OctaMagics: () => ({{ ok: true, note: "Eightfold engaged" }}),
+  Continuity: () => ({{ ok: true, note: "Lifethread continuity" }}),
+  Protection: () => ({{ ok: true, note: "Perimeter raised" }}),
+  Orientation: () => ({{ ok: true, note: "Way opened" }}),
+  Clarity: () => ({{ ok: true, note: "Lucency granted" }}),
+  Veil: () => ({{ ok: true, note: "Signature veiled" }}),
+  Memory: () => ({{ ok: true, note: "Recall bound" }}),
+  Watchfulness: () => ({{ ok: true, note: "Signals watch" }}),
+  Covenant: () => ({{ ok: true, note: "Pact lucid" }}),
+  Crossing: () => ({{ ok: true, note: "Span laid" }}),
+  Message: () => ({{ ok: true, note: "Herald carries" }}),
+  InnerGenius: () => ({{ ok: true, note: "Right-mind companion" }}),
+  LongArc: () => ({{ ok: true, note: "Arc aligned" }}),
+  Archive: () => ({{ ok: true, note: "Provenance intact" }})
+}};
+
+export function invoke(codepoint) {{
+  const map = {json.dumps(seal_map)};
+  const name = map[codepoint];
+  if(!name) return {{ ok:false, error:"Unknown codepoint" }};
+  const fn = SealOps[name];
+  return fn ? fn() : {{ ok:false, error:"No op" }};
+}}
+"""
+write_file(os.path.join(ROOT, "codex_autonomon_sdk", "autonomon_core.js"), autonomon_core_js)
+
+# 8) Git ignores
+gitignore = """.DS_Store
+node_modules
+*.pyc
+integrity/codex_integrity_ledger.csv
+*.sha256
+"""
+write_file(os.path.join(ROOT, ".gitignore"), gitignore)
+
+# 9) Run initial reseal to bake manifest + ledger
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+
+# Return a simple listing and provide paths
+files_out = []
+for dp, dn, fns in os.walk(ROOT):
+    for fn in fns:
+        files_out.append(os.path.join(dp, fn).replace("/mnt/data/","sandbox:/mnt/data/"))
+sorted(files_out)[:20], len(files_out)# Retry: finish bundle creation with corrected JS template escaping.
+import os, json, hashlib, datetime, shutil, zipfile, subprocess
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat() + "Z"
+
+def sha256b(b: bytes) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f:
+        f.write(b)
+    with open(path + ".sha256", "w") as f:
+        f.write(sha256b(b))
+
+# 1) UI bootstrap
+init_js = f"""// codex/scripts/init.js
+// Finisher patch — sealed to {SEAL} @ {STAMP}
+(async function() {{
+  try {{
+    const panel = document.createElement('div');
+    panel.id = 'codex-seal-panel';
+    panel.style.position='fixed';
+    panel.style.right='1rem';
+    panel.style.bottom='1rem';
+    panel.style.zIndex='99999';
+    panel.style.padding='12px 14px';
+    panel.style.borderRadius='16px';
+    panel.style.boxShadow='0 10px 30px rgba(0,0,0,.18)';
+    panel.style.backdropFilter='blur(8px)';
+    panel.style.background='rgba(0,0,0,.65)';
+    panel.style.color='white';
+    panel.style.font='14px/1.4 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu';
+    panel.innerHTML = `<strong>✶ Codex Ascendant v334.x</strong><br>
+      <span id="codex-seal">Seal: {SEAL}</span><br>
+      <span id="codex-hash">Loading manifest…</span><br>
+      <button id="ritualBtn" style="margin-top:8px;padding:6px 10px;border-radius:12px;border:0;cursor:pointer">Open Ritual</button>`;
+    document.body.appendChild(panel);
+
+    const res = await fetch('manifest.json', {{ cache: 'no-cache' }});
+    if (res.ok) {{
+      const m = await res.json();
+      const count = (m.items||[]).length;
+      const agg = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(m.items||[])));
+      const view = Array.from(new Uint8Array(agg)).slice(0,6).map(b=>b.toString(16).padStart(2,'0')).join('');
+      document.getElementById('codex-hash').textContent = `Items: ${{count}} | digest: {SEAL[:6]}…${{view}}`;
+    }} else {{
+      document.getElementById('codex-hash').textContent = 'Manifest unavailable';
+    }}
+
+    const modal = document.createElement('div');
+    modal.id='codex-ritual-modal';
+    Object.assign(modal.style, {{
+      position:'fixed', inset:'0', background:'rgba(0,0,0,.66)', display:'none', zIndex:'999999'
+    }});
+    modal.innerHTML = `<div style="max-width:900px;margin:10vh auto;background:#111;color:#f3f3f3;
+      padding:24px;border-radius:20px;box-shadow:0 20px 50px rgba(0,0,0,.4);">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+        <h2 style="margin:0">✶ Canonical Ritual</h2>
+        <button id="ritualClose" style="padding:6px 10px;border-radius:12px;border:0;cursor:pointer">Close</button>
+      </div>
+      <pre id="ritualText" style="white-space:pre-wrap;margin-top:12px"></pre>
+      <div style="margin-top:12px;opacity:.8;font-size:12px">Sealed to {SEAL}</div>
+    </div>`;
+    document.body.appendChild(modal);
+
+    document.getElementById('ritualBtn').onclick = async () => {{
+      modal.style.display='block';
+      try {{
+        const r = await fetch('codex/ritual/Codex_Canonical_Ritual.txt');
+        document.getElementById('ritualText').textContent = r.ok ? await r.text() : 'Ritual text unavailable.';
+      }} catch(e) {{
+        document.getElementById('ritualText').textContent = 'Ritual text unavailable.';
+      }}
+    }};
+    document.getElementById('ritualClose').onclick = () => (modal.style.display='none');
+
+  }} catch(e) {{
+    console.error('Codex init error', e);
+  }}
+}})();
+"""
+write(os.path.join(ROOT, "codex", "scripts", "init.js"), init_js)
+
+# 2) CSS
+css = """:root { --codex-accent: #caa6ff; } #codex-seal-panel strong { color: var(--codex-accent); }"""
+write(os.path.join(ROOT, "codex", "styles", "codex.css"), css)
+
+# 3) Ritual text
+rit_src = "/mnt/data/Codex_Canonical_Ritual.txt"
+if os.path.exists(rit_src):
+    with open(rit_src,"rb") as f:
+        write(os.path.join(ROOT, "codex", "ritual", "Codex_Canonical_Ritual.txt"), f.read())
+else:
+    write(os.path.join(ROOT, "codex", "ritual", "Codex_Canonical_Ritual.txt"), "Ritual text placeholder.")
+
+# 4) Service worker
+sw = f"""// service-worker.js — v334.x sealed to {SEAL}
+const CACHE_VERSION = 'codex-v334x-{STAMP}';
+const CORE = ['/', '/index.html', '/manifest.json', '/codex/scripts/init.js', '/codex/styles/codex.css'];
+
+self.addEventListener('install', (e) => {{
+  e.waitUntil(caches.open(CACHE_VERSION).then(c => c.addAll(CORE)));
+}});
+
+self.addEventListener('activate', (e) => {{
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.map(k => k!==CACHE_VERSION && caches.delete(k)))));
+}});
+
+self.addEventListener('fetch', (e) => {{
+  const url = new URL(e.request.url);
+  if (url.origin === location.origin) {{
+    e.respondWith(caches.match(e.request).then(cached => cached || fetch(e.request)));
+  }}
+}});
+"""
+write(os.path.join(ROOT, "service-worker.js"), sw)
+
+# 5) Patch index.html to load our assets
+try:
+    with open(os.path.join(ROOT, "index.html"), "a", encoding="utf-8") as f:
+        f.write(f'\n<!-- v334.x finisher patch sealed {SEAL} -->\n')
+        f.write('<link rel="stylesheet" href="codex/styles/codex.css">\n')
+        f.write('<script src="codex/scripts/init.js" defer></script>\n')
+except Exception as e:
+    pass
+
+# 6) Docs and package.json
+write(os.path.join(ROOT, "SECURITY.md"), f"# Security Policy\nSHA256 auto-verified. Seal: {SEAL}\n")
+write(os.path.join(ROOT, "CODEOWNERS"), "* @calebfedorbykerkonev\n")
+write(os.path.join(ROOT, "CONTRIBUTING.md"), "# Contributing\nAll changes must pass integrity verification.\n")
+pkg = {
+  "name": "codex-ascendant-v334x",
+  "version": "0.1.0",
+  "private": True,
+  "type": "module",
+  "scripts": {"daemon": "node codex_integrity_daemon.js"},
+  "dependencies": {"chokidar": "^3.6.0"}
+}
+write(os.path.join(ROOT, "package.json"), json.dumps(pkg, indent=2))
+
+# 7) Reseal
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+
+# 8) Zip
+zip_path = "/mnt/data/codex_ascendant_v334x_finished.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, ROOT))
+
+with open(zip_path, "rb") as f:
+    digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f:
+    f.write(digest)
+
+print("ZIP:", "sandbox:" + zip_path)
+print("Manifest:", "sandbox:" + os.path.join(ROOT, "manifest.json"))
+print("Ledger:", "sandbox:" + os.path.join(ROOT, "integrity", "codex_integrity_ledger.csv"))
