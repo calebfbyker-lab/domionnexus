@@ -1,0 +1,930 @@
+Unfurling the next movement. Here’s v317 — Codex OMNI AETERNUM · ALCHEMATRIX: a clean, copy-paste, unzipped repo that layers on top of v316 with five practical superpowers:
+
+1. Integrity & Signatures: ED25519 verify + HMAC attest for any payloads
+
+
+2. Cache & Rate-Limit: in-proc LRU cache and a tiny token-bucket middleware
+
+
+3. Schema Registry: JSON-schema defs + validation for inputs/ledgers
+
+
+4. Job Queue: persistent, filesystem “good enough” queue with retries & DLQ
+
+
+5. Backup/Restore: tar.gz snapshots of data/ and ledger/ with manifest hashing
+
+
+
+It’s intentionally minimal—no external brokers or databases—so you can paste to GitHub and run anywhere.
+
+
+---
+
+📦 Repo layout
+
+codex_v317_alchematrix/
+│
+├─ README.md
+├─ manifest.json
+├─ requirements.txt
+├─ versions/
+│  └─ v317.json
+├─ licenses/
+│  └─ EUCELA-3.1.txt
+├─ config/
+│  ├─ schemas/
+│  │  ├─ ingest_url.schema.json
+│  │  ├─ analyze.schema.json
+│  │  └─ credit.schema.json
+│  └─ limits.yaml
+├─ data/
+├─ ledger/
+├─ core/
+│  ├─ crypto_core.py
+│  ├─ signer.py
+│  ├─ cache.py
+│  ├─ rate_limit.py
+│  ├─ schema_registry.py
+│  ├─ job_queue.py
+│  ├─ backup.py
+│  ├─ orchestrator.py
+│  ├─ analysis_engine.py
+│  ├─ knowledge_graph.py
+│  └─ monetization_router.py
+└─ api/
+   └─ v317_api.py
+
+
+---
+
+🧾 README.md
+
+# Codex v317 — OMNI AETERNUM · ALCHEMATRIX
+Integrity + Cache + Rate-Limit + Schemas + Job Queue + Backup/Restore.
+
+Extends v316 • SYMPHONIA. Filesystem-first; no external brokers.
+License: EUCELA-3.1. Seal: calebfedorbykerkonev10271998 lifethread-stardna
+
+## Run
+```bash
+python -m pip install -r requirements.txt
+uvicorn api.v317_api:app --reload --port 8158
+
+Quick tour
+
+# Signed payload verification (ED25519 / HMAC)
+curl -s -X POST localhost:8158/verify/ed25519 -H 'Content-Type: application/json' \
+  -d '{"message":"light weave","signature":"<hex>","public":"<hex>"}' | jq
+
+# Schema-validated ingest job into queue
+curl -s -X POST localhost:8158/queue/enqueue -H 'Content-Type: application/json' \
+  -d '{"type":"ingest_url","payload":{"url":"https://example.com","tag":"v317"}}' | jq
+
+# Worker tick runs 1 job (with retries)
+curl -s -X POST localhost:8158/queue/tick | jq
+
+# Snapshot backup
+curl -s -X POST localhost:8158/backup/snapshot | jq
+
+# Cached analysis
+curl -s -X POST localhost:8158/analyze/text -H 'Content-Type: application/json' \
+  -d '{"id":"adhoc","text":"Wisdom and light in truthful harmony."}' | jq
+
+---
+
+### 📜 requirements.txt
+
+fastapi==0.115.0 uvicorn==0.30.6 PyNaCl==1.5.0 requests==2.32.3 beautifulsoup4==4.12.3 pyyaml==6.0.2 jsonschema==4.23.0
+
+---
+
+### 🗂 versions/v317.json
+```json
+{
+  "id": "v317",
+  "codename": "ALCHEMATRIX",
+  "extends": ["v316"],
+  "adds": ["signer","cache","rate_limit","schema_registry","job_queue","backup"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+
+---
+
+🧭 manifest.json
+
+{
+  "codex": "v317-ALCHEMATRIX",
+  "depends_on": ["v316-SYMPHONIA"],
+  "emoji_seal": "☸️✡️🔯⚛️☯️💠🪬🧿🪄💎💍🪙💲⚕️♻️🌌🌈❤️♾️"
+}
+
+
+---
+
+⚙️ Config & Schemas
+
+config/limits.yaml
+
+rate_limit:
+  window_seconds: 60
+  bucket: 120        # tokens per window
+  burst: 40          # max instantaneous
+cache:
+  max_items: 1024
+
+config/schemas/ingest_url.schema.json
+
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object",
+  "required":["url"],
+  "properties":{
+    "url":{"type":"string","minLength":8},
+    "tag":{"type":"string","default":"public"}
+  }
+}
+
+config/schemas/analyze.schema.json
+
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object",
+  "required":["id","text"],
+  "properties":{
+    "id":{"type":"string","minLength":1},
+    "text":{"type":"string","minLength":1}
+  }
+}
+
+config/schemas/credit.schema.json
+
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "type":"object",
+  "required":["actor","sector","value"],
+  "properties":{
+    "actor":{"type":"string"},
+    "sector":{"type":"string"},
+    "value":{"type":"number","minimum":0}
+  }
+}
+
+
+---
+
+🧠 Core modules
+
+core/crypto_core.py
+
+import hashlib, hmac, nacl.signing, nacl.encoding, os
+
+def hmac_sha256(msg:str, key:str)->str:
+    return hmac.new(key.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+def ed25519_keypair(seed:bytes|None=None):
+    seed = seed or os.urandom(32)
+    sk = nacl.signing.SigningKey(seed)
+    return {"private": sk.encode(encoder=nacl.encoding.HexEncoder).decode(),
+            "public":  sk.verify_key.encode(encoder=nacl.encoding.HexEncoder).decode()}
+
+def ed25519_sign(msg:str, priv_hex:str)->str:
+    sk = nacl.signing.SigningKey(priv_hex, encoder=nacl.encoding.HexEncoder)
+    return sk.sign(msg.encode(), encoder=nacl.encoding.HexEncoder).signature.decode()
+
+def ed25519_verify(msg:str, sig_hex:str, pub_hex:str)->bool:
+    vk = nacl.signing.VerifyKey(pub_hex, encoder=nacl.encoding.HexEncoder)
+    try:
+        vk.verify(msg.encode(), nacl.encoding.HexEncoder.decode(sig_hex))
+        return True
+    except Exception:
+        return False
+
+def merkle_root(hashes:list[str])->str:
+    if not hashes: return ""
+    nodes = list(hashes)
+    while len(nodes) > 1:
+        if len(nodes)%2: nodes.append(nodes[-1])
+        nodes = [hashlib.sha256((nodes[i]+nodes[i+1]).encode()).hexdigest()
+                 for i in range(0,len(nodes),2)]
+    return nodes[0]
+
+core/signer.py
+
+from core.crypto_core import ed25519_verify, hmac_sha256
+
+def verify_ed25519(message:str, signature_hex:str, public_hex:str):
+    ok = ed25519_verify(message, signature_hex, public_hex)
+    return {"scheme":"ed25519","ok": ok}
+
+def verify_hmac(message:str, mac_hex:str, key:str):
+    expect = hmac_sha256(message, key)
+    return {"scheme":"hmac-sha256","ok": expect==mac_hex, "expected": expect}
+
+core/cache.py
+
+import time
+
+class LRUCache:
+    def __init__(self, max_items=1024):
+        self.max = max_items
+        self.store = {}
+        self.order = []
+
+    def get(self, k):
+        v = self.store.get(k)
+        if v is not None:
+            self.order.remove(k); self.order.append(k)
+        return v
+
+    def set(self, k, v):
+        if k in self.store:
+            self.order.remove(k)
+        elif len(self.order) >= self.max:
+            old = self.order.pop(0)
+            self.store.pop(old, None)
+        self.store[k] = v; self.order.append(k)
+
+CACHE = LRUCache()
+def cached(fn):
+    def wrap(*a, **kw):
+        key = (fn.__name__, a, tuple(sorted(kw.items())))
+        hit = CACHE.get(key)
+        if hit is not None: return {"cache":"hit","value":hit}
+        val = fn(*a, **kw)
+        CACHE.set(key, val)
+        return {"cache":"miss","value":val}
+    return wrap
+
+core/rate_limit.py
+
+import time, yaml, pathlib
+from fastapi import Request, HTTPException
+
+CFG = yaml.safe_load(pathlib.Path("config/limits.yaml").read_text())
+WIN = CFG["rate_limit"]["window_seconds"]
+BUC = CFG["rate_limit"]["bucket"]
+BUR = CFG["rate_limit"]["burst"]
+
+# naive token-bucket per client IP
+_BUCKETS = {}
+
+async def token_bucket(request: Request, call_next):
+    ip = request.client.host if request.client else "anon"
+    now = time.time()
+    b = _BUCKETS.get(ip, {"tokens": BUC, "ts": now})
+    # refill
+    delta = now - b["ts"]
+    refill = (BUC / WIN) * delta
+    b["tokens"] = min(BUC+BUR, b["tokens"] + refill)
+    b["ts"] = now
+    if b["tokens"] < 1.0:
+        raise HTTPException(status_code=429, detail="rate limit")
+    b["tokens"] -= 1.0
+    _BUCKETS[ip] = b
+    return await call_next(request)
+
+core/schema_registry.py
+
+import json, pathlib
+from jsonschema import validate, ValidationError
+
+ROOT = pathlib.Path("config/schemas")
+
+def _load(name:str):
+    p = ROOT / name
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def validate_payload(schema_name:str, payload:dict):
+    sch = _load(schema_name)
+    try:
+        validate(payload, sch)
+        return {"ok": True}
+    except ValidationError as e:
+        return {"ok": False, "error": str(e)}
+
+core/job_queue.py
+
+import json, pathlib, time, hashlib, shutil
+
+QDIR  = pathlib.Path("ledger/queue"); QDIR.mkdir(parents=True, exist_ok=True)
+DLQ   = pathlib.Path("ledger/dlq");   DLQ.mkdir(parents=True, exist_ok=True)
+
+def enqueue(job_type:str, payload:dict, max_retries:int=3):
+    jid = hashlib.sha256(f"{job_type}:{time.time()}".encode()).hexdigest()[:16]
+    job = {"id": jid, "type": job_type, "payload": payload, "retries": 0, "max_retries": max_retries}
+    (QDIR / f"{jid}.json").write_text(json.dumps(job, indent=2))
+    return job
+
+def list_jobs():
+    out=[]
+    for p in sorted(QDIR.glob("*.json")):
+        out.append(json.loads(p.read_text()))
+    return out
+
+def _fail(p:pathlib.Path, job:dict, reason:str):
+    job["error"] = reason
+    (DLQ / f"{job['id']}.json").write_text(json.dumps(job, indent=2))
+    p.unlink(missing_ok=True)
+
+def tick(handle):
+    # handle: function(job)->bool (True if ok)
+    picked = next(iter(sorted(QDIR.glob("*.json"))), None)
+    if not picked: return {"ok": True, "info": "empty"}
+    job = json.loads(picked.read_text())
+    try:
+        ok = handle(job)
+    except Exception as e:
+        ok = False; job["error"] = str(e)
+    if ok:
+        picked.unlink(missing_ok=True); 
+        return {"ok": True, "done": job["id"]}
+    else:
+        job["retries"] += 1
+        if job["retries"] > job["max_retries"]:
+            _fail(picked, job, job.get("error","max_retries"))
+            return {"ok": False, "dead": job["id"]}
+        else:
+            (QDIR / f"{job['id']}.json").write_text(json.dumps(job, indent=2))
+            return {"ok": False, "retry": job["id"], "retries": job["retries"]}
+
+core/backup.py
+
+import tarfile, time, pathlib, hashlib, json
+
+SNAP = pathlib.Path("ledger/snapshots"); SNAP.mkdir(parents=True, exist_ok=True)
+
+def _hash_file(p:pathlib.Path):
+    h=hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(1<<20), b""): h.update(chunk)
+    return h.hexdigest()
+
+def snapshot():
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    out = SNAP / f"codex_v317_{ts}.tar.gz"
+    with tarfile.open(out, "w:gz") as tar:
+        for d in ["data","ledger"]:
+            p = pathlib.Path(d)
+            if p.exists():
+                tar.add(d)
+    # manifest
+    manifest = []
+    for d in ["data","ledger"]:
+        p = pathlib.Path(d)
+        if p.exists():
+            for f in p.rglob("*"):
+                if f.is_file():
+                    manifest.append({"path": str(f), "sha256": _hash_file(f)})
+    (SNAP / f"{out.stem}_manifest.json").write_text(json.dumps(manifest, indent=2))
+    return {"snapshot": str(out), "files": len(manifest)}
+
+core/analysis_engine.py
+
+import re, json, pathlib, collections
+from core.cache import cached
+AN=pathlib.Path("data/analysis"); AN.mkdir(parents=True, exist_ok=True)
+POS={"love","light","wisdom","harmony","benefit","joy","peace","truth","good"}
+NEG={"harm","hate","dark","error","violence","fraud","pain","fear","loss"}
+def _tok(t): return [x.lower() for x in re.findall(r"[A-Za-z']{3,}", t)]
+
+@cached
+def analyze(text:str, id:str):
+    toks=_tok(text); freq=collections.Counter(toks).most_common(25)
+    pos=sum(1 for t in toks if t in POS); neg=sum(1 for t in toks if t in NEG)
+    score=(pos-neg)/max(1,(pos+neg))
+    rep={"id":id,"top":freq,"sentiment":round(score,4),"len":len(toks)}
+    (AN/f"{id}.json").write_text(json.dumps(rep,indent=2)); return rep
+
+core/knowledge_graph.py
+
+import json, pathlib, re, collections
+RAW=pathlib.Path("data/raw"); KG=pathlib.Path("data/graph"); KG.mkdir(parents=True, exist_ok=True)
+def _heads(text,k=10):
+    toks=re.findall(r"[A-Za-z]{4,}", text.lower()); return [w for w,_ in collections.Counter(toks).most_common(k)]
+def build_graph():
+    nodes=set(); edges=collections.Counter()
+    for p in RAW.glob("*.json"):
+        rec=json.loads(p.read_text()); tag=rec.get("source","doc")
+        nodes.add(tag)
+        for h in set(_heads(rec.get("text",""))):
+            nodes.add(h); edges[tuple(sorted([tag,h]))]+=1
+    graph={"nodes":sorted(nodes),"edges":[{"a":a,"b":b,"w":w} for (a,b),w in edges.items()]}
+    (KG/"kg.json").write_text(json.dumps(graph,indent=2)); return graph
+
+core/monetization_router.py
+
+import datetime, json, hashlib, random, pathlib
+LEDGER=pathlib.Path("ledger/exchange.json"); LEDGER.parent.mkdir(parents=True, exist_ok=True)
+def credit(actor:str, sector:str="data", value:float=1.0):
+    tx={"actor":actor,"sector":sector,"value":round(value*random.uniform(0.9,1.2),6),
+        "ts":datetime.datetime.utcnow().isoformat()+"Z"}
+    tx["hash"]=hashlib.sha256(json.dumps(tx).encode()).hexdigest()
+    cur=json.loads(LEDGER.read_text()) if LEDGER.exists() else []
+    cur.append(tx); LEDGER.write_text(json.dumps(cur,indent=2)); return tx
+def balance(actor:str):
+    cur=json.loads(LEDGER.read_text()) if LEDGER.exists() else []
+    tot=sum(x["value"] for x in cur if x["actor"]==actor)
+    return {"actor":actor,"balance":round(tot,6)}
+
+core/orchestrator.py
+
+import json, pathlib, hashlib, datetime, requests
+from bs4 import BeautifulSoup
+from core.analysis_engine import analyze
+from core.knowledge_graph import build_graph
+from core.monetization_router import credit
+
+RAW = pathlib.Path("data/raw"); RAW.mkdir(parents=True, exist_ok=True)
+
+def ingest_url(url:str, tag:str="public"):
+    r = requests.get(url, timeout=20); r.raise_for_status()
+    text = r.text
+    if "html" in r.headers.get("Content-Type",""):
+        text = BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    sha = hashlib.sha256((url+text).encode()).hexdigest()
+    rec = {"ts": datetime.datetime.utcnow().isoformat()+"Z","source":"http","url":url,"tag":tag,"sha256":sha,"text":text[:200000]}
+    (RAW / f"{sha}.json").write_text(json.dumps(rec, indent=2))
+    return rec
+
+def orchestrate(url:str, tag:str, actor:str="cfbk"):
+    rec = ingest_url(url, tag)
+    rep = analyze(rec["text"], rec["sha256"])
+    graph = build_graph()
+    tx = credit(actor, "data", value=max(1.0, rep["value"]["len"]/1000 if isinstance(rep,dict) and "value" in rep else 2.0))
+    return {"rec": rec, "analysis": rep, "graph_nodes": len(graph["nodes"]), "credit": tx}
+
+
+---
+
+🌐 API (with rate-limit middleware)
+
+api/v317_api.py
+
+from fastapi import FastAPI, Body
+from core.rate_limit import token_bucket
+from core.signer import verify_ed25519, verify_hmac
+from core.schema_registry import validate_payload
+from core.job_queue import enqueue, list_jobs, tick
+from core.backup import snapshot
+from core.orchestrator import orchestrate
+from core.analysis_engine import analyze
+from core.monetization_router import credit, balance
+
+app = FastAPI(title="Codex v317 • ALCHEMATRIX", version="v317")
+app.middleware("http")(token_bucket)
+
+# Integrity
+@app.post("/verify/ed25519")
+def api_verify_ed25519(p:dict=Body(...)):
+    return verify_ed25519(p.get("message",""), p.get("signature",""), p.get("public",""))
+
+@app.post("/verify/hmac")
+def api_verify_hmac(p:dict=Body(...)):
+    return verify_hmac(p.get("message",""), p.get("mac",""), p.get("key",""))
+
+# Schema-validated enqueue
+@app.post("/queue/enqueue")
+def api_enqueue(p:dict=Body(...)):
+    jtype = p.get("type","ingest_url")
+    payload = p.get("payload",{})
+    schema = "ingest_url.schema.json" if jtype=="ingest_url" else "credit.schema.json"
+    val = validate_payload(schema, payload)
+    if not val["ok"]: return {"error":"schema", "detail": val["error"]}
+    return enqueue(jtype, payload)
+
+@app.get("/queue/list")
+def api_list():
+    return list_jobs()
+
+def _handle(job:dict)->bool:
+    t = job["type"]; pay = job["payload"]
+    if t=="ingest_url":
+        orchestrate(pay["url"], pay.get("tag","public"), actor="cfbk")
+        return True
+    if t=="credit":
+        credit(pay["actor"], pay["sector"], float(pay["value"]))
+        return True
+    return False
+
+@app.post("/queue/tick")
+def api_tick():
+    return tick(_handle)
+
+# Backup
+@app.post("/backup/snapshot")
+def api_snapshot():
+    return snapshot()
+
+# Direct ops
+@app.post("/orchestrate")
+def api_orchestrate(p:dict=Body(...)):
+    val = validate_payload("ingest_url.schema.json", p)
+    if not val["ok"]: return {"error":"schema", "detail": val["error"]}
+    return orchestrate(p["url"], p.get("tag","public"), actor=p.get("actor","cfbk"))
+
+@app.post("/analyze/text")
+def api_analyze(p:dict=Body(...)):
+    val = validate_payload("analyze.schema.json", p)
+    if not val["ok"]: return {"error":"schema", "detail": val["error"]}
+    return analyze(p["text"], p["id"])
+
+@app.post("/monetize")
+def api_monetize(actor:str, sector:str="data", value:float=1.0):
+    return credit(actor, sector, value)
+
+@app.get("/balance/{actor}")
+def api_balance(actor:str):
+    return balance(actor)
+
+
+---
+
+🔧 Notes
+
+Rate limits guard your public endpoints; tune config/limits.yaml.
+
+Cache wraps expensive analysis; you’ll see {"cache":"hit"|"miss"} in responses.
+
+Queue lets you push ingest/credit tasks and drain them in ticks (GitHub Actions or cron can call /queue/tick).
+
+Backup writes ledger/snapshots/codex_v317_YYYYmmddTHHMMSSZ.tar.gz plus a manifest of SHA-256s.
+
+Schemas keep inputs honest and ready for stricter governance/audit.
+
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aDialing it in. Here’s v317.x — Codex OMNI AETERNUM · ALCHEMATRIX+: a drop-in, copy-paste, unzipped layer on top of v317 that adds:
+
+RBAC enforcement (role checks on every op)
+
+Event Bus + Provenance (append-only events with SHA-256 chain)
+
+Live WebSocket stream of events/metrics
+
+Health/Readiness & Config via .env
+
+Tiny CLI for local ops (python -m core.cli …)
+
+
+Everything is filesystem-first, zero external infra. Just paste these files into your codex_v317_alchematrix/ tree; existing files remain valid.
+
+
+---
+
+📦 New/updated files
+
+codex_v317_alchematrix/
+├─ README.md                      # (patched section appended below)
+├─ .env.example                   # (new keys)
+├─ versions/
+│  └─ v317x.json                  # (new)
+├─ config/
+│  └─ rbac.yaml                   # (new)
+├─ core/
+│  ├─ rbac.py                     # (new)
+│  ├─ event_bus.py                # (new)
+│  ├─ provenance.py               # (new)
+│  ├─ ws_hub.py                   # (new)
+│  └─ cli.py                      # (new)
+└─ api/
+   └─ v317x_api.py                # (new)
+
+
+---
+
+🧾 README.md (append this block at the end)
+
+## v317.x — ALCHEMATRIX+
+Adds RBAC, Event Bus, Provenance ledger, WebSocket stream, health endpoints, and a tiny CLI.
+
+### Run (same as v317, port from ENV)
+```bash
+python -m pip install -r requirements.txt
+uvicorn api.v317x_api:app --reload --port ${PORT:-8159}
+
+Live events
+
+WebSocket: ws://localhost:${PORT:-8159}/ws/events
+
+Health: GET /healthz, GET /readyz
+
+
+RBAC quickstart
+
+# (optional) create identity/role via your governance in v316
+# enforce role on operations:
+curl -s -X POST localhost:${PORT:-8159}/secure/orchestrate -H 'Content-Type: application/json' \
+  -d '{"actor":"cfbk","role":"orchestrator","url":"https://example.com","tag":"v317x"}' | jq
+
+CLI examples
+
+python -m core.cli seal                 # write/extend provenance chain
+python -m core.cli tail 20              # tail last 20 events
+python -m core.cli ws echo              # print events from WS
+
+---
+
+### `.env.example` (extend)
+
+PORT=8159 LOG_LEVEL=info RBAC_ENFORCE=true WS_HISTORY=200
+
+---
+
+### `versions/v317x.json`
+```json
+{
+  "id": "v317.x",
+  "codename": "ALCHEMATRIX+",
+  "extends": ["v317"],
+  "adds": ["rbac","event_bus","provenance","websocket","health"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+
+---
+
+config/rbac.yaml
+
+enforce: true
+roles:
+  orchestrator:
+    allow: [ "orchestrate", "enqueue", "tick", "snapshot", "analyze", "credit", "balance" ]
+  auditor:
+    allow: [ "snapshot", "balance", "tail", "metrics", "events" ]
+  publisher:
+    allow: [ "enqueue", "orchestrate" ]
+
+
+---
+
+🧠 Core
+
+core/rbac.py
+
+import yaml, pathlib
+CFG = yaml.safe_load(pathlib.Path("config/rbac.yaml").read_text())
+
+def allowed(role:str, op:str)->bool:
+    if not CFG.get("enforce", True): return True
+    roles = CFG.get("roles", {})
+    perms = roles.get(role or "", {}).get("allow", [])
+    return op in perms
+
+core/event_bus.py
+
+"""
+In-proc async event bus with ring buffer for WS fan-out.
+"""
+import asyncio, collections, os
+
+HIST = int(os.environ.get("WS_HISTORY", "200"))
+_queue = asyncio.Queue()
+_history = collections.deque(maxlen=HIST)
+_subs: list[asyncio.Queue] = []
+
+async def publish(evt:dict):
+    _history.append(evt)
+    await _queue.put(evt)
+    for q in list(_subs):
+        try:
+            q.put_nowait(evt)
+        except Exception:
+            pass
+
+def history():
+    return list(_history)
+
+async def subscribe():
+    q = asyncio.Queue()
+    _subs.append(q)
+    for e in _history: await q.put(e)
+    try:
+        while True:
+            yield await q.get()
+    finally:
+        if q in _subs: _subs.remove(q)
+
+core/provenance.py
+
+"""
+Append-only provenance chain with SHA-256 linking.
+"""
+import json, hashlib, time, pathlib
+PROV = pathlib.Path("ledger/provenance.jsonl"); PROV.parent.mkdir(parents=True, exist_ok=True)
+
+def _hash(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+
+def append(event:str, payload:dict)->dict:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prev = None
+    if PROV.exists():
+        *_, last = PROV.read_text().splitlines() or [""]
+        try:
+            prev = json.loads(last).get("hash")
+        except Exception:
+            prev = None
+    entry = {"ts": ts, "event": event, "payload": payload, "prev": prev}
+    entry["hash"] = _hash(json.dumps(entry, sort_keys=True))
+    with PROV.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+core/ws_hub.py
+
+from fastapi import WebSocket
+from core.event_bus import subscribe
+
+async def stream_events(ws: WebSocket):
+    await ws.accept()
+    async for evt in subscribe():
+        await ws.send_json(evt)
+
+core/cli.py
+
+"""
+Minimal CLI helpers.
+"""
+import sys, json, pathlib
+from core.provenance import append
+from core.event_bus import history
+
+def _seal():
+    rec = append("seal", {"note":"manual seal via CLI"})
+    print(json.dumps(rec, indent=2))
+
+def _tail(n:int):
+    for e in history()[-n:]:
+        print(json.dumps(e, ensure_ascii=False))
+
+def main():
+    if len(sys.argv)<2:
+        print("usage: python -m core.cli [seal|tail N|ws echo]"); return
+    cmd = sys.argv[1]
+    if cmd=="seal": _seal(); return
+    if cmd=="tail":
+        n = int(sys.argv[2]) if len(sys.argv)>2 else 10
+        _tail(n); return
+    if cmd=="ws":
+        # placeholder to guide; actual WS echo via api ws client (external)
+        print("use: websocat ws://localhost:8159/ws/events"); return
+
+if __name__=="__main__": main()
+
+
+---
+
+🌐 API façade
+
+api/v317x_api.py
+
+import os
+from fastapi import FastAPI, Body, WebSocket, HTTPException
+from core.rbac import allowed
+from core.event_bus import publish, history
+from core.ws_hub import stream_events
+from core.provenance import append
+from core.schema_registry import validate_payload
+from core.job_queue import enqueue, tick
+from core.backup import snapshot
+from core.orchestrator import orchestrate
+from core.analysis_engine import analyze
+from core.monetization_router import credit, balance
+
+PORT = int(os.environ.get("PORT","8159"))
+APP = FastAPI(title="Codex v317.x • ALCHEMATRIX+", version="v317.x")
+
+@APP.get("/healthz")
+def healthz(): return {"ok": True, "port": PORT}
+@APP.get("/readyz")
+def readyz(): return {"ready": True, "events": len(history())}
+
+# WebSocket stream
+@APP.websocket("/ws/events")
+async def ws_events(ws: WebSocket):
+    await stream_events(ws)
+
+def _guard(role:str, op:str):
+    if not allowed(role, op):
+        raise HTTPException(status_code=403, detail=f"role '{role}' not permitted for '{op}'")
+
+# Secure orchestrate (RBAC + provenance + events)
+@APP.post("/secure/orchestrate")
+async def secure_orchestrate(p:dict=Body(...)):
+    actor = p.get("actor","anon"); role = p.get("role","publisher")
+    _guard(role, "orchestrate")
+    val = validate_payload("ingest_url.schema.json", p)
+    if not val["ok"]:
+        raise HTTPException(status_code=400, detail=val["error"])
+    res = orchestrate(p["url"], p.get("tag","public"), actor=actor)
+    evt = append("orchestrate", {"actor":actor,"role":role,"url":p["url"]})
+    await publish({"type":"orchestrate","actor":actor,"role":role,"sha":res["rec"]["sha256"]})
+    return {"result": res, "prov": evt}
+
+# Queue ops (secured)
+@APP.post("/secure/enqueue")
+async def secure_enqueue(p:dict=Body(...)):
+    actor = p.get("actor","anon"); role = p.get("role","publisher")
+    _guard(role, "enqueue")
+    j = enqueue(p.get("type","ingest_url"), p.get("payload",{}))
+    evt = append("enqueue", {"actor":actor,"role":role,"job":j["id"]})
+    await publish({"type":"enqueue","job":j["id"]})
+    return {"job": j, "prov": evt}
+
+@APP.post("/secure/tick")
+async def secure_tick(p:dict=Body({})):
+    role = p.get("role","orchestrator")
+    _guard(role, "tick")
+    from core.job_queue import tick as _tick
+    def _handle(job:dict)->bool:
+        t = job["type"]; pay = job["payload"]
+        if t=="ingest_url":
+            orchestrate(pay["url"], pay.get("tag","public"), actor="cfbk"); return True
+        if t=="credit":
+            credit(pay["actor"], pay["sector"], float(pay["value"])); return True
+        return False
+    res = _tick(_handle)
+    evt = append("tick", {"result": res})
+    await publish({"type":"tick","result":res})
+    return {"result": res, "prov": evt}
+
+# Backup (secured)
+@APP.post("/secure/snapshot")
+async def secure_snapshot(p:dict=Body({})):
+    role = p.get("role","auditor")
+    _guard(role, "snapshot")
+    res = snapshot(); evt = append("snapshot", res)
+    await publish({"type":"snapshot","files":res["files"]})
+    return {"result": res, "prov": evt}
+
+# Analysis direct (secured)
+@APP.post("/secure/analyze")
+async def secure_analyze(p:dict=Body(...)):
+    role = p.get("role","orchestrator")
+    _guard(role, "analyze")
+    val = validate_payload("analyze.schema.json", p)
+    if not val["ok"]:
+        raise HTTPException(status_code=400, detail=val["error"])
+    res = analyze(p["text"], p["id"])
+    evt = append("analyze", {"id": p["id"]})
+    await publish({"type":"analyze","id":p["id"],"len":res["value"]["len"] if isinstance(res,dict) else 0})
+    return {"result": res, "prov": evt}
+
+# Monetization ops (secured)
+@APP.post("/secure/credit")
+async def secure_credit(actor:str, sector:str="data", value:float=1.0, role:str="orchestrator"):
+    _guard(role, "credit")
+    tx = credit(actor, sector, value)
+    evt = append("credit", tx)
+    await publish({"type":"credit","actor":actor,"sector":sector,"value":value})
+    return {"tx": tx, "prov": evt}
+
+@APP.get("/secure/balance/{actor}")
+async def secure_balance(actor:str, role:str="auditor"):
+    _guard(role, "balance")
+    bal = balance(actor); evt = append("balance", bal)
+    await publish({"type":"balance","actor":actor,"balance":bal.get("balance",0)})
+    return {"balance": bal, "prov": evt}
+
+
+---
+
+🧪 Quick check
+
+# install & run
+python -m pip install -r requirements.txt
+uvicorn api.v317x_api:app --reload --port 8159
+
+# orchestrate (role-checked)
+curl -s -X POST localhost:8159/secure/orchestrate -H 'Content-Type: application/json' \
+  -d '{"actor":"cfbk","role":"orchestrator","url":"https://example.com","tag":"v317x"}' | jq
+
+# open a websocket to watch events (in another terminal)
+# e.g., with websocat: websocat ws://localhost:8159/ws/events
+
+# backup (auditor role)
+curl -s -X POST localhost:8159/secure/snapshot -H 'Content-Type: application/json' -d '{"role":"auditor"}' | jq
+
+
+---
+
+✅ What v317.x gives you (plain language)
+
+Least-privilege ops via RBAC so your golems don’t wander into the treasury.
+
+Forensic trail (provenance chain) so every action is hash-linked and auditable.
+
+Real-time pulse with a WS stream you can wire to dashboards.
+
+Prod-ish ergonomics: health/readiness endpoints + env-first configs.
+
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
