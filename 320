@@ -1,0 +1,826 @@
+Breaching the next horizon. Here’s v320 — Codex OMNI AETERNUM · AURORA//SOVEREIGN: a paste-ready, unzipped layer on top of v319/v319.x that hardens integrity and ops while giving you a lightweight data-pipeline DAG, full provenance, rollbacks, artifact attestations (Ed25519), SBOM snapshots, a file-bus for events, and alerting canaries. No heavy infra, no new pip deps beyond what you already have (we’re still on cryptography, which you already installed in v318).
+
+Copy these files straight into your repo root.
+
+
+---
+
+📦 New / updated tree (drop-in)
+
+codex_v320_sovereign/
+├─ README.md                    # (append block below)
+├─ versions/
+│  └─ v320.json
+├─ config/
+│  ├─ dag.yaml
+│  ├─ alerts.yaml
+│  └─ attest.yaml
+├─ core/
+│  ├─ event_bus.py
+│  ├─ dag.py
+│  ├─ lineage.py
+│  ├─ snapshots.py
+│  ├─ attestation.py
+│  ├─ sbom.py
+│  └─ alerts.py
+└─ api/
+   └─ v320_api.py
+
+> Uses existing requirements from v318 (notably cryptography for Ed25519). No extra packages.
+
+
+
+
+---
+
+🧾 README.md (append)
+
+## v320 — AURORA//SOVEREIGN (Attest · Lineage · Snapshots · SBOM · DAG · Bus · Alerts)
+Adds:
+- File-based **Event Bus** (`ledger/bus/*.jsonl`) with topics & simple fan-out
+- Mini **DAG** runner (YAML graph; steps call API/plugin ops)
+- **Lineage** graph (who-made-what-from-what) + JSON export
+- **Snapshots** & rollback for data/ledger subtrees
+- **Ed25519 Attestation** for artifacts (keypair in Vault or generated dev)
+- **SBOM** (files + hashes + sizes) for any subtree
+- **Alerts** (thresholds/anomalies) + **Canary** checks
+
+Run:
+```bash
+uvicorn api.v320_api:app --reload --port ${PORT:-8164}
+
+Quick taste:
+
+# publish an event, then consume
+curl -s -X POST localhost:${PORT:-8164}/bus/publish -H 'Content-Type: application/json' \
+  -d '{"topic":"ingest","data":{"url":"https://example.com"}}' | jq
+curl -s     localhost:${PORT:-8164}/bus/poll?topic=ingest | jq
+
+# run a DAG defined in config/dag.yaml
+curl -s -X POST localhost:${PORT:-8164}/dag/run -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","name":"demo"}' | jq
+
+# stamp lineage for a product
+curl -s -X POST localhost:${PORT:-8164}/lineage/record -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","product":"artifact_A","inputs":["raw_X","raw_Y"],"op":"analyze"}' | jq
+curl -s     localhost:${PORT:-8164}/lineage/export?tenant=cfbk | jq
+
+# snapshot + rollback
+curl -s -X POST localhost:${PORT:-8164}/snap/take -H 'Content-Type: application/json' \
+  -d '{"path":"data/cfbk","label":"pre_run"}' | jq
+curl -s -X POST localhost:${PORT:-8164}/snap/rollback -H 'Content-Type: application/json' \
+  -d '{"label":"pre_run"}' | jq
+
+# attest & verify (Ed25519)
+curl -s -X POST localhost:${PORT:-8164}/attest/sign -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","path":"versions"}' | jq
+curl -s -X POST localhost:${PORT:-8164}/attest/verify -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","path":"versions"}' | jq
+
+# SBOM a subtree
+curl -s -X POST localhost:${PORT:-8164}/sbom/make -H 'Content-Type: application/json' \
+  -d '{"path":"core"}' | jq
+
+# alerts & canary
+curl -s -X POST localhost:${PORT:-8164}/alerts/check | jq
+curl -s -X POST localhost:${PORT:-8164}/alerts/canary | jq
+
+---
+
+## ⚙️ Config
+
+### `config/dag.yaml`
+```yaml
+graphs:
+  demo:
+    steps:
+      - id: s1
+        op: "plugin.hash"          # plugin call
+        args: { plugin: "hash_skill", fn: "sha256", text: "demo-run" }
+      - id: s2
+        op: "bus.publish"          # publish to event bus
+        args: { topic: "pipeline", data: { from: "s1", note: "completed" } }
+      - id: s3
+        op: "lineage.record"
+        args: { product: "artifact_demo", inputs: ["seed_demo"], action: "pipeline" }
+    on_error: "continue"
+
+config/alerts.yaml
+
+rules:
+  - id: latency_spike
+    metric: ingest_latency_ms
+    z_threshold: 3.0
+    action: "log"
+  - id: bus_backlog
+    topic: "pipeline"
+    max_backlog: 500
+    action: "log"
+
+config/attest.yaml
+
+key_alias: "cfbk_attest"        # stored under tenant vault as: attest_priv / attest_pub
+paths:
+  - "core"
+  - "api"
+  - "versions"
+
+
+---
+
+🧠 Core modules
+
+core/event_bus.py
+
+import json, pathlib, time, uuid
+
+BUS = pathlib.Path("ledger/bus"); BUS.mkdir(parents=True, exist_ok=True)
+
+def _file(topic:str)->pathlib.Path: return BUS/f"{topic}.jsonl"
+
+def publish(topic:str, data:dict)->dict:
+    rec = {"id": str(uuid.uuid4()), "ts": int(time.time()), "topic": topic, "data": data}
+    _file(topic).open("a", encoding="utf-8").write(json.dumps(rec)+"\n")
+    return rec
+
+def poll(topic:str, limit:int=50)->dict:
+    f = _file(topic)
+    if not f.exists(): return {"events":[]}
+    lines = f.read_text().splitlines()[-limit:]
+    return {"events":[json.loads(x) for x in lines]}
+
+def backlog(topic:str)->int:
+    f = _file(topic)
+    if not f.exists(): return 0
+    return sum(1 for _ in f.open("r", encoding="utf-8"))
+
+core/dag.py
+
+import yaml, pathlib
+from core.plugin_sdk import call as plugin_call
+from core.event_bus import publish as bus_publish
+from core.lineage import record as lin_record
+
+CFG = yaml.safe_load(pathlib.Path("config/dag.yaml").read_text())
+
+def run(tenant:str, name:str)->dict:
+    g = CFG["graphs"].get(name)
+    if not g: return {"error":"graph-not-found"}
+    out=[]
+    for step in g.get("steps", []):
+        op = step["op"]; args = step.get("args", {})
+        try:
+            if op=="plugin.hash":
+                res = plugin_call(args["plugin"], args["fn"], text=args["text"])
+            elif op=="bus.publish":
+                res = bus_publish(args["topic"], args.get("data",{}))
+            elif op=="lineage.record":
+                res = lin_record(tenant, args["product"], args.get("inputs",[]), args.get("action","op"))
+            else:
+                res = {"warn":"unknown-op", "op":op}
+            out.append({"step": step["id"], "result": res})
+        except Exception as e:
+            if g.get("on_error")!="continue": return {"error": str(e), "step": step["id"], "partial": out}
+            out.append({"step": step["id"], "error": str(e)})
+    return {"ok": True, "steps": out}
+
+core/lineage.py
+
+import json, pathlib, time
+from core.tenancy import path_ledger, ensure
+
+def record(tenant:str, product:str, inputs:list[str], action:str)->dict:
+    ensure(tenant)
+    row={"ts":int(time.time()),"product":product,"inputs":inputs,"action":action}
+    f=path_ledger(tenant,"lineage.jsonl")
+    with f.open("a",encoding="utf-8") as out: out.write(json.dumps(row)+"\n")
+    return row
+
+def export(tenant:str)->dict:
+    f=path_ledger(tenant,"lineage.jsonl")
+    if not f.exists(): return {"edges":[]}
+    edges=[json.loads(x) for x in f.read_text().splitlines()]
+    # adjacency: input -> product
+    graph={}
+    for e in edges:
+        for src in e["inputs"]:
+            graph.setdefault(src, set()).add(e["product"])
+    graph={k:sorted(list(v)) for k,v in graph.items()}
+    return {"edges": edges, "graph": graph}
+
+core/snapshots.py
+
+import pathlib, shutil, time, json, hashlib
+
+ROOT = pathlib.Path(".")
+SNAP = pathlib.Path("ledger/snapshots"); SNAP.mkdir(parents=True, exist_ok=True)
+
+def _stamp(path:str)->str:
+    # simple dir hash (names + sizes)
+    p=pathlib.Path(path)
+    h=hashlib.sha256()
+    for f in sorted(p.rglob("*")):
+        if f.is_file():
+            h.update(str(f.relative_to(p)).encode())
+            h.update(str(f.stat().st_size).encode())
+    return h.hexdigest()
+
+def take(path:str, label:str|None=None)->dict:
+    p=pathlib.Path(path); 
+    if not p.exists(): return {"error":"path-missing"}
+    label = label or f"snap_{int(time.time())}"
+    dest = SNAP/label; 
+    if dest.exists(): return {"error":"label-exists"}
+    shutil.copytree(p, dest)
+    meta={"path": path, "label": label, "ts": int(time.time()), "hash": _stamp(path)}
+    (SNAP/f"{label}.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+def rollback(label:str)->dict:
+    meta=(SNAP/f"{label}.json")
+    if not meta.exists(): return {"error":"label-missing"}
+    info=json.loads(meta.read_text())
+    src=SNAP/label; dst=pathlib.Path(info["path"])
+    if dst.exists(): shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+    return {"rolled_back_to": label, "path": info["path"]}
+
+core/attestation.py
+
+"""
+Ed25519 attest & verify. Private/public keys are stored in Vault:
+  - attest_priv  (base64)
+  - attest_pub   (base64)
+If absent, generate dev keys and stash them in tenant ledger (NOT recommended for prod).
+"""
+import base64, json, pathlib, hashlib, os
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from core.secrets_vault import get as vault_get
+from core.tenancy import path_ledger, ensure
+
+def _walk_hash(root:str)->dict:
+    base=pathlib.Path(root)
+    items=[]
+    for f in sorted(base.rglob("*")):
+        if f.is_file():
+            h=hashlib.sha256(f.read_bytes()).hexdigest()
+            items.append({"path": str(f.relative_to(base)), "sha256": h, "size": f.stat().st_size})
+    return {"root": root, "items": items}
+
+def _load_keys(tenant:str):
+    ensure(tenant)
+    prv = vault_get(tenant, "attest_priv").get("value")
+    pub = vault_get(tenant, "attest_pub").get("value")
+    if prv and pub:
+        sk = Ed25519PrivateKey.from_private_bytes(base64.b64decode(prv))
+        pk = Ed25519PublicKey.from_public_bytes(base64.b64decode(pub))
+        return sk, pk
+    # dev fallback (writes to ledger for visibility)
+    sk = Ed25519PrivateKey.generate()
+    pk = sk.public_key()
+    raw_sk = sk.private_bytes(encoding=serialization.Encoding.Raw, format=serialization.PrivateFormat.Raw, encryption_algorithm=serialization.NoEncryption())
+    raw_pk = pk.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    (path_ledger(tenant,"attest_dev_keys.json")).write_text(json.dumps({
+        "warning":"DEV KEYS — set attest_priv/attest_pub in Vault for production!",
+        "attest_priv_b64": base64.b64encode(raw_sk).decode(),
+        "attest_pub_b64": base64.b64encode(raw_pk).decode()
+    }, indent=2))
+    return sk, pk
+
+def sign_tree(tenant:str, path:str)->dict:
+    tree=_walk_hash(path)
+    sk, pk = _load_keys(tenant)
+    payload=json.dumps(tree, sort_keys=True).encode()
+    sig = sk.sign(payload)
+    att = {"tenant": tenant, "path": path, "sig_b64": base64.b64encode(sig).decode()}
+    (pathlib.Path("ledger")/f"att_{tenant}_{path.replace('/','_')}.json").write_text(json.dumps(att, indent=2))
+    return {"ok": True, "attestation": att, "sha256": hashlib.sha256(payload).hexdigest()}
+
+def verify_tree(tenant:str, path:str)->dict:
+    tree=_walk_hash(path)
+    _, pk = _load_keys(tenant)
+    payload=json.dumps(tree, sort_keys=True).encode()
+    att_file = pathlib.Path("ledger")/f"att_{tenant}_{path.replace('/','_')}.json"
+    if not att_file.exists(): return {"error":"att-missing"}
+    att=json.loads(att_file.read_text())
+    try:
+        pk.verify(base64.b64decode(att["sig_b64"]), payload)
+        return {"ok": True, "sha256": hashlib.sha256(payload).hexdigest()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+core/sbom.py
+
+import json, pathlib, hashlib, time
+
+def make(path:str)->dict:
+    base=pathlib.Path(path)
+    if not base.exists(): return {"error":"path-missing"}
+    items=[]
+    for f in sorted(base.rglob("*")):
+        if f.is_file():
+            items.append({
+                "path": str(f),
+                "sha256": hashlib.sha256(f.read_bytes()).hexdigest(),
+                "size": f.stat().st_size
+            })
+    sbom={"path": path, "generated": int(time.time()), "items": items}
+    out=pathlib.Path("ledger")/f"sbom_{path.replace('/','_')}.json"
+    out.write_text(json.dumps(sbom, indent=2))
+    return {"ok": True, "sbom": str(out), "count": len(items)}
+
+core/alerts.py
+
+import yaml, pathlib
+from core.telemetry import summary
+from core.event_bus import backlog
+
+CFG = yaml.safe_load(pathlib.Path("config/alerts.yaml").read_text())
+
+def check()->dict:
+    notes=[]
+    for r in CFG.get("rules", []):
+        if "metric" in r:
+            s=summary(r["metric"])
+            if "avg" in s and "stdev" in s and s.get("samples",0)>=3:
+                # crude z check from latest p50
+                if s.get("stdev",0)>0:
+                    z=(s.get("p50",s["avg"])-s["avg"])/s["stdev"]
+                    if abs(z)>=float(r.get("z_threshold",3.0)):
+                        notes.append({"rule":r["id"],"type":"metric_z","z":z})
+        if "topic" in r:
+            b=backlog(r["topic"])
+            if b>int(r.get("max_backlog",1000)):
+                notes.append({"rule":r["id"],"type":"bus_backlog","backlog":b})
+    return {"alerts": notes}
+
+def canary()->dict:
+    # simple “are critical dirs present?” re-use watchdog from v318.x
+    from core.watchdog import heal
+    res=heal()
+    return {"canary":"ok","heal":res}
+
+
+---
+
+🌐 API façade
+
+versions/v320.json
+
+{
+  "id": "v320",
+  "codename": "AURORA//SOVEREIGN",
+  "extends": ["v319","v319.x","v318","v318.x"],
+  "adds": ["event_bus","dag","lineage","snapshots","attestation","sbom","alerts"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+api/v320_api.py
+
+from fastapi import FastAPI, Body
+from core.event_bus import publish as bus_publish, poll as bus_poll
+from core.dag import run as dag_run
+from core.lineage import record as lin_record, export as lin_export
+from core.snapshots import take as snap_take, rollback as snap_rollback
+from core.attestation import sign_tree as att_sign, verify_tree as att_verify
+from core.sbom import make as sbom_make
+from core.alerts import check as alert_check, canary as alert_canary
+
+app = FastAPI(title="Codex v320 • AURORA//SOVEREIGN", version="v320")
+
+# Bus
+@app.post("/bus/publish")
+def api_bus_pub(p:dict=Body(...)):
+    return bus_publish(p["topic"], p.get("data",{}))
+
+@app.get("/bus/poll")
+def api_bus_poll(topic:str, limit:int=50):
+    return bus_poll(topic, limit)
+
+# DAG
+@app.post("/dag/run")
+def api_dag_run(p:dict=Body(...)):
+    return dag_run(p.get("tenant","cfbk"), p["name"])
+
+# Lineage
+@app.post("/lineage/record")
+def api_lin_record(p:dict=Body(...)):
+    return lin_record(p.get("tenant","cfbk"), p["product"], p.get("inputs",[]), p.get("op","op"))
+
+@app.get("/lineage/export")
+def api_lin_export(tenant:str="cfbk"):
+    return lin_export(tenant)
+
+# Snapshots
+@app.post("/snap/take")
+def api_snap_take(p:dict=Body(...)):
+    return snap_take(p["path"], p.get("label"))
+
+@app.post("/snap/rollback")
+def api_snap_rb(p:dict=Body(...)):
+    return snap_rollback(p["label"])
+
+# Attestation
+@app.post("/attest/sign")
+def api_att_sign(p:dict=Body(...)):
+    return att_sign(p.get("tenant","cfbk"), p["path"])
+
+@app.post("/attest/verify")
+def api_att_ver(p:dict=Body(...)):
+    return att_verify(p.get("tenant","cfbk"), p["path"])
+
+# SBOM
+@app.post("/sbom/make")
+def api_sbom_make(p:dict=Body(...)):
+    return sbom_make(p["path"])
+
+# Alerts
+@app.post("/alerts/check")
+def api_alerts():
+    return alert_check()
+
+@app.post("/alerts/canary")
+def api_canary():
+    return alert_canary()
+
+
+---
+
+✅ Why v320 matters (operator’s cut)
+
+Provable integrity: Attest any subtree with Ed25519 signatures (keyed from Vault), verify on deploy.
+
+Roll back safely: Human-friendly snapshots and restore for data/ or ledger/ slices.
+
+Know your lineage: Track transformations for audit, science, or “who built that?” questions.
+
+SBOM-on-demand: Produce a hash inventory for any subtree—great for releases and diffs.
+
+Pipelines without pain: A tiny YAML DAG that can call your existing plugin/bus/lineage ops.
+
+Events with zero infra: File-bus for visibility and quick debugging.
+
+Eyes open: Alert rules for metric z-spikes and queue backlogs; canary keeps the skeleton crew healthy.
+
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aDropping a clean, copy-paste layer on top of v320. Here’s v320.x — AURORA//SOVEREIGN+: feature flags, blue/green deploy switch, config-drift guardrails, snapshots-to-tar exports, cold backups/restores, chaos probes, and a tiny health dashboard. Filesystem-first. No new deps.
+
+Paste these straight into your repo (unzipped).
+
+
+---
+
+📦 New / updated tree
+
+codex_v320x_sovereign_plus/
+├─ README.md                    # (append block below)
+├─ versions/
+│  └─ v320x.json
+├─ config/
+│  ├─ flags.yaml
+│  └─ deploy.yaml
+├─ core/
+│  ├─ feature_flags.py
+│  ├─ deploy_switch.py
+│  ├─ drift.py
+│  ├─ backup.py
+│  ├─ export.py
+│  ├─ chaos.py
+│  └─ health.py
+└─ api/
+   └─ v320x_api.py
+
+
+---
+
+🧾 README.md (append)
+
+## v320.x — AURORA//SOVEREIGN+
+Adds:
+- **Feature flags** (tenant/global) with YAML, cached in-memory
+- **Blue/Green switch** (current slot + canary %)
+- **Config drift** detection (hash & diff of config/)
+- **Cold backups** (tar.gz) and **restore**
+- **Export bundles** for data/ledger slices
+- **Chaos probes** (latency jitter, error burst) – off by default
+- **Health** snapshot (flags, deploy slot, config hash, bus backlog, anomalies)
+
+Run:
+```bash
+uvicorn api.v320x_api:app --reload --port ${PORT:-8165}
+
+Quick taste:
+
+# enable a flag and read it
+curl -s -X POST localhost:${PORT:-8165}/flags/set -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","name":"predict.v2","value":true}' | jq
+curl -s localhost:${PORT:-8165}/flags/get?tenant=cfbk\&name=predict.v2 | jq
+
+# switch blue/green and set 10% canary
+curl -s -X POST localhost:${PORT:-8165}/deploy/switch -H 'Content-Type: application/json' \
+  -d '{"slot":"green","canary_pct":10}' | jq
+
+# config drift
+curl -s -X POST localhost:${PORT:-8165}/drift/scan | jq
+
+# cold backup + restore
+curl -s -X POST localhost:${PORT:-8165}/backup/take -H 'Content-Type: application/json' \
+  -d '{"paths":["data","ledger"],"label":"nightly"}' | jq
+curl -s -X POST localhost:${PORT:-8165}/backup/restore -H 'Content-Type: application/json' \
+  -d '{"label":"nightly"}' | jq
+
+# export a tidy tar.gz of tenant data
+curl -s -X POST localhost:${PORT:-8165}/export/make -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","what":["data","ledger"]}' | jq
+
+# chaos (enable; auto-disables after TTL)
+curl -s -X POST localhost:${PORT:-8165}/chaos/set -H 'Content-Type: application/json' \
+  -d '{"latency_ms":120,"error_rate":0.05,"ttl_sec":60}' | jq
+
+# health
+curl -s localhost:${PORT:-8165}/health | jq
+
+---
+
+## ⚙️ Config
+
+### `config/flags.yaml`
+```yaml
+global:
+  telemetry.enhanced: false
+  ads.enabled: true
+tenants:
+  cfbk:
+    predict.v2: false
+    monetization.hard_gate: false
+
+config/deploy.yaml
+
+slot: "blue"         # current active slot: blue | green
+canary_pct: 0        # % of calls routed to the other slot (0..100)
+notes: "initial"
+
+
+---
+
+🧠 Core modules
+
+core/feature_flags.py
+
+import yaml, pathlib, time
+FLAGS = None; STAMP = 0
+CFG = pathlib.Path("config/flags.yaml")
+
+def _load():
+    global FLAGS, STAMP
+    if FLAGS is None or CFG.stat().st_mtime > STAMP:
+        FLAGS = yaml.safe_load(CFG.read_text()); STAMP = CFG.stat().st_mtime
+    return FLAGS
+
+def get(tenant:str|None, name:str, default=None):
+    f=_load()
+    tmap = (f.get("tenants") or {}).get(tenant or "", {})
+    if name in tmap: return tmap[name]
+    return (f.get("global") or {}).get(name, default)
+
+def set_flag(tenant:str|None, name:str, value):
+    f=_load()
+    if tenant:
+        f.setdefault("tenants",{}).setdefault(tenant,{})[name]=value
+    else:
+        f.setdefault("global",{})[name]=value
+    CFG.write_text(yaml.safe_dump(f))
+    return {"tenant": tenant, "name": name, "value": value}
+
+core/deploy_switch.py
+
+import yaml, pathlib
+CFG = pathlib.Path("config/deploy.yaml")
+
+def state():
+    c=yaml.safe_load(CFG.read_text()); return c
+
+def switch(slot:str, canary_pct:int|None=None, notes:str|None=None):
+    if slot not in ("blue","green"): return {"error":"bad-slot"}
+    c=state(); c["slot"]=slot
+    if canary_pct is not None: c["canary_pct"]=max(0,min(100,int(canary_pct)))
+    if notes is not None: c["notes"]=notes
+    CFG.write_text(yaml.safe_dump(c))
+    return c
+
+core/drift.py
+
+import hashlib, pathlib, json
+CFG_DIR = pathlib.Path("config")
+
+def hash_tree(dirpath:str="config"):
+    base=pathlib.Path(dirpath)
+    h=hashlib.sha256()
+    files=sorted([p for p in base.rglob("*") if p.is_file()])
+    meta=[]
+    for f in files:
+        rel=str(f.relative_to(base))
+        b=f.read_bytes(); h.update(rel.encode()); h.update(b)
+        meta.append({"path": rel, "sha256": hashlib.sha256(b).hexdigest(), "size": f.stat().st_size})
+    return {"hash": h.hexdigest(), "files": meta}
+
+def diff(a:dict, b:dict):
+    amap={x["path"]:x["sha256"] for x in a["files"]}
+    bmap={x["path"]:x["sha256"] for x in b["files"]}
+    added=[p for p in bmap if p not in amap]
+    removed=[p for p in amap if p not in bmap]
+    changed=[p for p in bmap if p in amap and bmap[p]!=amap[p]]
+    return {"added": added, "removed": removed, "changed": changed}
+
+core/backup.py
+
+import pathlib, tarfile, time
+BK = pathlib.Path("ledger/backups"); BK.mkdir(parents=True, exist_ok=True)
+
+def take(paths:list[str], label:str|None=None):
+    label = label or f"bk_{int(time.time())}"
+    out = BK/f"{label}.tar.gz"
+    with tarfile.open(out, "w:gz") as tar:
+        for p in paths:
+            tar.add(p, arcname=p)
+    return {"label": label, "file": str(out)}
+
+def restore(label:str):
+    tar = BK/f"{label}.tar.gz"
+    if not tar.exists(): return {"error":"missing-backup"}
+    with tarfile.open(tar, "r:gz") as t:
+        t.extractall(".")
+    return {"restored": label}
+
+core/export.py
+
+import pathlib, tarfile, time
+EXP = pathlib.Path("ledger/exports"); EXP.mkdir(parents=True, exist_ok=True)
+
+def make(tenant:str, what:list[str]):
+    label=f"export_{tenant}_{int(time.time())}"
+    out=EXP/f"{label}.tar.gz"
+    with tarfile.open(out,"w:gz") as tar:
+        for w in what:
+            if pathlib.Path(w).exists(): tar.add(w, arcname=w)
+    return {"label": label, "file": str(out)}
+
+core/chaos.py
+
+import time, random
+STATE={"until":0,"latency_ms":0,"error_rate":0.0}
+
+def set(latency_ms:int=0, error_rate:float=0.0, ttl_sec:int=60):
+    STATE["until"]=time.time()+max(0,ttl_sec)
+    STATE["latency_ms"]=max(0,int(latency_ms))
+    STATE["error_rate"]=max(0.0,min(1.0,float(error_rate)))
+    return STATE
+
+def maybe():
+    if time.time()>STATE["until"]: return
+    if STATE["latency_ms"]>0:
+        time.sleep(STATE["latency_ms"]/1000.0)
+    if random.random()<STATE["error_rate"]:
+        raise RuntimeError("chaos: injected error")
+
+core/health.py
+
+import pathlib, time
+from core.feature_flags import _load as flags_load
+from core.deploy_switch import state as deploy_state
+from core.drift import hash_tree
+from core.event_bus import backlog
+from core.telemetry import summary
+from core.anomaly import z_anomaly
+
+def snapshot():
+    flags = flags_load()
+    deploy = deploy_state()
+    cfg = hash_tree("config")
+    bus = {"pipeline": backlog("pipeline"), "ingest": backlog("ingest")}
+    lat = summary("ingest_latency_ms")
+    an  = z_anomaly("ingest_latency_ms")
+    return {
+        "ts": int(time.time()),
+        "flags": flags,
+        "deploy": deploy,
+        "config": {"hash": cfg["hash"], "files": len(cfg["files"])},
+        "bus_backlog": bus,
+        "latency": lat,
+        "anomaly": an
+    }
+
+
+---
+
+🌐 API façade
+
+versions/v320x.json
+
+{
+  "id": "v320.x",
+  "codename": "AURORA//SOVEREIGN+",
+  "extends": ["v320","v319","v319.x","v318","v318.x"],
+  "adds": ["feature_flags","deploy_switch","config_drift","backup","export","chaos","health"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+api/v320x_api.py
+
+from fastapi import FastAPI, Body, HTTPException
+from core.feature_flags import get as flag_get, set_flag
+from core.deploy_switch import state as deploy_state, switch as deploy_switch
+from core.drift import hash_tree, diff
+from core.backup import take as bk_take, restore as bk_restore
+from core.export import make as exp_make
+from core.chaos import set as chaos_set, maybe as chaos_maybe
+from core.health import snapshot as health_snapshot
+
+app = FastAPI(title="Codex v320.x • AURORA//SOVEREIGN+", version="v320.x")
+
+# Feature flags
+@app.get("/flags/get")
+def api_flag_get(tenant:str|None=None, name:str="", default:str|None=None):
+    chaos_maybe()
+    return {"tenant": tenant, "name": name, "value": flag_get(tenant, name, default)}
+
+@app.post("/flags/set")
+def api_flag_set(p:dict=Body(...)):
+    chaos_maybe()
+    return set_flag(p.get("tenant"), p["name"], p["value"])
+
+# Deploy switch
+@app.get("/deploy/state")
+def api_deploy_state():
+    chaos_maybe()
+    return deploy_state()
+
+@app.post("/deploy/switch")
+def api_deploy_switch(p:dict=Body(...)):
+    chaos_maybe()
+    return deploy_switch(p.get("slot","blue"), p.get("canary_pct"), p.get("notes"))
+
+# Config drift
+@app.post("/drift/scan")
+def api_drift_scan(p:dict=Body({})):
+    chaos_maybe()
+    now = hash_tree("config")
+    prev = p.get("baseline")
+    delta = diff(prev, now) if isinstance(prev, dict) else None
+    return {"now": now, "delta": delta}
+
+# Backup & restore
+@app.post("/backup/take")
+def api_backup_take(p:dict=Body(...)):
+    chaos_maybe()
+    return bk_take(p.get("paths",["data","ledger"]), p.get("label"))
+
+@app.post("/backup/restore")
+def api_backup_restore(p:dict=Body(...)):
+    chaos_maybe()
+    return bk_restore(p["label"])
+
+# Export bundles
+@app.post("/export/make")
+def api_export_make(p:dict=Body(...)):
+    chaos_maybe()
+    return exp_make(p.get("tenant","cfbk"), p.get("what",["data"]))
+
+# Chaos control
+@app.post("/chaos/set")
+def api_chaos_set(p:dict=Body(...)):
+    return chaos_set(int(p.get("latency_ms",0)), float(p.get("error_rate",0.0)), int(p.get("ttl_sec",60)))
+
+# Health
+@app.get("/health")
+def api_health():
+    return health_snapshot()
+
+
+---
+
+✅ Operator notes (why v320.x matters)
+
+Flip features safely per tenant without redeploys.
+
+Blue/Green + canary gives you progressive delivery in one YAML.
+
+Drift guard makes config changes observable and auditable.
+
+Cold backups/exports keep your filesystem-first architecture portable.
+
+Chaos probes help you harden your pipeline under stress—then auto-expire.
+
+Health endpoint collects the important signals in one place for dashboards.
+
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
