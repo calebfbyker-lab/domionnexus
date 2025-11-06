@@ -1,0 +1,428 @@
+# v337.x finish — key rotation, policy templates, inclusion proofs, UI verify, CLI helpers, reseal/verify/zip
+import os, json, hashlib, datetime, zipfile, subprocess
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# 1) Policy templates + creator enhancement
+policy_templates = {
+  "version": "v337.x",
+  "sealed_to": SEAL,
+  "templates": {
+    "default": ["no-network-writes", "public-sources-only"],
+    "read-heavy": ["no-network-writes", "public-sources-only", "limit-summary-50k"],
+    "strict": ["no-network-writes", "public-sources-only", "no-external-bridges"]
+  }
+}
+write(os.path.join(ROOT, "work_orders", "policy_templates.json"), json.dumps(policy_templates, indent=2))
+
+# Patch create_work_order.py to accept --policy-template
+creator_path = os.path.join(ROOT, "work_orders", "create_work_order.py")
+with open(creator_path, "r", encoding="utf-8") as f:
+    csrc = f.read()
+if "--policy-template" not in csrc:
+    csrc = csrc.replace('ap.add_argument("--policy", default=\'["no-network-writes","public-sources-only"]\')',
+                        'ap.add_argument("--policy", default=None)\n    ap.add_argument("--policy-template", default="default")\n    ap.add_argument("--templates", default=None)')
+    csrc = csrc.replace('order = make_order(args.secret, args.actor, args.task, json.loads(args.params), json.loads(args.limits), json.loads(args.policy), "'+SEAL+'")',
+                        'import json as _json\n    if args.policy is None:\n        tmpl_path = args.templates or os.path.join(os.path.dirname(__file__), "policy_templates.json")\n        with open(tmpl_path,"r",encoding="utf-8") as _f: _pt = _f.read()\n        _tmpls = _json.loads(_pt)["templates"]\n        _pol = _tmpls.get(args.policy_template, _tmpls["default"])\n    else:\n        _pol = _json.loads(args.policy)\n    order = make_order(args.secret, args.actor, args.task, json.loads(args.params), json.loads(args.limits), _pol, "'+SEAL+'")')
+    write(creator_path, csrc)
+
+# 2) Key rotation tool and revocation list
+revocations = {
+  "version": "v337.x",
+  "sealed_to": SEAL,
+  "revoked": []
+}
+write(os.path.join(ROOT, "work_orders", "revocations.json"), json.dumps(revocations, indent=2))
+
+rotate_py = """# work_orders/rotate_key.py
+import json, sys, os, time
+REG = os.path.join(os.path.dirname(__file__), "key_registry.json")
+REVOKE = os.path.join(os.path.dirname(__file__), "revocations.json")
+
+def rotate(key_id: str, new_public_hex: str=None, status="present"):
+    with open(REG,"r",encoding="utf-8") as f: reg = json.load(f)
+    found = False
+    for k in reg["keys"]:
+        if k["id"] == key_id:
+            k["public_hex"] = new_public_hex
+            k["status"] = status
+            k["added_utc"] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            found = True
+            break
+    if not found:
+        reg["keys"].append({"id":key_id,"type":"ed25519","public_hex":new_public_hex,"added_utc":time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),"status":status})
+    with open(REG,"w",encoding="utf-8") as f: json.dump(reg, f, indent=2)
+
+def revoke(key_id: str, reason="rotation"):
+    with open(REVOKE,"r",encoding="utf-8") as f: rev = json.load(f)
+    rev["revoked"].append({"id": key_id, "reason": reason, "ts_utc": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())})
+    with open(REVOKE,"w",encoding="utf-8") as f: json.dump(rev, f, indent=2)
+
+if __name__ == "__main__":
+    if len(sys.argv)<2:
+        print("usage: python3 rotate_key.py <key_id> [new_public_hex|'None'] [status] [--revoke]"); raise SystemExit(2)
+    key_id = sys.argv[1]
+    new_hex = None if len(sys.argv)<3 or sys.argv[2]=="None" else sys.argv[2]
+    status = "present" if len(sys.argv)<4 else sys.argv[3]
+    revoke_flag = ("--revoke" in sys.argv)
+    rotate(key_id, new_hex, status)
+    if revoke_flag:
+        revoke(key_id)
+    print("OK")
+"""
+write(os.path.join(ROOT, "work_orders", "rotate_key.py"), rotate_py)
+
+# 3) Inclusion proof generator (compute Merkle path)
+inclusion_py = """# integrity/inclusion_proof.py
+import os, json, hashlib, sys
+BASE = os.path.dirname(__file__)
+JOURNAL = os.path.join(BASE, "executions.jsonl")
+
+def merkle_path(hashes_hex, target_hex):
+    layers = [hashes_hex[:]]
+    # pad if odd
+    while len(layers[-1])>1:
+        cur = layers[-1]
+        nxt = []
+        for i in range(0, len(cur), 2):
+            a = bytes.fromhex(cur[i])
+            b = bytes.fromhex(cur[i+1] if i+1 < len(cur) else cur[i])
+            nxt.append(hashlib.sha256(a+b).hexdigest())
+        layers.append(nxt)
+    # find path
+    path = []
+    idx = layers[0].index(target_hex)
+    for lvl in range(0, len(layers)-1):
+        cur = layers[lvl]
+        sib_idx = idx-1 if idx%2==1 else idx+1
+        sibling = cur[sib_idx] if sib_idx < len(cur) else cur[idx]
+        path.append({"level": lvl, "sibling": sibling, "side": "L" if idx%2==1 else "R"})
+        idx //= 2
+    return {"target": target_hex, "path": path, "levels": len(layers)}
+
+def generate(target_hex):
+    if not os.path.exists(JOURNAL):
+        raise SystemExit("no journal")
+    hashes = []
+    with open(JOURNAL,"r",encoding="utf-8") as f:
+        for line in f:
+            if not line.strip(): continue
+            o = json.loads(line)
+            h = o.get("sha256") or hashlib.sha256(line.encode()).hexdigest()
+            hashes.append(h)
+    if target_hex not in hashes:
+        raise SystemExit("target not found")
+    return merkle_path(hashes, target_hex)
+
+if __name__ == "__main__":
+    if len(sys.argv)<2:
+        print("usage: python3 inclusion_proof.py <entry_sha256>"); raise SystemExit(2)
+    proof = generate(sys.argv[1])
+    print(json.dumps(proof, indent=2))
+"""
+write(os.path.join(ROOT, "integrity", "inclusion_proof.py"), inclusion_py)
+
+# 4) Journal UI: verify inclusion of a pasted entry
+with open(os.path.join(ROOT, "journal.html"), "r", encoding="utf-8") as f:
+    jsrc = f.read()
+
+if "Verify Inclusion" not in jsrc:
+    jsrc = jsrc.replace("</pre>", "</pre>\n<div style=\"margin:8px 0\"><button id=\"incl\">Verify Inclusion (first entry)</button></div>\n<pre id=\"inclOut\"></pre>")
+    jsrc = jsrc.replace("</script>", """
+async function sha256hex(buf){ const dig = await crypto.subtle.digest('SHA-256', buf); return Array.from(new Uint8Array(dig)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+function hexToBytes(hex){ const a=[]; for(let i=0;i<hex.length;i+=2)a.push(parseInt(hex.slice(i,i+2),16)); return new Uint8Array(a); }
+async function merkleRoot(hexes){
+  if(!hexes.length) return null;
+  let cur = hexes.map(h=>hexToBytes(h));
+  while(cur.length>1){
+    const nxt=[];
+    for(let i=0;i<cur.length;i+=2){
+      const a = cur[i], b = (i+1<cur.length)? cur[i+1] : cur[i];
+      const c = new Uint8Array(a.length + b.length); c.set(a,0); c.set(b,a.length);
+      nxt.push(new Uint8Array(await crypto.subtle.digest('SHA-256', c)));
+    }
+    cur = nxt;
+  }
+  return Array.from(cur[0]).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+document.getElementById('incl').onclick = async () => {
+  const lines = document.getElementById('paste').value.split('\\n').filter(Boolean);
+  const parsed = lines.map(l => { try { return JSON.parse(l);} catch(_) { return null; } }).filter(Boolean);
+  if (!parsed.length) { document.getElementById('inclOut').textContent = 'no entries'; return; }
+  const hashes = await Promise.all(parsed.map(async o => o.sha256 || await sha256hex(new TextEncoder().encode(JSON.stringify(o)))));
+  const root = await merkleRoot(hashes);
+  document.getElementById('inclOut').textContent = JSON.stringify({first_entry_sha256: hashes[0], merkle_root: root}, null, 2);
+};
+</script>""")
+    write(os.path.join(ROOT, "journal.html"), jsrc)
+
+# 5) CLI helper script
+cli_helper = f"""# tools/codex_cli_helpers.md
+## v337.x helpers
+
+- Create with policy template:
+```
+python3 work_orders/create_work_order.py --secret "test" --task plan --params '{{"goal":"demo"}}' --policy-template strict
+```
+
+- Rotate key (mark present) and revoke old:
+```
+python3 work_orders/rotate_key.py cfbk-primary NEW_PUBLIC_HEX present
+python3 work_orders/rotate_key.py cfbk-primary None present --revoke
+```
+
+- Merkle receipts and inclusion proof:
+```
+python3 integrity/exec_receipts.py
+python3 integrity/inclusion_proof.py <entry_sha256>
+```
+"""
+write(os.path.join(ROOT, "tools", "codex_cli_helpers.md"), cli_helper)
+
+# 6) Reseal + verify + zip
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+vr = subprocess.call(["python3", os.path.join(ROOT, "integrity", "codex_verifier.py")])
+
+zip_path = "/mnt/data/codex_ascendant_v337x_release.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, ROOT))
+
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("Verify RC:", vr)
+print("V337.x ZIP:", "sandbox:"+zip_path)
+print("V337.x SHA256:", "sandbox:"+zip_path+".sha256")
+print("Journal page:", "sandbox:"+os.path.join(ROOT, "journal.html"))# Retry v337: escape braces in YAML within f-strings by writing as raw string literals.
+import os, json, hashlib, datetime, zipfile, subprocess
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# Key registry & docs
+key_registry = {
+  "version":"v337","sealed_to":SEAL,
+  "keys":[
+    {"id":"cfbk-primary","type":"ed25519","public_hex": None, "added_utc": STAMP, "status":"absent"},
+    {"id":"cfbk-hmac","type":"hmac-sha256","public_hex": None, "added_utc": STAMP, "status":"present"}
+  ]
+}
+write(os.path.join(ROOT, "work_orders", "key_registry.json"), json.dumps(key_registry, indent=2))
+
+keys_md = (
+"# Work Order Keys (v337)\n\n"
+"- Registry: `work_orders/key_registry.json`\n"
+"- Support:\n"
+"  - **HMAC-SHA256** (default)\n"
+"  - **Ed25519** (optional; requires PyNaCl)\n"
+)
+write(os.path.join(ROOT, "work_orders", "KEYS.md"), keys_md)
+
+# signature_util with optional ed25519
+sig_util = """# work_orders/signature_util.py
+import hmac, hashlib, json
+def sign_hmac(secret: str, order_body: dict) -> str:
+    msg = json.dumps(order_body, sort_keys=True).encode()
+    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+def verify_hmac(secret: str, order: dict) -> bool:
+    tag = order.get("hmac")
+    if not tag: return False
+    body = dict(order); body.pop("hmac", None)
+    expected = sign_hmac(secret, body)
+    return hmac.compare_digest(tag, expected)
+def sign_ed25519(priv_hex: str, order_body: dict) -> str:
+    try:
+        from nacl.signing import SigningKey
+    except Exception as e:
+        raise RuntimeError("Ed25519 signing requires PyNaCl. " + str(e))
+    sk = SigningKey(bytes.fromhex(priv_hex))
+    msg = json.dumps(order_body, sort_keys=True).encode()
+    sig = sk.sign(msg).signature
+    return sig.hex()
+def verify_ed25519(pub_hex: str, order: dict) -> bool:
+    try:
+        from nacl.signing import VerifyKey
+    except Exception as e:
+        raise RuntimeError("Ed25519 verification requires PyNaCl. " + str(e))
+    tag = order.get("hmac")
+    if not tag: return False
+    body = dict(order); body.pop("hmac", None)
+    vk = VerifyKey(bytes.fromhex(pub_hex))
+    try:
+        vk.verify(json.dumps(body, sort_keys=True).encode(), bytes.fromhex(tag))
+        return True
+    except Exception:
+        return False
+"""
+write(os.path.join(ROOT, "work_orders", "signature_util.py"), sig_util)
+
+# Merkle & receipts
+merkle_py = """# integrity/merkle.py
+import hashlib
+def merkle_root(hashes_hex):
+    if not hashes_hex: return None
+    cur = [bytes.fromhex(h) for h in hashes_hex]
+    while len(cur) > 1:
+        nxt = []
+        for i in range(0, len(cur), 2):
+            a = cur[i]
+            b = cur[i+1] if i+1 < len(cur) else cur[i]
+            nxt.append(hashlib.sha256(a + b).digest())
+        cur = nxt
+    return cur[0].hex()
+"""
+write(os.path.join(ROOT, "integrity", "merkle.py"), merkle_py)
+
+exec_receipts = f"""# integrity/exec_receipts.py
+# v337 sealed to {SEAL} @ {STAMP}
+import os, json, csv, hashlib
+from .merkle import merkle_root
+BASE = os.path.dirname(__file__)
+JOURNAL = os.path.join(BASE, "executions.jsonl")
+RECEIPTS = os.path.join(BASE, "execution_receipts.csv")
+ROOTS = os.path.join(BASE, "merkle_roots.json")
+def generate():
+    if not os.path.exists(JOURNAL):
+        return None, None
+    hashes, rows = [], []
+    with open(JOURNAL, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip(): continue
+            obj = json.loads(line)
+            dig = obj.get("sha256") or hashlib.sha256(line.encode()).hexdigest()
+            hashes.append(dig)
+            e = obj.get("entry", {{}})
+            rows.append([dig, e.get("ts_utc"), e.get("task"), json.dumps(e.get("result", {{}}))])
+    root = merkle_root(hashes)
+    with open(RECEIPTS, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["entry_sha256","ts_utc","task","result_json"]); w.writerows(rows)
+    roots = []
+    if os.path.exists(ROOTS):
+        with open(ROOTS, "r", encoding="utf-8") as f: roots = json.load(f)
+    roots.append({{"root": root, "count": len(hashes)}})
+    with open(ROOTS, "w", encoding="utf-8") as f: json.dump(roots, f, indent=2)
+    return RECEIPTS, ROOTS
+if __name__ == "__main__":
+    r, m = generate()
+    print("Receipts:", r); print("Merkle roots:", m)
+"""
+write(os.path.join(ROOT, "integrity", "exec_receipts.py"), exec_receipts)
+
+# Strengthen executor summarization limit
+exec_path = os.path.join(ROOT, "golem_engine", "executor_v336.py")
+with open(exec_path, "r", encoding="utf-8") as f: ex_src = f.read()
+if "max_chars" not in ex_src:
+    ex_src = ex_src.replace(
+        "out = {\"summary\": g.summarize(txt)}",
+        "max_chars = int(limits.get(\"max_chars\", 50000))\n        txt = txt[:max_chars]\n        out = {\"summary\": g.summarize(txt)}"
+    )
+    write(exec_path, ex_src)
+
+# Journal UI with Merkle calc (seal tag substitution)
+journal_html = """<!doctype html>
+<html><meta charset="utf-8"><title>Execution Journal — v337 sealed SEAL_TAG</title>
+<link rel="stylesheet" href="codex/styles/codex.css">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px/1.5 ui-sans-serif,system-ui">
+<h1>✶ Execution Journal</h1>
+<p>Seal: <strong>SEAL_TAG</strong></p>
+<p>Paste lines from <code>integrity/executions.jsonl</code> below. We'll compute a Merkle root in-browser.</p>
+<textarea id="paste" rows="10" style="width:100%"></textarea>
+<div style="margin:8px 0"><button id="parse">Compute</button></div>
+<pre id="out"></pre>
+<script>
+async function sha256hex(buf){ const dig = await crypto.subtle.digest('SHA-256', buf); return Array.from(new Uint8Array(dig)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+function hexToBytes(hex){ const a=[]; for(let i=0;i<hex.length;i+=2)a.push(parseInt(hex.slice(i,i+2),16)); return new Uint8Array(a); }
+async function merkleRoot(hexes){
+  if(!hexes.length) return null;
+  let cur = hexes.map(h=>hexToBytes(h));
+  while(cur.length>1){
+    const nxt=[];
+    for(let i=0;i<cur.length;i+=2){
+      const a = cur[i], b = (i+1<cur.length)? cur[i+1] : cur[i];
+      const c = new Uint8Array(a.length + b.length); c.set(a,0); c.set(b,a.length);
+      nxt.push(new Uint8Array(await crypto.subtle.digest('SHA-256', c)));
+    }
+    cur = nxt;
+  }
+  return Array.from(cur[0]).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+document.getElementById('parse').onclick = async () => {
+  const lines = document.getElementById('paste').value.split('\\n').filter(Boolean);
+  const parsed = lines.map(l => { try { return JSON.parse(l);} catch(_) { return null; } }).filter(Boolean);
+  const hashes = await Promise.all(parsed.map(async o => o.sha256 || await sha256hex(new TextEncoder().encode(JSON.stringify(o)))));
+  const root = await merkleRoot(hashes);
+  document.getElementById('out').textContent = JSON.stringify({count: hashes.length, merkle_root: root}, null, 2);
+};
+</script>
+</body></html>
+""".replace("SEAL_TAG", SEAL)
+write(os.path.join(ROOT, "journal.html"), journal_html)
+
+# Docs + CI
+notes = f"# Codex v337 — Keys, Receipts, Merkle Roots, Policy & UI\n\nSeal: {SEAL} — {STAMP}\n"
+write(os.path.join(ROOT, "docs", "V337_NOTES.md"), notes)
+
+api = "# API v337 Additions\n- key_registry.json, signature_util (Ed25519 optional), exec_receipts.\n"
+write(os.path.join(ROOT, "docs", "API_v337.md"), api)
+
+ci = (
+"name: codex-v337-receipts\n"
+"on: [push, workflow_dispatch]\n"
+"jobs:\n"
+"  test:\n"
+"    runs-on: ubuntu-latest\n"
+"    steps:\n"
+"      - uses: actions/checkout@v4\n"
+"      - uses: actions/setup-python@v5\n"
+"        with: { python-version: '3.x' }\n"
+"      - name: Create+Exec+Receipts\n"
+"        run: |\n"
+"          python3 work_orders/create_work_order.py --secret \"t\" --task summarize --params '{\"text\":\"v337 receipts test\"}' --out wo.json\n"
+"          python3 golem_engine/executor_v336.py wo.json > run.json\n"
+"          python3 integrity/exec_receipts.py\n"
+"          test -f integrity/execution_receipts.csv\n"
+"          test -f integrity/merkle_roots.json\n"
+)
+write(os.path.join(ROOT, ".github", "workflows", "codex_v337_receipts.yml"), ci)
+
+# Reseal + verify + zip
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+vr = subprocess.call(["python3", os.path.join(ROOT, "integrity", "codex_verifier.py")])
+zip_path = "/mnt/data/codex_ascendant_v337_release.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, ROOT))
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("Verify RC:", vr)
+print("V337 ZIP:", "sandbox:"+zip_path)
+print("V337 SHA256:", "sandbox:"+zip_path+".sha256")
+print("Notes:", "sandbox:"+os.path.join(ROOT, "docs", "V337_NOTES.md"))
+print("Journal viewer:", "sandbox:"+os.path.join(ROOT, "journal.html"))
