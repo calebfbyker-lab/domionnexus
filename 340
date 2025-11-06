@@ -1,0 +1,859 @@
+{
+  "version": "v340",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "id": "ba0c888f-856a-4a1d-bc3e-5e027e8f3747",
+  "ts_utc": "2025-11-06T18:58:15Z",
+  "actor": "CFBK",
+  "task": "bridge_btc",
+  "params": {},
+  "limits": {
+    "cpu_ms": 2000,
+    "net": false
+  },
+  "policy": [
+    "no-network-writes",
+    "public-sources-only",
+    "allow-bridge",
+    "rate:tokens=2"
+  ],
+  "hmac": "d50ec6a0d72bf550ed2438cf744f6259da2dde8795ab3b45c7a1cadc989b187d"
+}# Retry v340 creation — avoid braces inside f-strings by using .format or replace.
+import os, json, hashlib, datetime, zipfile, subprocess, time, uuid
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# 1) receipt_pack.py
+receipt_pack = """
+# integrity/receipt_pack.py
+# v340 sealed to {SEAL} @ {STAMP}
+import os, json, time
+BASE = os.path.dirname(__file__)
+NOTAR = os.path.join(BASE, "release_notarization.json")
+RECEIPTS_DIR = os.path.join(BASE, "receipts")
+os.makedirs(RECEIPTS_DIR, exist_ok=True)
+
+def pack(result_obj: dict):
+    order_id = result_obj.get("order_id")
+    fn = "receipt_{oid}.json".format(oid=(order_id or int(time.time())))
+    with open(NOTAR, "r", encoding="utf-8") as f:
+        notar = json.load(f)
+    envelope = {{
+        "version": "v340-receipt",
+        "sealed_to": "{SEAL}",
+        "ts_utc": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        "result": result_obj,
+        "notarization": {{
+            "merkle_root": notar.get("merkle_root"),
+            "ts_utc": notar.get("ts_utc"),
+            "items_count": len(notar.get("items", []))
+        }}
+    }}
+    outp = os.path.join(RECEIPTS_DIR, fn)
+    with open(outp, "w", encoding="utf-8") as f: json.dump(envelope, f, indent=2)
+    return outp
+
+if __name__ == "__main__":
+    import sys, json as _j
+    if len(sys.argv)<2:
+        print("usage: python3 integrity/receipt_pack.py <result.json>"); raise SystemExit(2)
+    with open(sys.argv[1], "r", encoding="utf-8") as f: res = _j.load(f)
+    print(pack(res))
+""".replace("{SEAL}", SEAL).replace("{STAMP}", STAMP)
+write(os.path.join(ROOT, "integrity", "receipt_pack.py"), receipt_pack)
+
+# 2) rate.py
+rate_py = """
+# integrity/rate.py
+# v340 token-bucket enforcement sealed to SEAL_TAG @ STAMP_TAG
+import os, json, time
+BASE = os.path.dirname(__file__)
+STATE = os.path.join(BASE, "rate_state.json")
+
+DEFAULT_RATE = 10
+
+def _load():
+    if os.path.exists(STATE):
+        with open(STATE,"r",encoding="utf-8") as f: return json.load(f)
+    return {"actors": {}}
+
+def _save(obj):
+    with open(STATE,"w",encoding="utf-8") as f: json.dump(obj, f, indent=2)
+
+def _rate_from_policy(policy):
+    if not policy: return DEFAULT_RATE
+    for p in policy:
+        if isinstance(p, str) and p.startswith("rate:tokens="):
+            try: return max(1, int(p.split("=",1)[1]))
+            except: return DEFAULT_RATE
+    return DEFAULT_RATE
+
+def check_and_consume(actor: str, policy) -> dict:
+    data = _load()
+    now = time.time()
+    rate = _rate_from_policy(policy)
+    cap = rate
+    actor_state = data["actors"].setdefault(actor, {"tokens": cap, "last_ts": now})
+    elapsed = now - actor_state["last_ts"]
+    refill = (elapsed/60.0)*rate
+    tokens = min(cap, actor_state["tokens"] + refill)
+    if tokens < 1.0:
+        remaining = int(max(0, 60 - elapsed))
+        return {"ok": False, "error": "rate_limited", "retry_in_s": remaining, "rate_per_min": rate}
+    tokens -= 1.0
+    actor_state["tokens"] = tokens
+    actor_state["last_ts"] = now
+    _save(data)
+    return {"ok": True, "rate_per_min": rate, "tokens_left": tokens}
+""".replace("SEAL_TAG", SEAL).replace("STAMP_TAG", STAMP)
+write(os.path.join(ROOT, "integrity", "rate.py"), rate_py)
+
+# 3) patch executor
+exec_path = os.path.join(ROOT, "golem_engine", "executor_v336.py")
+with open(exec_path, "r", encoding="utf-8") as f:
+    ex_src = f.read()
+if "v340: token-bucket" not in ex_src:
+    ex_src = ex_src.replace(
+        "    g = Golem()",
+        "    g = Golem()\n    # v340: token-bucket rate enforcement per actor\n    from ..integrity.rate import check_and_consume\n    actor = order.get('actor','anon')\n    rate_result = check_and_consume(actor, policy)\n    if not rate_result.get('ok'):\n        return {\"ok\": False, \"error\": \"rate_limited\", **rate_result}"
+    )
+    ex_src = ex_src.replace(
+        '    rec["journal_path"] = path',
+        '    rec["journal_path"] = path\n    # v340: pack portable receipt envelope\n    try:\n        from ..integrity.receipt_pack import pack as _pack\n        rec["receipt_path"] = _pack(rec)\n    except Exception:\n        pass\n'
+    )
+    write(exec_path, ex_src)
+
+# 4) Bridge Console HTML (no braces in format literals)
+bridge_console = """
+<!doctype html>
+<html>
+<meta charset="utf-8">
+<title>Bridge Console — v340</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="codex/styles/codex.css">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px/1.5 ui-sans-serif,system-ui;margin:24px">
+<h1>✶ Bridge Console</h1>
+<p>This console mints <code>bridge_*</code> work orders using policy template <code>bridge-ok</code>. Executor will only accept them if ACL allows and policy contains <code>allow-bridge</code>.</p>
+
+<div class="card" style="padding:16px;border:1px solid #2a2a3a;border-radius:12px;margin-bottom:16px">
+  <h3>Create Bridge Order</h3>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <label>Secret (HMAC)<input id="secret" type="password" value="test" style="width:100%"></label>
+    <label>Actor<input id="actor" value="CFBK" style="width:100%"></label>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+    <label>Bridge Task
+      <select id="task" style="width:100%">
+        <option value="bridge_gpu">bridge_gpu</option>
+        <option value="bridge_asic">bridge_asic</option>
+        <option value="bridge_btc">bridge_btc</option>
+      </select>
+    </label>
+    <label>Params (JSON)
+      <textarea id="params" rows="3" style="width:100%">{}</textarea>
+    </label>
+  </div>
+  <div style="margin-top:12px">
+    <button id="mint">Mint Signed Order (bridge-ok)</button>
+  </div>
+  <pre id="orderOut"></pre>
+</div>
+
+<div class="card" style="padding:16px;border:1px solid #2a2a3a;border-radius:12px">
+  <h3>Verify Receipt</h3>
+  <p>Paste executor output JSON below; we will check for embedded <code>inclusion_proof</code> and presence of <code>receipt_path</code>.</p>
+  <textarea id="result" rows="8" style="width:100%"></textarea>
+  <div style="margin-top:8px"><button id="verify">Verify Embedded Proof</button></div>
+  <pre id="verifyOut"></pre>
+</div>
+
+<script>
+const TPL = ["no-network-writes","public-sources-only","allow-bridge","rate:tokens=2"];
+async function hmacHex(secret, obj){
+  const msg = JSON.stringify(obj, Object.keys(obj).sort());
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), {name:'HMAC', hash:'SHA-256'}, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
+  return Array.from(new Uint8Array(sig)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+document.getElementById('mint').onclick = async () => {
+  const actor = document.getElementById('actor').value || "CFBK";
+  const task = document.getElementById('task').value;
+  let params = {}; try { params = JSON.parse(document.getElementById('params').value || '{}'); } catch { alert('Params JSON invalid'); return; }
+  const order = {
+    version: "v340",
+    sealed_to: "SEAL_TAG",
+    id: crypto.randomUUID(),
+    ts_utc: new Date().toISOString().replace(/\\.\\d{3}Z$/,'Z'),
+    actor, task,
+    params, limits: {"cpu_ms": 2000, "net": false},
+    policy: TPL
+  };
+  order.hmac = await hmacHex(document.getElementById('secret').value, order);
+  document.getElementById('orderOut').textContent = JSON.stringify(order, null, 2);
+};
+
+function hexToBytes(hex){ const a=[]; for(let i=0;i<hex.length;i+=2)a.push(parseInt(hex.slice(i,i+2),16)); return new Uint8Array(a); }
+async function sha256cat(a,b){ const c=new Uint8Array(a.length+b.length); c.set(a,0); c.set(b,a.length); const dig=await crypto.subtle.digest('SHA-256', c); return Array.from(new Uint8Array(dig)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+
+document.getElementById('verify').onclick = async () => {
+  let obj; try { obj = JSON.parse(document.getElementById('result').value); } catch { document.getElementById('verifyOut').textContent = 'Invalid JSON'; return; }
+  if (!obj.inclusion_proof) { document.getElementById('verifyOut').textContent = 'No inclusion_proof found'; return; }
+  const pr = obj.inclusion_proof;
+  let cur = pr.target;
+  for (const hop of pr.path){
+    const L = hexToBytes(hop.sibling), R = hexToBytes(cur);
+    cur = (hop.side === "L") ? await sha256cat(L, R) : await sha256cat(R, L);
+  }
+  document.getElementById('verifyOut').textContent = 'Embedded proof resolves to leaf: ' + cur + (obj.receipt_path ? '\\nreceipt_path: '+obj.receipt_path : '');
+};
+</script>
+</body>
+</html>
+""".replace("SEAL_TAG", SEAL)
+write(os.path.join(ROOT, "bridge_console.html"), bridge_console)
+
+# 5) Docs
+notes = f"""
+# Codex v340 — Receipts 2.0, Bridge Console, Rate Enforcement
+
+- **Receipts 2.0**: `integrity/receipt_pack.py` bundles executor result + inclusion proof + notarization snapshot into portable envelopes in `integrity/receipts/`.
+- **Bridge Console UI**: `bridge_console.html` crafts signed `bridge_*` orders using `bridge-ok` template; verify embedded proof in returned results.
+- **Token-Bucket Rate Enforcement**: `integrity/rate.py` enforces `rate:tokens=N` hints per actor (default 10/min).
+- **Executor hooks**: v340 patches executor to apply rate limit and attach `receipt_path` upon success.
+- **Public Anchor (optional)**: notarization already emits Merkle root; you can mirror `integrity/release_notarization.json` to any immutable public store.
+Seal: {SEAL} — {STAMP}
+"""
+write(os.path.join(ROOT, "docs", "V340_NOTES.md"), notes)
+
+api = """
+# API v340
+- Executor returns on success:
+  - journal_sha256
+  - inclusion_proof (when available)
+  - receipt_path (portable envelope saved in integrity/receipts/)
+- Policy `rate:tokens=N` honored via token-bucket per actor.
+"""
+write(os.path.join(ROOT, "docs", "API_v340.md"), api)
+
+# 6) CI
+ci = """
+name: codex-v340-receipts-bridge
+on: [push, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Notarize first (for receipts snapshot)
+        run: python3 integrity/notarize_release.py
+      - name: Summarize (should pass, create receipt)
+        run: |
+          python3 work_orders/create_work_order.py --secret "t" --task summarize --params '{"text":"v340 receipt demo"}' --policy-template default --out wo.json
+          python3 -m golem_engine.executor_v336 wo.json > run.json
+          cat run.json
+          grep "receipt_path" run.json
+      - name: Bridge denied (no ACL allow)
+        run: |
+          python3 work_orders/create_work_order.py --secret "t" --task bridge_gpu --params '{}' --policy-template bridge-ok --out wo_bridge.json
+          python3 -m golem_engine.executor_v336 wo_bridge.json > run_bridge.json || true
+          cat run_bridge.json
+          grep "bridge_denied_dual_gate" run_bridge.json
+"""
+write(os.path.join(ROOT, ".github", "workflows", "codex_v340_receipts_bridge.yml"), ci)
+
+# 7) Reseal + verify + notarize + zip
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+verify_rc = subprocess.call(["python3", os.path.join(ROOT, "integrity", "codex_verifier.py")])
+subprocess.call(["python3", os.path.join(ROOT, "integrity", "notarize_release.py")])
+
+zip_path = "/mnt/data/codex_ascendant_v340_release.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, ROOT))
+
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("VERIFY_RC:", verify_rc)
+print("v340 ZIP:", "sandbox:"+zip_path)
+print("v340 SHA256:", "sandbox:"+zip_path+".sha256")
+print("Bridge Console:", "sandbox:"+os.path.join(ROOT, "bridge_console.html")){
+  "version": "v340",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "id": "a11d7b6d-4de9-4307-9511-47b063bfa4e4",
+  "ts_utc": "2025-11-06T19:00:55Z",
+  "actor": "CFBK",
+  "task": "bridge_gpu",
+  "params": {},
+  "limits": {
+    "cpu_ms": 2000,
+    "net": false
+  },
+  "policy": [
+    "no-network-writes",
+    "public-sources-only",
+    "allow-bridge",
+    "rate:tokens=2"
+  ],
+  "hmac": "ff214c6a94f5f4e49e5536c46d85874693f2a98912b425e64840607edd3dec5f"
+}{
+  "version": "v340",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "id": "68781832-9ad9-440e-b0fd-a25139d330d7",
+  "ts_utc": "2025-11-06T19:01:36Z",
+  "actor": "CFBK",
+  "task": "bridge_asic",
+  "params": {},
+  "limits": {
+    "cpu_ms": 2000,
+    "net": false
+  },
+  "policy": [
+    "no-network-writes",
+    "public-sources-only",
+    "allow-bridge",
+    "rate:tokens=2"
+  ],
+  "hmac": "e1e5ffad2b50ea3b5d9f3be6999d4f9498dae382b32962f6ec2281ba88dbfe52"
+}# v241.x — Monetization evolution: pricing engine, licensing, metering, checkout stubs,
+# BTC/Lightning hooks (stub), SKU catalog, revenue dashboard (static), docs, CI, and release zip.
+
+import os, json, hashlib, datetime, zipfile, textwrap
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+SEAL  = "calebfedorbykerkonev10271998"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# 1) Product catalog and pricing rules
+catalog = {
+  "version": "v241.x",
+  "sealed_to": SEAL,
+  "currency_default": "USD",
+  "skus": [
+    {"id":"codex-core", "name":"Codex Core", "type":"license", "term":"perpetual", "base_price": 199.0},
+    {"id":"codex-pro",  "name":"Codex Pro",  "type":"license", "term":"annual",    "base_price": 149.0},
+    {"id":"addon-proofs","name":"Proofs Pack","type":"addon", "term":"annual", "base_price": 49.0}
+  ]
+}
+write(os.path.join(ROOT, "commerce", "product_catalog.json"), json.dumps(catalog, indent=2))
+
+pricing_rules = {
+  "version":"v241.x",
+  "sealed_to": SEAL,
+  "currency_overrides": {"BTC": {"fx_source":"manual"}},
+  "discounts":[
+    {"rule":"launch-10", "type":"percent", "value":10, "applies_to":["codex-core","codex-pro","addon-proofs"]},
+    {"rule":"bundle-pro", "type":"bundle", "value":15, "bundle":["codex-pro","addon-proofs"]}
+  ],
+  "tax": {"vat_percent_default": 0.0, "regions": {"EU":{"vat_percent": 20.0}}}
+}
+write(os.path.join(ROOT, "commerce", "pricing_rules.json"), json.dumps(pricing_rules, indent=2))
+
+pricing_py = """
+# commerce/pricing.py — v241.x sealed
+import json, os
+
+CAT = os.path.join(os.path.dirname(__file__),'product_catalog.json')
+RULES = os.path.join(os.path.dirname(__file__),'pricing_rules.json')
+
+def _load(path):
+    with open(path,'r',encoding='utf-8') as f: return json.load(f)
+
+def price_quote(skus, currency='USD', region=None, fx_rate_btc=None, discounts=None):
+    cat = _load(CAT); rules = _load(RULES)
+    catmap = {x['id']:x for x in cat['skus']}
+    items = []; subtotal = 0.0
+    for sid in skus:
+        if sid not in catmap: raise ValueError('Unknown SKU: '+sid)
+        p = float(catmap[sid]['base_price']); items.append({'sku':sid,'price':p}); subtotal += p
+
+    # apply discounts
+    ds = discounts or []
+    for d in rules.get('discounts', []):
+        if d['type'] == 'percent' and d['rule'] in ds:
+            for it in items:
+                if it['sku'] in d['applies_to']:
+                    it['price'] *= (1 - d['value']/100.0)
+        if d['type'] == 'bundle' and d['rule'] in ds:
+            if all(any(it['sku']==x for it in items) for x in d['bundle']):
+                subtotal *= (1 - d['value']/100.0)
+
+    subtotal = sum(it['price'] for it in items)
+
+    # tax
+    vat = 0.0
+    if region and region in rules.get('tax',{}).get('regions',{}):
+        vatp = rules['tax']['regions'][region]['vat_percent']/100.0
+        vat = subtotal * vatp
+
+    total_usd = subtotal + vat
+
+    # currency conversion (simple)
+    out_currency = currency.upper()
+    total_out = total_usd
+    if out_currency == 'BTC':
+        if not fx_rate_btc or fx_rate_btc <= 0: raise ValueError('BTC fx rate required (USD per BTC).')
+        total_out = round(total_usd / fx_rate_btc, 8)  # BTC amount
+    return {
+        'currency': out_currency,
+        'items': items,
+        'subtotal_usd': round(subtotal,2),
+        'vat_usd': round(vat,2),
+        'total_'+('btc' if out_currency=='BTC' else 'usd'): total_out
+    }
+"""
+write(os.path.join(ROOT, "commerce", "pricing.py"), pricing_py)
+
+# 2) Licensing & metering
+license_manager = """
+# commerce/license_manager.py — v241.x sealed
+import os, json, time, hmac, hashlib
+
+STATE = os.path.join(os.path.dirname(__file__), 'licenses.json')
+
+def _load():
+    if os.path.exists(STATE):
+        with open(STATE,'r',encoding='utf-8') as f: return json.load(f)
+    return {'licenses': []}
+
+def _save(obj):
+    with open(STATE,'w',encoding='utf-8') as f: json.dump(obj, f, indent=2)
+
+def issue(user_id: str, sku: str, term_days: int, secret: str):
+    now = int(time.time())
+    lic = {'user_id':user_id,'sku':sku,'issued':now,'term_days':term_days}
+    tag = hmac.new(secret.encode(), json.dumps(lic, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+    lic['sig'] = tag
+    db = _load(); db['licenses'].append(lic); _save(db)
+    return lic
+
+def verify(lic: dict, secret: str) -> bool:
+    body = dict(lic); tag = body.pop('sig', None)
+    if not tag: return False
+    exp = hmac.new(secret.encode(), json.dumps(body, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(tag, exp): return False
+    # term check
+    now = int(time.time()); issued = lic['issued']; term = lic['term_days']*86400
+    return (now - issued) <= term
+"""
+write(os.path.join(ROOT, "commerce", "license_manager.py"), license_manager)
+
+metering_py = """
+# commerce/metering.py — v241.x sealed
+import os, json, time
+
+STATE = os.path.join(os.path.dirname(__file__), 'usage_log.json')
+
+def _load():
+    if os.path.exists(STATE):
+        with open(STATE,'r',encoding='utf-8') as f: return json.load(f)
+    return {'events': []}
+
+def _save(obj):
+    with open(STATE,'w',encoding='utf-8') as f: json.dump(obj, f, indent=2)
+
+def record(user_id: str, feature: str, amount: float=1.0):
+    db = _load()
+    db['events'].append({'ts': int(time.time()), 'user_id': user_id, 'feature': feature, 'amount': amount})
+    _save(db)
+    return True
+
+def aggregate(user_id: str=None, feature: str=None):
+    db = _load()
+    rows = db['events']
+    if user_id: rows = [r for r in rows if r['user_id']==user_id]
+    if feature: rows = [r for r in rows if r['feature']==feature]
+    total = sum(r['amount'] for r in rows)
+    return {'count': len(rows), 'total': total}
+"""
+write(os.path.join(ROOT, "commerce", "metering.py"), metering_py)
+
+# 3) Checkout stubs (Stripe webhook stub, BTCPay readme)
+stripe_stub = """
+# commerce/stripe_webhook_stub.py — v241.x sealed
+# This is a documentation/testing stub. In production, implement signature
+# verification and event handling according to Stripe docs.
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length','0'))
+        payload = self.rfile.read(length)
+        # TODO: verify Stripe-Signature header, then parse event
+        self.send_response(200); self.end_headers()
+        self.wfile.write(b'OK')
+
+if __name__ == '__main__':
+    HTTPServer(('0.0.0.0', 8787), Handler).serve_forever()
+"""
+write(os.path.join(ROOT, "commerce", "stripe_webhook_stub.py"), stripe_stub)
+
+btcpay_md = """
+# BTCPay/Lightning Integration (Stub)
+
+This repo ships with pricing and licensing ready; to accept BTC/Lightning:
+
+1. Deploy a **BTCPay Server** (self-hosted or a provider).
+2. Create a store and generate an API key.
+3. Map an invoice amount using `commerce/pricing.py` with `currency='BTC'` and your FX rate.
+4. On payment confirmation webhooks, call `commerce/license_manager.issue(...)` and deliver the license blob.
+5. Record usage with `commerce/metering.record(...)` for metered features.
+
+> For security: never trust client-provided totals; always re-quote server-side using your SKU catalog and pricing rules.
+"""
+write(os.path.join(ROOT, "commerce", "BTCPAY_README.md"), btcpay_md)
+
+# 4) Revenue dashboard (static, client-only using usage_log.json if hosted with JSON fetch allowed)
+dashboard_html = """
+<!doctype html>
+<html>
+<meta charset="utf-8">
+<title>Revenue Dashboard — v241.x</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px/1.5 ui-sans-serif,system-ui;margin:24px">
+<h1>✶ Revenue & Usage</h1>
+<p>Static viewer for <code>commerce/usage_log.json</code>. Drop this file alongside the JSON or serve both under the same origin.</p>
+<div>
+  <button id="load">Load usage_log.json</button>
+</div>
+<pre id="out"></pre>
+<script>
+document.getElementById('load').onclick = async () => {
+  try {
+    const r = await fetch('commerce/usage_log.json'); const j = await r.json();
+    const byUser = {};
+    for (const e of j.events) {
+      const u = (byUser[e.user_id] = byUser[e.user_id] || {});
+      u[e.feature] = (u[e.feature]||0) + e.amount;
+    }
+    document.getElementById('out').textContent = JSON.stringify({users: byUser, total_events: j.events.length}, null, 2);
+  } catch(err) {
+    document.getElementById('out').textContent = 'Could not load usage_log.json: ' + err;
+  }
+};
+</script>
+</body>
+</html>
+"""
+write(os.path.join(ROOT, "commerce", "revenue_dashboard.html"), dashboard_html)
+
+# 5) Docs
+docs = f"""
+# Monetization — v241.x
+
+Seal: {SEAL} — {STAMP}
+
+This module adds **pricing**, **licensing**, **metering**, and **checkout stubs**:
+
+- `commerce/product_catalog.json` — SKUs and base prices
+- `commerce/pricing_rules.json` — discounts, VAT, BTC FX hints
+- `commerce/pricing.py` — quotes in USD or BTC (supply FX rate)
+- `commerce/license_manager.py` — HMAC-signed licenses with expiry
+- `commerce/metering.py` — usage logging and aggregation
+- `commerce/stripe_webhook_stub.py` — placeholder for Stripe events
+- `commerce/BTCPAY_README.md` — guide for BTC/Lightning integration
+- `commerce/revenue_dashboard.html` — static usage/revenue viewer
+
+## Example
+
+```python
+from commerce.pricing import price_quote
+from commerce.license_manager import issue, verify
+from commerce.metering import record, aggregate
+
+q = price_quote(['codex-pro','addon-proofs'], currency='USD', region='EU', discounts=['bundle-pro'])
+lic = issue('user-123', 'codex-pro', term_days=365, secret='supersecret')
+ok = verify(lic, 'supersecret')
+record('user-123','proofs.verify', 1)
+tot = aggregate('user-123','proofs.verify')
+```
+
+Wire the license issuance to your payment confirmation webhooks (Stripe/BTCPay).
+"""
+write(os.path.join(ROOT, "docs", "V241x_MONETIZATION.md"), docs)
+
+# 6) CI (lint-level smoke: import + a quote + license issue + metering)
+ci = """
+name: codex-v241x-monetization
+on: [push, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Pricing, License, Metering smoke
+        run: |
+          python - <<'PY'
+from commerce.pricing import price_quote
+from commerce.license_manager import issue, verify
+from commerce.metering import record, aggregate
+q = price_quote(['codex-pro','addon-proofs'], currency='USD', region='EU', discounts=['bundle-pro'])
+assert 'subtotal_usd' in q
+lic = issue('user-xyz','codex-pro',365,'s3cr3t')
+assert verify(lic,'s3cr3t')
+record('user-xyz','proofs.verify', 2)
+a = aggregate('user-xyz','proofs.verify')
+assert a['total'] >= 2
+print("OK")
+PY
+"""
+write(os.path.join(ROOT, ".github", "workflows", "codex_v241x_monetization.yml"), ci)
+
+# 7) Package release
+zip_path = "/mnt/data/codex_ascendant_v241x_monetization.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            # Only include commerce + docs + workflow for this release slice
+            if not any(seg in p for seg in ["/commerce/", "V241x_MONETIZATION.md", "codex_v241x_monetization.yml"]):
+                continue
+            z.write(p, os.path.relpath(p, ROOT))
+
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("V241.x monetization ZIP:", "sandbox:"+zip_path)
+print("SHA256:", "sandbox:"+zip_path+".sha256")# v340.x evolution — Compact Receipts, Signature & Verify tools, Bridge Console verify-to-root,
+# Docs, CI, reseal/verify, and release zip (delta slice).
+
+import os, json, hashlib, datetime, zipfile, subprocess, time
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# 1) Compact receipt export + optional Ed25519 signing
+minify_py = """
+# integrity/receipt_minify.py
+# v340.x sealed to SEAL_TAG @ STAMP_TAG
+# Creates compact .receipt.min.json and (optionally) an ed25519 signature sidecar
+# Usage:
+#   python3 integrity/receipt_minify.py <receipt.json> [--sign <priv_hex>]
+import sys, json, os
+OUTDIR = os.path.join(os.path.dirname(__file__), "receipts")
+def _minify(inp_path, priv_hex=None):
+    with open(inp_path, "r", encoding="utf-8") as f: env = json.load(f)
+    slim = {
+        "v":"340x",
+        "seal": env.get("sealed_to"),
+        "ts": env.get("ts_utc"),
+        "root": env.get("notarization",{}).get("merkle_root"),
+        "j": env.get("result",{}).get("journal_sha256"),
+        "task": env.get("result",{}).get("task"),
+        "ok": env.get("result",{}).get("ok", True),
+        "proof": env.get("result",{}).get("inclusion_proof")
+    }
+    base = os.path.splitext(os.path.basename(inp_path))[0]
+    outp = os.path.join(OUTDIR, base + ".min.json")
+    with open(outp, "w", encoding="utf-8") as f: json.dump(slim, f, separators=(',',':'))
+    sigp = None
+    if priv_hex:
+        try:
+            from nacl.signing import SigningKey
+            sk = SigningKey(bytes.fromhex(priv_hex))
+            sig = sk.sign(json.dumps(slim, separators=(',',':')).encode()).signature.hex()
+            sigp = outp + ".ed25519"
+            with open(sigp, "w") as f: f.write(sig)
+        except Exception as e:
+            print("WARN: ed25519 signing unavailable:", e)
+    return outp, sigp
+if __name__ == "__main__":
+    if len(sys.argv)<2:
+        print("usage: python3 integrity/receipt_minify.py <receipt.json> [--sign <priv_hex>]"); raise SystemExit(2)
+    path = sys.argv[1]
+    priv = None
+    if len(sys.argv)>=4 and sys.argv[2]=="--sign":
+        priv = sys.argv[3]
+    outp, sigp = _minify(path, priv)
+    print(outp)
+    if sigp: print(sigp)
+""".replace("SEAL_TAG", SEAL).replace("STAMP_TAG", STAMP)
+write(os.path.join(ROOT, "integrity", "receipt_minify.py"), minify_py)
+
+verify_py = """
+# integrity/receipt_verify.py
+# v340.x sealed to SEAL_TAG @ STAMP_TAG
+# Verifies compact receipt, optional ed25519 signature, and inclusion_proof against a given root.
+# Usage:
+#   python3 integrity/receipt_verify.py <receipt.min.json> [--pub <pub_hex>] [--root <merkle_root_hex>]
+import sys, json, os
+def verify_sig(path, pub_hex):
+    try:
+        from nacl.signing import VerifyKey
+    except Exception as e:
+        print("WARN: ed25519 verify unavailable:", e); return None
+    sigp = path + ".ed25519"
+    if not os.path.exists(sigp): return False
+    with open(sigp,"r") as f: sig = bytes.fromhex(f.read().strip())
+    with open(path,"rb") as f: data = f.read()
+    vk = VerifyKey(bytes.fromhex(pub_hex))
+    try:
+        vk.verify(data, sig); return True
+    except Exception:
+        return False
+def verify_proof(rec, root_hex):
+    pr = rec.get("proof"); 
+    if not pr or not root_hex: return None
+    import hashlib
+    def hb(h): return bytes.fromhex(h)
+    cur = pr["target"]
+    for hop in pr["path"]:
+        L = hb(hop["sibling"]); R = hb(cur)
+        cat = (L+R) if hop["side"]=="L" else (R+L)
+        cur = hashlib.sha256(cat).hexdigest()
+    return cur.lower() == root_hex.lower()
+if __name__ == "__main__":
+    if len(sys.argv)<2:
+        print("usage: python3 integrity/receipt_verify.py <receipt.min.json> [--pub <pub_hex>] [--root <merkle_root_hex>]"); raise SystemExit(2)
+    p = sys.argv[1]; pub=None; root=None
+    if "--pub" in sys.argv:
+        pub = sys.argv[sys.argv.index("--pub")+1]
+    if "--root" in sys.argv:
+        root = sys.argv[sys.argv.index("--root")+1]
+    with open(p,"r",encoding="utf-8") as f: rec = json.load(f)
+    out = {"sig_verified": None, "proof_ok": None}
+    if pub: out["sig_verified"] = verify_sig(p, pub)
+    if root: out["proof_ok"] = verify_proof(rec, root)
+    print(json.dumps(out))
+""".replace("SEAL_TAG", SEAL).replace("STAMP_TAG", STAMP)
+write(os.path.join(ROOT, "integrity", "receipt_verify.py"), verify_py)
+
+# 2) Bridge Console: add root-based verification UI
+bc_path = os.path.join(ROOT, "bridge_console.html")
+if os.path.exists(bc_path):
+    with open(bc_path,"a",encoding="utf-8") as f:
+        f.write("""
+<!-- v340.x add: verify-to-root input -->
+<section class="card" style="padding:16px;border:1px solid #2a2a3a;border-radius:12px;margin-top:16px">
+  <h3>Verify to Notarization Root</h3>
+  <p>Paste Merkle root from <code>integrity/release_notarization.json</code> to check embedded proof resolves to it.</p>
+  <input id="root" placeholder="Merkle root hex" style="width:100%">
+  <button id="verifyToRoot" style="margin-top:8px">Verify Against Root</button>
+  <pre id="vtrOut"></pre>
+</section>
+<script>
+document.getElementById('verifyToRoot').onclick = async () => {
+  let obj; try { obj = JSON.parse(document.getElementById('result').value); } catch { document.getElementById('vtrOut').textContent='Result JSON invalid'; return; }
+  const root = document.getElementById('root').value.trim();
+  if (!obj.inclusion_proof || !root) { document.getElementById('vtrOut').textContent='Missing proof or root'; return; }
+  function hexToBytes(hex){ const a=[]; for(let i=0;i<hex.length;i+=2)a.push(parseInt(hex.slice(i,i+2),16)); return new Uint8Array(a); }
+  async function sha256cat(a,b){ const c=new Uint8Array(a.length+b.length); c.set(a,0); c.set(b,a.length); const dig=await crypto.subtle.digest('SHA-256', c); return Array.from(new Uint8Array(dig)).map(b=>b.toString(16).padStart(2,'0')).join(''); }
+  let cur = obj.inclusion_proof.target;
+  for (const hop of obj.inclusion_proof.path){
+    const L = hexToBytes(hop.sibling), R = hexToBytes(cur);
+    cur = (hop.side === "L") ? await sha256cat(L, R) : await sha256cat(R, L);
+  }
+  document.getElementById('vtrOut').textContent = (cur.toLowerCase()===root.toLowerCase()) ? 'VALID ✅' : 'INVALID ❌ (got '+cur+')';
+};
+</script>
+""")
+
+# 3) Docs
+notes = f"""
+# Codex v340.x — Compact Receipts & Verify-to-Root
+
+- **Compact Receipts**: `integrity/receipt_minify.py` outputs `{{
+  "v":"340x","seal":"...", "ts":"...", "root":"...", "j":"<journal_sha256>", "task":"...", "ok":true, "proof":{{...}}
+}}` plus optional `.ed25519` signature sidecar (if PyNaCl installed).
+- **Receipt Verify**: `integrity/receipt_verify.py` can verify signature and check the embedded inclusion proof against a provided Merkle root.
+- **Bridge Console**: new section to verify embedded proofs directly against the notarization root.
+Seal: {SEAL} — {STAMP}
+"""
+write(os.path.join(ROOT, "docs", "V340x_NOTES.md"), notes)
+
+# 4) CI
+ci = """
+name: codex-v340x-receipts-verify
+on: [push, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Notarize -> Run -> Pack -> Minify
+        run: |
+          python3 integrity/notarize_release.py
+          python3 work_orders/create_work_order.py --secret "t" --task summarize --params '{"text":"v340x"}' --policy-template default --out wo.json
+          python3 -m golem_engine.executor_v336 wo.json > run.json
+          python3 - <<'PY'
+import json, os
+from integrity.receipt_pack import pack
+with open('run.json','r') as f: res = json.load(f)
+rp = pack(res)
+print(rp)
+PY
+          python3 - <<'PY'
+import json, glob, subprocess
+from integrity.receipt_minify import _minify
+p = sorted(glob.glob('integrity/receipts/receipt_*.json'))[-1]
+print(_minify(p))
+PY
+      - name: Verify compact receipt structure (no ed25519 required)
+        run: |
+          python3 - <<'PY'
+import json, glob
+p = sorted(glob.glob('integrity/receipts/receipt_*.min.json'))[-1]
+with open('integrity/release_notarization.json','r') as f: root = json.load(f)['merkle_root']
+with open(p,'r') as f: rec = json.load(f)
+assert rec['root'] == root
+print("OK")
+PY
+"""
+write(os.path.join(ROOT, ".github", "workflows", "codex_v340x_receipts_verify.yml"), ci)
+
+# 5) Package release slice
+zip_path = "/mnt/data/codex_ascendant_v340x_release.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for relpath in [
+        "integrity/receipt_minify.py",
+        "integrity/receipt_verify.py",
+        "docs/V340x_NOTES.md",
+        ".github/workflows/codex_v340x_receipts_verify.yml",
+        "bridge_console.html"
+    ]:
+        p = os.path.join(ROOT, relpath)
+        if os.path.exists(p):
+            z.write(p, relpath)
+
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("v340.x ZIP:", "sandbox:"+zip_path)
+print("v340.x SHA256:", "sandbox:"+zip_path+".sha256")
