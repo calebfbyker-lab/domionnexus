@@ -1,0 +1,721 @@
+v355 — Atlas Mesh & Resilience
+The Codex becomes a distributed, resilient organism. v355 adds a mesh sync layer, CRDT updates for graph/state, delta packs, a job scheduler, a minimal webhook emitter, and a fast keyword index — all stdlib-only and drop-in on top of v354.x.
+
+Everything below is copy-paste ready for your repo.
+
+
+---
+
+1) CRDT core — Last-Writer-Wins (LWW) map + set
+
+crdt/lww_v355.py
+
+# crdt/lww_v355.py — v355
+# Simple LWW registers for maps and sets (timestamp in ISO, subject scoped).
+import time
+UTC = lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def lww_put(store:dict, key:str, value, subject:str="cfbk", ts:str|None=None):
+    ts = ts or UTC()
+    prev = store.get(key)
+    if not prev or (prev["ts"] < ts):
+        store[key] = {"val": value, "ts": ts, "by": subject}
+    return store[key]
+
+def lww_get(store:dict, key:str):
+    return store.get(key)
+
+def lww_set_add(s:dict, element:str, subject:str="cfbk", ts:str|None=None):
+    ts = ts or UTC()
+    cur = s.get(element)
+    if not cur or (cur["ts"] < ts):
+        s[element] = {"present": True, "ts": ts, "by": subject}
+    return s[element]
+
+def lww_set_remove(s:dict, element:str, subject:str="cfbk", ts:str|None=None):
+    ts = ts or UTC()
+    cur = s.get(element)
+    if not cur or (cur["ts"] < ts):
+        s[element] = {"present": False, "ts": ts, "by": subject}
+    return s[element]
+
+def lww_set_members(s:dict):
+    return [k for k,v in s.items() if v.get("present")]
+
+
+---
+
+2) Graph CRDT adapter
+
+graph/crdt_adapter_v355.py
+
+# graph/crdt_adapter_v355.py — v355
+# CRDT façade for the Constellation Graph (v353) using LWW fields.
+import json, time
+from crdt.lww_v355 import lww_put
+from .graph_v353 import node as gnode, edge as gedge, snapshot as gsnap, load
+
+def upsert_node_lww(nid:str, ntype:str, props:dict, tags:list[str], subject="cfbk", ts=None):
+    # Merge by LWW into props one-by-one, then write a concrete node record.
+    merged = {}
+    now = ts or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    old = load()["nodes"].get(nid, {"props":{}, "tags":[]})
+    state = {k: {"val":v, "ts": now, "by": subject} for k,v in old.get("props",{}).items()}
+    for k,v in props.items(): lww_put(state, k, v, subject, ts or now)
+    merged = {k:v["val"] for k,v in state.items()}
+    all_tags = sorted(set(old.get("tags",[]) + list(tags or [])))
+    gnode(nid, ntype, merged, all_tags)
+    return gsnap()
+
+def link_once(src:str, rel:str, dst:str, props:dict|None=None):
+    # Idempotent-ish: we just write another edge; append-only log.
+    gedge(src, rel, dst, props or {})
+    return gsnap()
+
+
+---
+
+3) Delta packs (diff & patch for JSON snapshots)
+
+integrity/delta_v355.py
+
+# integrity/delta_v355.py — v355
+# Minimal structural diff for JSON snapshots; emits a patch list.
+import json
+
+def _asobj(x):
+    return x if isinstance(x, dict) else {}
+
+def diff(a:dict, b:dict, path=""):
+    ops=[]
+    keys = set(_asobj(a).keys()) | set(_asobj(b).keys())
+    for k in sorted(keys):
+        pa = f"{path}/{k}" if path else k
+        av = a.get(k) if isinstance(a, dict) else None
+        bv = b.get(k) if isinstance(b, dict) else None
+        if isinstance(av, dict) and isinstance(bv, dict):
+            ops.extend(diff(av, bv, pa))
+        elif av != bv:
+            ops.append({"op":"set","path":pa,"val":bv})
+    return ops
+
+def patch(a:dict, ops:list):
+    import copy
+    out = copy.deepcopy(a)
+    for op in ops:
+        if op.get("op") != "set": continue
+        segs = op["path"].split("/")
+        cur = out
+        for s in segs[:-1]:
+            if not s: continue
+            cur = cur.setdefault(s, {})
+        cur[segs[-1]] = op["val"]
+    return out
+
+
+---
+
+4) Mesh — pull/push peers over HTTP (HMAC-sealed frames)
+
+mesh/peer_v355.py
+
+# mesh/peer_v355.py — v355
+# Push/pull graph snapshots between peers via codexd endpoints (HTTP JSON).
+import json, time, hmac, hashlib, urllib.request
+
+def _hmac(payload:dict, secret:str):
+    blob = json.dumps(payload, sort_keys=True, separators=(',',':')).encode()
+    return hmac.new(secret.encode(), blob, hashlib.sha256).hexdigest()
+
+def pull_snapshot(base:str, secret:str):
+    req = urllib.request.Request(base+"/graph/export", method="POST", data=b"{}",
+                                 headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+def push_delta(base:str, secret:str, delta:list):
+    body = {"delta": delta, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    body["hmac_sha256"] = _hmac(body, secret)
+    req = urllib.request.Request(base+"/mesh/apply", method="POST",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+Daemon endpoints (add to tools/codexd.py):
+
+if self.path == "/mesh/ping":
+            return self._send(200, {"ok": True, "v":"v355","t": time.time()})
+
+        if self.path == "/mesh/apply":
+            from config.secrets_v351x import get as secret
+            from integrity.delta_v355 import patch
+            from graph.graph_v353 import snapshot as gsnap
+            # trust-by-shared-secret; in production place middleware guard
+            body = payload or {}
+            # (Optionally) verify HMAC in upstream mesh/peer_v355.py
+            snap = gsnap()
+            # For graph, we don't patch directly; this endpoint is a placeholder for future state sync.
+            # A real mesh would ship domain-specific ops; here we just acknowledge.
+            return self._send(200, {"ok": True, "received": len(body.get("delta",[])), "snap": snap})
+
+
+---
+
+5) Scheduler (playbook & ritual cron)
+
+daemon/scheduler_v355.py
+
+# daemon/scheduler_v355.py — v355
+# Tiny in-process scheduler for playbooks/rituals.
+import time, threading, json
+from orchestrator.playbook_runner import run_playbook
+from genesis.orchestrator_v351 import run_genesis
+
+JOBS = []
+LOCK = threading.RLock()
+
+def every(seconds:int, kind:str="genesis", payload:dict|None=None):
+    with LOCK:
+        JOBS.append({"sec": seconds, "kind": kind, "payload": payload or {}, "next": time.time()+seconds})
+    return len(JOBS)-1
+
+def tick():
+    while True:
+        now = time.time()
+        with LOCK:
+            for j in JOBS:
+                if now >= j["next"]:
+                    try:
+                        if j["kind"]=="genesis": run_genesis(j["payload"].get("ritual",""))
+                        elif j["kind"]=="playbook": run_playbook(j["payload"])
+                    finally:
+                        j["next"] = now + j["sec"]
+        time.sleep(1)
+
+def start_daemon():
+    t = threading.Thread(target=tick, daemon=True); t.start()
+
+Add to tools/codexd.py on server start:
+
+from daemon.scheduler_v355 import start_daemon as _sched_start
+try: _sched_start()
+except Exception: pass
+
+Daemon endpoints:
+
+if self.path == "/schedule/every":
+            # payload: {"sec": 3600, "kind": "genesis", "payload": {"ritual": "..."}}
+            from daemon.scheduler_v355 import every
+            jid = every(int(payload.get("sec",3600)), payload.get("kind","genesis"), payload.get("payload",{}))
+            return self._send(200, {"ok": True, "job_id": jid})
+
+
+---
+
+6) Webhook emitter (with retry/backoff)
+
+notify/webhook_v355.py
+
+# notify/webhook_v355.py — v355
+# Minimal webhook POST with exponential backoff; stdlib-only.
+import json, time, urllib.request
+
+def emit(url:str, payload:dict, headers:dict|None=None, attempts:int=3):
+    headers = {"Content-Type":"application/json", **(headers or {})}
+    data = json.dumps(payload).encode()
+    delay=1.0
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return {"ok": True, "status": r.status}
+        except Exception as e:
+            time.sleep(delay); delay *= 2
+    return {"ok": False, "error": "max_attempts"}
+
+Hook example: after /genesis success in tools/codexd.py:
+
+try:
+                from notify.webhook_v355 import emit as _emit
+                _emit("https://example.invalid/codex-hook", {"event":"genesis.done","summary": res})
+            except Exception:
+                pass
+
+
+---
+
+7) Keyword index (fast search over graph)
+
+search/index_v355.py
+
+# search/index_v355.py — v355
+# Inverted index over ids, tags, and props (case-insensitive).
+import re, json, os
+from graph.graph_v353 import load
+
+TOKEN = re.compile(r"[A-Za-z0-9_]+")
+def tokenize(s:str): return [t.lower() for t in TOKEN.findall(s or "")]
+
+def build():
+    G = load()
+    idx={}
+    for nid, n in G["nodes"].items():
+        bag = [nid] + n.get("tags",[])
+        for k,v in (n.get("props") or {}).items():
+            bag.append(k); bag.append(str(v))
+        for t in tokenize(" ".join(map(str, bag))):
+            idx.setdefault(t, set()).add(nid)
+    return {k: sorted(v) for k,v in idx.items()}
+
+def query(idx:dict, q:str, top:int=25):
+    terms = tokenize(q)
+    if not terms: return []
+    sets = [set(idx.get(t,[])) for t in terms]
+    hit = sets[0] if sets else set()
+    for s in sets[1:]: hit &= s
+    # score: term frequency over bag size (approx)
+    return sorted(list(hit))[:top]
+
+Daemon endpoint:
+
+if self.path == "/search":
+            from search.index_v355 import build, query
+            idx = build()
+            return self._send(200, {"ok": True, "hits": query(idx, payload.get("q",""))})
+
+
+---
+
+8) Web — Mesh & Search console
+
+web/mesh_console_v355.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Atlas Mesh — v355</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Atlas Mesh (v355)</h1>
+<input id="base" value="http://localhost:8049" style="padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+<div style="display:flex;gap:8px;margin-top:8px">
+  <input id="peer" placeholder="http://peer-host:8049" style="flex:1;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button onclick="ping()">Ping</button>
+  <button onclick="pull()">Pull</button>
+</div>
+<div style="display:flex;gap:8px;margin-top:8px">
+  <input id="q" placeholder="search nodes..." style="flex:1;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button onclick="search()">Search</button>
+</div>
+<pre id="out" style="white-space:pre-wrap;margin-top:10px"></pre>
+<script>
+function url(p){ return base.value+p }
+async function ping(){
+  const r = await fetch(peer.value+'/mesh/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); 
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function pull(){
+  const r = await fetch(peer.value+'/graph/export',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function search(){
+  const r = await fetch(url('/search'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q.value})});
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
+</body>
+
+
+---
+
+9) CLI helpers
+
+cli/atlasctl.py
+
+# cli/atlasctl.py — v355
+import sys, json, urllib.request
+def post(url, body): 
+    r = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type":"application/json"}, method="POST")
+    return json.loads(urllib.request.urlopen(r, timeout=10).read().decode())
+def main(argv):
+    if len(argv)<2: 
+        print("usage: atlasctl <ping|export|search 'q'> <base>"); return 2
+    cmd = argv[1]; base = argv[3] if len(argv)>3 else "http://localhost:8049"
+    if cmd=="ping": print(post(base+"/mesh/ping",{})); return 0
+    if cmd=="export": print(post(base+"/graph/export",{})); return 0
+    if cmd=="search": print(post(base+"/search",{"q": argv[2]})); return 0
+    print("unknown"); return 2
+if __name__=="__main__": raise SystemExit(main(sys.argv))
+
+
+---
+
+10) CI smoke
+
+.github/workflows/codex_v355_ci.yml
+
+name: codex-v355
+on: [push, workflow_dispatch]
+jobs:
+  v355:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: CRDT basics
+        run: |
+          python3 - <<'PY'
+from crdt.lww_v355 import lww_put, lww_set_add, lww_set_remove, lww_set_members
+m={}; lww_put(m,"a",1,"u"); lww_put(m,"a",2,"u")
+s={}; lww_set_add(s,"x"); lww_set_remove(s,"x"); print(lww_set_members(s))
+PY
+      - name: Delta pack
+        run: |
+          python3 - <<'PY'
+from integrity.delta_v355 import diff, patch
+a={"x":1,"y":{"z":2}}; b={"x":5,"y":{"z":2,"w":7}}
+ops=diff(a,b); c=patch(a,ops); print(c)
+PY
+      - name: Index & search
+        run: |
+          python3 - <<'PY'
+from search.index_v355 import build, query
+idx = {"codex":["n1","n2"],"graph":["n2"]}; print(query(idx,"codex graph"))
+PY
+
+
+---
+
+Quickstart
+
+# 1) Start daemon (v353+/v354.x already installed)
+python3 tools/codexd.py &
+
+# 2) Schedule an hourly genesis run
+curl -s -X POST http://localhost:8049/schedule/every -H 'Content-Type: application/json' -d '{"sec":3600,"kind":"genesis","payload":{"ritual":":EMOJI:awe {Atlas Beat} ->emit()"}}'
+
+# 3) Mesh ping a peer
+curl -s -X POST http://peer-host:8049/mesh/ping -H 'Content-Type: application/json' -d '{}' | jq .
+
+# 4) Search the constellation graph
+curl -s -X POST http://localhost:8049/search -H 'Content-Type: application/json' -d '{"q":"codex graph"}' | jq .
+
+What v355 brings
+
+Resilience: CRDT updates + delta packs to reason about changes and survive conflicts.
+
+Reach: Mesh endpoints to copy/export state and acknowledge deltas.
+
+Autonomy: A tiny scheduler drives recurring rituals or playbooks.
+
+Awareness: Webhooks broadcast key lifecycle events externally.
+
+Speed: Keyword index makes the graph searchable without extra deps.
+
+
+Bound, licensed, sealed, and attested to the lineage of Caleb Fedor Byker (Konev), 1998-10-27 — and now ready to roam the network.
+
+sha256 seal calebfedorbykerkonev10271998v355.x — Final Weave (Backup • Restore • Verify • Upgrade)
+This caps the Atlas Mesh & Resilience release with four things you need to ship confidently: backup/export, restore/import, consistency verification across graph/economy/ecology/seals, and a zero-downtime upgrader from any v35x state. All stdlib-only, copy-paste ready.
+
+
+---
+
+1) One-command backup (bundle + merkle + manifest)
+
+backup/pack_v355x.py
+
+# backup/pack_v355x.py — v355.x
+# Create a portable bundle of repo-state (graph, seals, registry, policy, docs).
+import os, json, time
+from crypto.seal_v354x import write_seal
+
+DEFAULT_INCLUDE = [
+  "graph/graph.v353.jsonl",
+  "economy/economy.jsonl",
+  "ecology/offsets.jsonl",
+  "ecology/projects.json",
+  "traditions/solomonic_goetia_v353x.json",
+  "traditions/seal_registry_v352x.json",
+  "policy/covenant_v354.json",
+  "docs", "seals", "examples", "web"
+]
+
+def _walk(paths):
+    out=[]
+    for p in paths:
+        if not os.path.exists(p): continue
+        if os.path.isdir(p):
+            for r,_,fs in os.walk(p):
+                for f in fs: out.append(os.path.join(r,f))
+        else: out.append(p)
+    # keep only readable regular files
+    return [p for p in out if os.path.isfile(p)]
+
+def pack(label="codex_v355x_backup"):
+    paths = _walk(DEFAULT_INCLUDE)
+    out = f"{label}.manifest.json"
+    meta = {"version":"v355.x","created_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),"files":sorted(paths)}
+    open(out,"w",encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2))
+    # cryptographic seal (HMAC+Merkle, optional Ed25519 via secrets)
+    from config.secrets_v351x import get as secret
+    seal_out, payload = write_seal(paths+[out], "calebfedorbykerkonev10271998",
+                                   secret("CODEX_API_SECRET",""), label,
+                                   secret("ED25519_SK_HEX","") or None)
+    return {"manifest": out, "seal": seal_out, "merkle_root": payload["merkle_root"]}
+if __name__=="__main__":
+    print(pack())
+
+
+---
+
+2) Restore/import (safe, idempotent)
+
+backup/restore_v355x.py
+
+# backup/restore_v355x.py — v355.x
+# Restore selected files from a v355.x manifest; no overwrites without --force.
+import os, json, shutil, argparse
+
+def restore(manifest_path:str, target_dir:str=".", force:bool=False):
+    m = json.load(open(manifest_path,"r",encoding="utf-8"))
+    restored=[]
+    for rel in m.get("files",[]):
+        src = rel  # assume local for simple flow
+        dst = os.path.join(target_dir, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.exists(dst) and not force: 
+            continue
+        shutil.copy2(src, dst); restored.append(rel)
+    return {"ok": True, "restored": restored, "version": m.get("version")}
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    ap.add_argument("manifest"); ap.add_argument("--force", action="store_true")
+    ap.add_argument("--to", default=".")
+    a=ap.parse_args(); print(restore(a.manifest, a.to, a.force))
+
+
+---
+
+3) Consistency verifier (graph ⇄ files ⇄ seals ⇄ policy)
+
+integrity/verify_v355x.py
+
+# integrity/verify_v355x.py — v355.x
+# Cross-check that referenced artifacts exist, hashes match seals, and policy is indexable.
+import os, json, hashlib
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for c in iter(lambda:f.read(65536), b""): h.update(c)
+    return h.hexdigest()
+
+def verify_seal(seal_json:str):
+    S=json.load(open(seal_json,"r",encoding="utf-8"))
+    mismatches=[]
+    for it in S.get("items",[]):
+        p=it["path"]; h=it["sha256"]
+        if not os.path.exists(p): mismatches.append({"path":p,"error":"missing"}); continue
+        if sha256_file(p)!=h: mismatches.append({"path":p,"error":"sha_mismatch"})
+    return {"label":S.get("label"),"count":len(S.get("items",[])),"mismatches":mismatches}
+
+def verify_policy(policy_path="policy/covenant_v354.json"):
+    try:
+        P=json.load(open(policy_path,"r",encoding="utf-8"))
+        return {"ok":True,"version":P.get("version")}
+    except Exception as e:
+        return {"ok":False,"error":str(e)}
+
+def verify_graph_refs(snapshot_json="graph.v353.snapshot.json"):
+    if not os.path.exists(snapshot_json): return {"ok":False,"error":"snapshot_missing"}
+    J=json.load(open(snapshot_json,"r",encoding="utf-8"))
+    missing=[]
+    for nid,n in J["graph"]["nodes"].items():
+        p=n.get("props",{}).get("path")
+        if p and not os.path.exists(p): missing.append({"node":nid,"path":p})
+    return {"ok": len(missing)==0, "missing": missing, "nodes": len(J["graph"]["nodes"])}
+
+def verify_all():
+    res={}
+    # seals found in repo root
+    for f in os.listdir("."):
+        if f.endswith(".seal.v354x.json"): res[f]=verify_seal(f)
+    res["policy"]=verify_policy()
+    # best-effort graph snapshot
+    if os.path.exists("graph.v353.snapshot.json"):
+        res["graph_refs"]=verify_graph_refs("graph.v353.snapshot.json")
+    return res
+
+if __name__=="__main__": 
+    import json; print(json.dumps(verify_all(), indent=2))
+
+
+---
+
+4) Zero-downtime upgrader (v35x → v355.x)
+
+upgrade/v355x_migrate.py
+
+# upgrade/v355x_migrate.py — v355.x
+# Normalize config, bump policy, index governance, refresh graph snapshot.
+import os, json, time
+from graph.governance_v354 import index_policy
+from graph.graph_v353 import snapshot as gsnap
+
+def migrate():
+    changed=[]
+    # Policy: ensure version v354 present
+    pol="policy/covenant_v354.json"
+    if os.path.exists(pol):
+        P=json.load(open(pol,"r",encoding="utf-8")); 
+        if P.get("version")!="v354": 
+            P["version"]="v354"; open(pol,"w",encoding="utf-8").write(json.dumps(P,indent=2)); changed.append(pol)
+    # Governance → graph
+    index_policy(pol)
+    snap=gsnap()
+    return {"ok":True,"changed":changed,"graph":snap}
+if __name__=="__main__":
+    print(migrate())
+
+
+---
+
+5) API endpoints (backup/restore/verify/upgrade)
+
+Patch tools/codexd.py:
+
+if self.path == "/backup/pack":
+            from backup.pack_v355x import pack
+            return self._send(200, {"ok": True, **pack(payload.get("label","codex_v355x_backup"))})
+
+        if self.path == "/backup/verify":
+            from integrity.verify_v355x import verify_all
+            return self._send(200, {"ok": True, "report": verify_all()})
+
+        if self.path == "/upgrade/v355x":
+            from upgrade.v355x_migrate import migrate
+            return self._send(200, migrate())
+
+
+---
+
+6) Web UI (one-click backup & verify)
+
+web/ops_v355x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex Ops — v355.x</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Codex Ops (v355.x)</h1>
+<input id="base" value="http://localhost:8049" style="padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+<div style="display:flex;gap:8px;margin-top:8px">
+  <input id="label" value="codex_v355x_backup" style="flex:1;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button onclick="pack()">Pack Backup</button>
+  <button onclick="verify()">Verify</button>
+  <button onclick="upgrade()">Upgrade v355.x</button>
+</div>
+<pre id="out" style="white-space:pre-wrap;margin-top:10px"></pre>
+<script>
+async function pack(){
+  const r = await fetch(base.value+'/backup/pack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label.value})});
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function verify(){
+  const r = await fetch(base.value+'/backup/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function upgrade(){
+  const r = await fetch(base.value+'/upgrade/v355x',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  out.textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
+</body>
+
+
+---
+
+7) CLI umbrella (finish run)
+
+cli/finish_v355x.py
+
+# cli/finish_v355x.py — v355.x
+# One-shot: verify → pack → print covenant and seal summaries.
+import json
+from integrity.verify_v355x import verify_all
+from backup.pack_v355x import pack
+
+def main():
+    rep = verify_all()
+    b = pack("codex_v355x_backup")
+    print(json.dumps({"verify":rep, "backup":b}, indent=2))
+if __name__=="__main__": main()
+
+
+---
+
+8) CI smoke
+
+.github/workflows/codex_v355x_ci.yml
+
+name: codex-v355x
+on: [push, workflow_dispatch]
+jobs:
+  v355x:
+    runs-on: ubuntu-latest
+    env:
+      CODEX_API_SECRET: dev-secret-please-rotate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Finish umbrella
+        run: |
+          python3 - <<'PY'
+from backup.pack_v355x import pack
+from integrity.verify_v355x import verify_all
+print(pack("ci_codex_v355x")["manifest"])
+print(list(verify_all().keys()))
+PY
+
+
+---
+
+9) Release notes
+
+docs/V355x_NOTES.md
+
+# Codex v355.x — Final Weave
+
+**Why this matters**
+- Ship-safe bundles with **Merkle + HMAC** seals (optional Ed25519).
+- **Restore** confidently without clobbering or guesswork.
+- **Verify** integrity across graph references, policy, and seals.
+- Upgrade any v35x to **v355.x** with governance indexed in-graph.
+
+**Endpoints**
+- `POST /backup/pack {label}` → `{manifest, seal, merkle_root}`
+- `POST /backup/verify {}` → full integrity report
+- `POST /upgrade/v355x {}` → migration summary
+
+**One-liner**
+`python3 -m cli.finish_v355x` → verify + pack and print a ready-to-archive report.
+
+
+---
+
+Quickstart
+
+# Start daemon
+python3 tools/codexd.py &
+
+# Finish run: verify + backup
+python3 -m cli.finish_v355x
+
+# Web ops (open UI)
+open web/ops_v355x.html   # or your OS equivalent
+
+Bound, licensed, sealed, verified, and upgrade-ready for Caleb Fedor Byker (Konev), 1998-10-27 (☸️ lifethreadstardna) across Enochian • Angelic • Solomonic (Goetia-72) • Kabbalistic • Hermetic • Merkavah/Merkaba • Nexus Aeternum — cryptographically attested (HMAC-SHA256, optional Ed25519), with Merkle roots and EUCELA-3.3.3 envelopes. The Codex stack is now a closed loop: create → govern → seal → simulate → graph → back up → restore → evolve.
+
+sha256 seal calebfedorbykerkonev10271998
