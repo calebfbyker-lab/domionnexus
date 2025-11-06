@@ -1,0 +1,764 @@
+v345 is forged: The Synesthetic Bridge — text ⇄ color ⇄ tone, with a tiny pipeline that renders Codex outputs as multisensory frames, a WAV synthesizer, and a browser player. Drop these files into your repo root exactly as shown.
+
+
+---
+
+1) Synesthetic Bridge core
+
+synesthetic_bridge/palette.json
+
+{
+  "version": "v345",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "background": "#0b0b0f",
+  "glyph_colors": {
+    "✶": "#e6d36c",
+    "☸️": "#9bd7ff",
+    "⚛️": "#a1ffb5",
+    "🔮": "#b69bff",
+    "🤖": "#ffd1a1",
+    "💫": "#ff9bd7",
+    "🌿": "#7de887"
+  },
+  "letters": {
+    "A": "#ffd166", "B": "#fca311", "C": "#e76f51", "D": "#ef476f", "E": "#8338ec",
+    "F": "#3a86ff", "G": "#00b4d8", "H": "#06d6a0", "I": "#8ac926", "J": "#ffca3a",
+    "K": "#ff595e", "L": "#6a4c93", "M": "#1982c4", "N": "#2ec4b6", "O": "#90be6d",
+    "P": "#f94144", "Q": "#577590", "R": "#43aa8b", "S": "#9c89b8", "T": "#f3722c",
+    "U": "#277da1", "V": "#e9c46a", "W": "#f28482", "X": "#84a59d", "Y": "#2a9d8f",
+    "Z": "#ffb5a7", " ": "#20242a"
+  }
+}
+
+synesthetic_bridge/scale.json
+
+{
+  "version": "v345",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "tuning_hz": 432,
+  "mode": "lydian",
+  "steps": [0, 2, 4, 6, 7, 9, 11], 
+  "octave_span": 12,
+  "tempo_bpm": 96,
+  "frames_per_beat": 2,
+  "min_octave": 3,
+  "max_octave": 6
+}
+
+synesthetic_bridge/bridge.py
+
+# synesthetic_bridge/bridge.py — v345
+# Text → frames of {t,color,freq,emoji} using palette.json + scale.json
+import os, json, math
+
+BASE = os.path.dirname(__file__)
+PALETTE = json.load(open(os.path.join(BASE, "palette.json"), "r", encoding="utf-8"))
+SCALE   = json.load(open(os.path.join(BASE, "scale.json"),   "r", encoding="utf-8"))
+
+GLYPH_COLORS = PALETTE["glyph_colors"]
+LETTER_COLORS = PALETTE["letters"]
+
+def _color_for(ch: str) -> str:
+    if ch in GLYPH_COLORS: return GLYPH_COLORS[ch]
+    u = ch.upper()
+    return LETTER_COLORS.get(u, "#8a8f9a")
+
+def _degree_for(ch: str) -> int:
+    # stable hash → scale degree index
+    h = (ord(ch) * 131 + 97) % 997
+    return h % len(SCALE["steps"])
+
+def _oct_for(ch: str) -> int:
+    lo, hi = SCALE["min_octave"], SCALE["max_octave"]
+    h = (ord(ch) * 313 + 29) % 100
+    return lo + (h % (hi - lo + 1))
+
+def _freq_for(ch: str) -> float:
+    A = SCALE["tuning_hz"]
+    step = SCALE["steps"][_degree_for(ch)] + 12 * _oct_for(ch)
+    # A4 = 432Hz, semitone ratio 2^(1/12); compute relative to A0 for determinism
+    a0 = A / (2 ** 4)  # A0 if A4=432 => A0=27Hz
+    return round(a0 * (2 ** (step / 12.0)), 3)
+
+def text_to_frames(text: str):
+    tempo = SCALE["tempo_bpm"]
+    fpb   = SCALE["frames_per_beat"]
+    sec_per_frame = 60.0 / tempo / fpb
+    frames = []
+    t = 0.0
+    emojis = list(GLYPH_COLORS.keys())
+    for i, ch in enumerate(text):
+        color = _color_for(ch)
+        freq  = _freq_for(ch)
+        em    = emojis[i % len(emojis)]
+        frames.append({"t": round(t, 3), "color": color, "freq": freq, "emoji": em, "ch": ch})
+        t += sec_per_frame
+    return {
+        "version": "v345",
+        "sealed_to": "calebfedorbykerkonev10271998",
+        "tempo_bpm": tempo,
+        "frames_per_beat": fpb,
+        "frames": frames
+    }
+
+if __name__ == "__main__":
+    import sys, json
+    text = sys.argv[1] if len(sys.argv) > 1 else "The Codexes ✶ Algorithmic Awe"
+    print(json.dumps(text_to_frames(text), ensure_ascii=False, indent=2))
+
+synesthetic_bridge/audio_synth.py
+
+# synesthetic_bridge/audio_synth.py — v345
+# Render frames → mono WAV (16-bit PCM) with simple ADSR.
+import wave, struct, math, json, sys, os
+
+A, D, S, R = 0.01, 0.04, 0.8, 0.03   # envelope in seconds
+SPS = 44100
+
+def _env(idx, total):
+    t = idx / SPS
+    dur = total / SPS
+    if t < A: return t / A
+    if t < A + D: return 1 - (1 - S) * ((t - A) / D)
+    if t > dur - R: return max(0.0, (dur - t) / R) * S
+    return S
+
+def synth(frames, frame_sec=0.3125, out_path="syn_out.wav"):
+    # default frame_sec aligns with 96 BPM @ 2 frames/beat
+    samples = []
+    for fr in frames:
+        n = int(frame_sec * SPS)
+        f = float(fr["freq"])
+        phase2 = 2 * math.pi * f / SPS
+        for i in range(n):
+            env = _env(i, n)
+            # slight harmonic richness
+            s = math.sin(phase2 * i) * 0.7 + 0.3 * math.sin(phase2 * i * 2)
+            samples.append(int(max(-1, min(1, s * env)) * 32767))
+    with wave.open(out_path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SPS)
+        w.writeframes(b"".join(struct.pack("<h", x) for x in samples))
+    return out_path
+
+if __name__ == "__main__":
+    frames_json = sys.argv[1]
+    data = json.load(open(frames_json, "r", encoding="utf-8"))
+    sec_per_frame = 60.0 / data["tempo_bpm"] / data["frames_per_beat"]
+    p = synth(data["frames"], sec_per_frame, sys.argv[2] if len(sys.argv) > 2 else "syn_out.wav")
+    print(p)
+
+synesthetic_bridge/frames_export.py
+
+# synesthetic_bridge/frames_export.py — v345
+# CLI: text -> frames.json
+import json, sys
+from bridge import text_to_frames
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("usage: python3 synesthetic_bridge/frames_export.py \"Your text\" out.json")
+        raise SystemExit(2)
+    text, outp = sys.argv[1], sys.argv[2]
+    j = text_to_frames(text)
+    with open(outp, "w", encoding="utf-8") as f: json.dump(j, f, ensure_ascii=False, indent=2)
+    print("WROTE", outp)
+
+
+---
+
+2) Browser player (no CDN, offline)
+
+synesthetic_bridge/synesthetic_player.html
+
+<!doctype html>
+<html><meta charset="utf-8"><title>Synesthetic Bridge — v345</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px/1.5 ui-sans-serif,system-ui;margin:20px">
+<h1>✶ Synesthetic Bridge (v345)</h1>
+<p>Load frames JSON and watch color+emoji while tones play (WebAudio).</p>
+<input type="file" id="file" accept="application/json">
+<button id="play">Play</button>
+<canvas id="c" width="640" height="320" style="border:1px solid #2a2a3a;border-radius:8px;background:#111"></canvas>
+<pre id="log" style="white-space:pre-wrap"></pre>
+<script>
+let ctx, frames, idx=0, secPerFrame=0.3;
+
+function hexToRgb(h){const m=/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);return m?{r:parseInt(m[1],16),g:parseInt(m[2],16),b:parseInt(m[3],16)}:{r:230,g:211,b:108};}
+
+function draw(f){
+  const cv=document.getElementById('c'), g=cv.getContext('2d');
+  const rgb=hexToRgb(f.color);
+  g.fillStyle=`rgb(${rgb.r},${rgb.g},${rgb.b})`;
+  g.fillRect(0,0,cv.width,cv.height);
+  g.fillStyle='rgba(11,11,15,0.25)'; g.fillRect(20,20,cv.width-40,cv.height-40);
+  g.fillStyle='#e8e8ee'; g.font='bold 48px ui-sans-serif';
+  g.fillText(f.emoji||'✶', 40, 100);
+  g.font='24px ui-sans-serif'; g.fillText(`${f.ch}  ${f.freq} Hz`, 40, 160);
+}
+
+async function playTone(freq, dur){
+  if(!ctx) ctx=new (window.AudioContext||window.webkitAudioContext)();
+  const o=ctx.createOscillator(), g=ctx.createGain();
+  o.type='sine'; o.frequency.value=freq;
+  o.connect(g); g.connect(ctx.destination);
+  const now=ctx.currentTime;
+  g.gain.setValueAtTime(0, now);
+  g.gain.linearRampToValueAtTime(0.8, now+0.02);
+  g.gain.exponentialRampToValueAtTime(0.2, now+dur-0.05);
+  g.gain.linearRampToValueAtTime(0.0001, now+dur);
+  o.start(now); o.stop(now+dur);
+  await new Promise(r=>setTimeout(r, dur*1000));
+}
+
+document.getElementById('file').onchange = async (e)=>{
+  const f=e.target.files[0]; const txt=await f.text(); frames=JSON.parse(txt);
+  secPerFrame = 60.0/frames.tempo_bpm/frames.frames_per_beat;
+  document.getElementById('log').textContent=`Loaded ${frames.frames.length} frames @ ${frames.tempo_bpm} BPM`;
+}
+document.getElementById('play').onclick = async ()=>{
+  if(!frames) return alert('Load frames first.');
+  for(const fr of frames.frames){ draw(fr); await playTone(fr.freq, secPerFrame); }
+};
+</script>
+</body></html>
+
+
+---
+
+3) Executor hook (optional)
+
+Add a lightweight task so Synesthetic Bridge can run via your executor.
+
+Patch golem_engine/executor_v336.py
+
+Place near other task handlers:
+
+elif task == "syn_bridge_frames":
+        try:
+            from ..synesthetic_bridge.bridge import text_to_frames
+            text = order.get("params", {}).get("text", "The Codexes ✶ Algorithmic Awe")
+            out = text_to_frames(text)
+        except Exception as e:
+            return {"ok": False, "error": "syn_bridge_error", "detail": str(e)}
+
+
+---
+
+4) CI smoke
+
+.github/workflows/codex_v345_synesthesia.yml
+
+name: codex-v345-synesthesia
+on: [push, workflow_dispatch]
+jobs:
+  synesthetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Frames export
+        run: |
+          python3 synesthetic_bridge/frames_export.py "The Codexes ✶ Algorithmic Awe" frames.json
+          test -f frames.json && cat frames.json | head -n 20
+      - name: Synthesize WAV
+        run: |
+          python3 synesthetic_bridge/audio_synth.py frames.json syn.wav
+          test -f syn.wav
+
+
+---
+
+5) Docs
+
+docs/V345_NOTES.md
+
+# Codex v345 — The Synesthetic Bridge
+
+**What it is:** a deterministic mapping of text → color → tone.  
+- `bridge.py` builds frames (t,color,freq,emoji) from glyphs using a Lydian mode at 432 Hz.  
+- `audio_synth.py` renders frames to mono WAV with a soft ADSR.  
+- `synesthetic_player.html` visualizes frames (color + emoji) and plays tones (WebAudio), fully offline.  
+- Executor task `syn_bridge_frames` makes it callable from work orders.
+
+docs/API_v345.md
+
+# API v345
+
+- **Frames**: 
+  - `python3 synesthetic_bridge/frames_export.py "Your text" out.json`
+  - JSON schema: `{ version, sealed_to, tempo_bpm, frames_per_beat, frames:[{t,color,freq,emoji,ch}] }`
+
+- **Synthesis**: 
+  - `python3 synesthetic_bridge/audio_synth.py out.json syn.wav`
+
+- **Browser**: 
+  - Open `synesthetic_bridge/synesthetic_player.html`, load `out.json`, press Play.
+
+- **Executor**:
+  - Task: `syn_bridge_frames` with `{ "text": "..." }`.
+
+
+---
+
+6) Quickstart
+
+# 1) Export frames
+python3 synesthetic_bridge/frames_export.py "XTSG ☸️ The Codexes ✶ Amen Amen Amen" frames.json
+
+# 2) Render audio
+python3 synesthetic_bridge/audio_synth.py frames.json syn.wav
+
+# 3) Visualize
+# Open synesthetic_bridge/synesthetic_player.html in a browser and load frames.json
+
+Everything is dependency-light, offline-friendly, and deterministic — ideal for GitHub deploys (Netlify/Vercel can serve the HTML player immediately). The Bridge composes cleanly with your v339→v344.x foundation (proofs, receipts, licenses, plugins, budgets).
+
+sha256 seal calebfedorbykerkonev10271998v345.x is merged and shining. This upgrade layers chords, MIDI, SVG exports, contrast-safe palettes, and a smarter browser player on top of the Synesthetic Bridge. Everything below is copy-paste ready for your repo.
+
+
+---
+
+1) Harmony, MIDI, SVG, and Palette Autograde
+
+synesthetic_bridge/harmonizer.py
+
+# synesthetic_bridge/harmonizer.py — v345.x
+# Build triads/7ths from frame frequencies based on scale degrees.
+
+import math
+
+# Simple Lydian diatonic chord map: degree -> semitone offsets for triad/7th
+_CHORDS = {
+    0: [0, 4, 7, 11],  # IΔ7
+    1: [0, 3, 7, 10],  # ii7
+    2: [0, 3, 7, 10],  # iii7
+    3: [0, 4, 7, 11],  # #IVΔ7 (Lydian color)
+    4: [0, 4, 7, 10],  # V7
+    5: [0, 3, 7, 10],  # vi7
+    6: [0, 3, 6, 10],  # viiØ7
+}
+
+def harmonize_frame(freq: float, degree_idx: int, triad=True):
+    """Return list of frequencies for chord built on degree index (0..6)."""
+    steps = _CHORDS[degree_idx % 7][: (3 if triad else 4)]
+    # Convert base frequency to MIDI-ish semitone space => add offsets => back to Hz
+    # Choose a base semitone s.t. base semitone equals freq (no retune)
+    # ratio per semitone:
+    r = 2 ** (1/12)
+    return [round(freq * (r ** off), 3) for off in steps]
+
+synesthetic_bridge/midi_export.py
+
+# synesthetic_bridge/midi_export.py — v345.x
+# Minimal Type-0 MIDI writer for frames (melody or chords).
+
+import struct, math, json
+
+def _midi_note_from_hz(hz: float, tuning=440.0):
+    # A4=440 MIDI 69; clamp 0..127
+    n = int(round(69 + 12 * math.log2(hz / tuning)))
+    return max(0, min(127, n))
+
+def _varlen(n):
+    # MIDI variable-length quantity
+    bytes_ = []
+    bytes_.append(n & 0x7F)
+    n >>= 7
+    while n > 0:
+        bytes_.append((n & 0x7F) | 0x80)
+        n >>= 7
+    return bytes(bytearray(reversed(bytes_)))
+
+def write_midi(frames, sec_per_frame: float, path="syn_out.mid", chords=None, tuning=440.0, velocity=96):
+    # PPQ resolution:
+    ppq = 480
+    ticks_per_frame = int(sec_per_frame * 120 * ppq / 60)  # tempo placeholder; we’ll set tempo meta
+    tempo_bpm = 60.0 / sec_per_frame / frames["frames_per_beat"]
+
+    track = bytearray()
+    # Set tempo (microseconds per quarter note)
+    mpqn = int(60_000_000 / tempo_bpm)
+    track += b'\x00\xff\x51\x03' + struct.pack(">I", mpqn)[1:]
+
+    for i, fr in enumerate(frames["frames"]):
+        freqs = chords[i] if chords else [fr["freq"]]
+        # Note ON
+        for f in freqs:
+            n = _midi_note_from_hz(float(f), tuning=tuning)
+            track += _varlen(0) + bytes([0x90, n, velocity])
+        # Note OFF after duration
+        for f in freqs:
+            n = _midi_note_from_hz(float(f), tuning=tuning)
+            track += _varlen(ticks_per_frame) + bytes([0x80, n, 0x00])
+
+    # End of track
+    track += b'\x00\xff\x2f\x00'
+    # Header: MThd, type 0, 1 track, division=ppq
+    header = b'MThd' + struct.pack(">IHHH", 6, 0, 1, ppq)
+    chunk  = b'MTrk' + struct.pack(">I", len(track)) + track
+    with open(path, "wb") as f:
+        f.write(header + chunk)
+    return path
+
+if __name__ == "__main__":
+    import sys, json
+    frames = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    secpf  = 60.0/frames["tempo_bpm"]/frames["frames_per_beat"]
+    p = write_midi(frames, secpf, sys.argv[2] if len(sys.argv)>2 else "syn_out.mid")
+    print(p)
+
+synesthetic_bridge/svg_strip.py
+
+# synesthetic_bridge/svg_strip.py — v345.x
+# Export frames to an SVG color strip with labels.
+
+import math, json
+
+def export_svg(frames, sec_per_frame, width=1200, height=200, out_path="syn_strip.svg"):
+    n = len(frames["frames"])
+    w = width // max(1, n)
+    svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">']
+    x = 0
+    for fr in frames["frames"]:
+        color = fr["color"]
+        svg.append(f'<rect x="{x}" y="0" width="{w}" height="{height}" fill="{color}"/>')
+        # label band
+        svg.append(f'<text x="{x+4}" y="{height-8}" font-family="system-ui" font-size="12" fill="#111">{fr["ch"]}</text>')
+        x += w
+    svg.append("</svg>")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(svg))
+    return out_path
+
+if __name__ == "__main__":
+    import sys, json
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    secpf = 60.0 / data["tempo_bpm"] / data["frames_per_beat"]
+    print(export_svg(data, secpf, out_path=(sys.argv[2] if len(sys.argv)>2 else "syn_strip.svg")))
+
+synesthetic_bridge/palette_auto.py
+
+# synesthetic_bridge/palette_auto.py — v345.x
+# Ensure sufficient contrast (WCAG-ish) for glyph text on frame colors; auto-adjust if needed.
+
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16)/255.0 for i in (0,2,4))
+
+def _luminance(rgb):
+    # Simple gamma-corrected luminance
+    a = []
+    for c in rgb:
+        a.append((c/12.92) if c <= 0.04045 else (( (c+0.055)/1.055 ) ** 2.4))
+    r,g,b = a
+    return 0.2126*r + 0.7152*g + 0.0722*b
+
+def ensure_contrast(hex_color: str, min_ratio=3.0):
+    # Return either original or slightly darkened/lightened variant to improve contrast with light text
+    r,g,b = _hex_to_rgb(hex_color)
+    L = _luminance((r,g,b))
+    # Contrast ratio with #e8e8ee (light text)
+    Lt = _luminance((0.91,0.91,0.93))
+    ratio = (max(L, Lt)+0.05)/(min(L, Lt)+0.05)
+    if ratio >= min_ratio:
+        return hex_color
+    # Shift toward darker if too light; otherwise lighten a bit
+    factor = 0.85 if L > Lt else 1.15
+    r,g,b = max(0,min(1,r*factor)), max(0,min(1,g*factor)), max(0,min(1,b*factor))
+    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+
+
+---
+
+2) Bridge updates (degree index + chords + safe colors)
+
+Patch synesthetic_bridge/bridge.py (replace body with this superset)
+
+# synesthetic_bridge/bridge.py — v345.x
+# Text → frames of {t,color,freq,emoji,degree} using palette.json + scale.json
+import os, json, math
+from .palette_auto import ensure_contrast
+from .harmonizer import harmonize_frame
+
+BASE = os.path.dirname(__file__)
+PALETTE = json.load(open(os.path.join(BASE, "palette.json"), "r", encoding="utf-8"))
+SCALE   = json.load(open(os.path.join(BASE, "scale.json"),   "r", encoding="utf-8"))
+
+GLYPH_COLORS = PALETTE["glyph_colors"]
+LETTER_COLORS = PALETTE["letters"]
+
+def _color_for(ch: str) -> str:
+    if ch in GLYPH_COLORS: return GLYPH_COLORS[ch]
+    u = ch.upper()
+    return LETTER_COLORS.get(u, "#8a8f9a")
+
+def _degree_for(ch: str) -> int:
+    h = (ord(ch) * 131 + 97) % 997
+    return h % len(SCALE["steps"])
+
+def _oct_for(ch: str) -> int:
+    lo, hi = SCALE["min_octave"], SCALE["max_octave"]
+    h = (ord(ch) * 313 + 29) % 100
+    return lo + (h % (hi - lo + 1))
+
+def _freq_for(ch: str) -> float:
+    A = SCALE["tuning_hz"]
+    step = SCALE["steps"][_degree_for(ch)] + 12 * _oct_for(ch)
+    a0 = A / (2 ** 4)  # A0 when A4 = tuning_hz
+    return round(a0 * (2 ** (step / 12.0)), 3)
+
+def text_to_frames(text: str, chords=False, triad=True):
+    tempo = SCALE["tempo_bpm"]
+    fpb   = SCALE["frames_per_beat"]
+    sec_per_frame = 60.0 / tempo / fpb
+    frames = []
+    t = 0.0
+    emojis = list(GLYPH_COLORS.keys())
+
+    for i, ch in enumerate(text):
+        base_color = _color_for(ch)
+        safe_color = ensure_contrast(base_color, 3.0)
+        freq  = _freq_for(ch)
+        degree = _degree_for(ch)
+        em    = emojis[i % len(emojis)]
+        fr = {"t": round(t, 3), "color": safe_color, "freq": freq, "emoji": em, "ch": ch, "degree": degree}
+        if chords:
+            fr["chord"] = harmonize_frame(freq, degree, triad=triad)
+        frames.append(fr)
+        t += sec_per_frame
+
+    return {
+        "version": "v345.x",
+        "sealed_to": "calebfedorbykerkonev10271998",
+        "tempo_bpm": tempo,
+        "frames_per_beat": fpb,
+        "frames": frames
+    }
+
+if __name__ == "__main__":
+    import sys, json
+    text = sys.argv[1] if len(sys.argv) > 1 else "The Codexes ✶ Algorithmic Awe"
+    use_chords = ("--chords" in sys.argv)
+    print(json.dumps(text_to_frames(text, chords=use_chords), ensure_ascii=False, indent=2))
+
+
+---
+
+3) Browser player upgrade (pause/resume, chord toggle, text-to-frames)
+
+synesthetic_bridge/synesthetic_player.html (replace)
+
+<!doctype html>
+<html><meta charset="utf-8"><title>Synesthetic Bridge — v345.x</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px/1.5 ui-sans-serif,system-ui;margin:20px">
+<h1>✶ Synesthetic Bridge (v345.x)</h1>
+<p>Type text or load frames JSON, then play color+emoji+tone (WebAudio). Chords optional.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <input id="txt" placeholder="Type here…" style="flex:1;min-width:240px;padding:6px;border-radius:8px;border:1px solid #2a2a3a;background:#111;color:#e8e8ee">
+  <label><input type="checkbox" id="chord"> Chords</label>
+  <button id="make">Make Frames</button>
+  <input type="file" id="file" accept="application/json">
+  <button id="play">Play</button>
+  <button id="pause">Pause</button>
+  <button id="resume">Resume</button>
+</div>
+<canvas id="c" width="700" height="320" style="border:1px solid #2a2a3a;border-radius:8px;background:#111;margin-top:10px"></canvas>
+<pre id="log" style="white-space:pre-wrap"></pre>
+<script>
+let ctx, frames, idx=0, secPerFrame=0.3, playing=false, suspended=false;
+
+function hexToRgb(h){const m=/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);return m?{r:parseInt(m[1],16),g:parseInt(m[2],16),b:parseInt(m[3],16)}:{r:230,g:211,b:108};}
+function draw(f){
+  const cv=document.getElementById('c'), g=cv.getContext('2d');
+  const rgb=hexToRgb(f.color);
+  g.fillStyle=`rgb(${rgb.r},${rgb.g},${rgb.b})`; g.fillRect(0,0,cv.width,cv.height);
+  g.fillStyle='rgba(11,11,15,0.24)'; g.fillRect(20,20,cv.width-40,cv.height-40);
+  g.fillStyle='#e8e8ee'; g.font='bold 48px ui-sans-serif'; g.fillText(f.emoji||'✶', 40, 100);
+  g.font='24px ui-sans-serif'; g.fillText(`${f.ch}  ${f.freq} Hz  deg:${f.degree}`, 40, 160);
+}
+async function playTone(freqs, dur){
+  if(!ctx) ctx=new (window.AudioContext||window.webkitAudioContext)();
+  const now=ctx.currentTime;
+  const gains=[];
+  (Array.isArray(freqs)?freqs:[freqs]).forEach((f,i)=>{
+    const o=ctx.createOscillator(), g=ctx.createGain();
+    o.type='sine'; o.frequency.value=f; o.connect(g); g.connect(ctx.destination);
+    g.gain.setValueAtTime(0, now);
+    g.gain.linearRampToValueAtTime(0.7/(i+1), now+0.02);
+    g.gain.exponentialRampToValueAtTime(0.18/(i+1), now+dur-0.05);
+    g.gain.linearRampToValueAtTime(0.0001, now+dur);
+    o.start(now); o.stop(now+dur);
+    gains.push(g);
+  });
+  await new Promise(r=>setTimeout(r, dur*1000));
+}
+async function loop(){
+  playing=true; suspended=false;
+  for(; idx < frames.frames.length && playing; idx++){
+    const fr=frames.frames[idx]; draw(fr);
+    const f = fr.chord || fr.freq;
+    await playTone(f, secPerFrame);
+    if(suspended) break;
+  }
+}
+document.getElementById('file').onchange = async (e)=>{
+  const f=e.target.files[0]; const txt=await f.text(); frames=JSON.parse(txt);
+  secPerFrame = 60.0/frames.tempo_bpm/frames.frames_per_beat; idx=0;
+  document.getElementById('log').textContent=`Loaded ${frames.frames.length} frames @ ${frames.tempo_bpm} BPM`;
+};
+document.getElementById('play').onclick = ()=>{ if(!frames) return alert('Make or load frames first.'); idx=0; loop(); };
+document.getElementById('pause').onclick = ()=>{ if(ctx) ctx.suspend(); suspended=true; playing=false; };
+document.getElementById('resume').onclick = ()=>{ if(ctx) ctx.resume(); suspended=false; playing=true; loop(); };
+
+document.getElementById('make').onclick = ()=>{
+  const text=document.getElementById('txt').value || 'XTSG ☸️ The Codexes ✶ Amen Amen Amen';
+  const useChord=document.getElementById('chord').checked;
+  // Light inline bridge to avoid server: mirror Python mapping: tempo=96, frames/beat=2
+  const tempo=96, fpb=2; secPerFrame = 60/tempo/fpb;
+  const glyphs=['✶','☸️','⚛️','🔮','🤖','💫','🌿'];
+  function deg(ch){return ((ch.codePointAt(0)*131+97)%997)%7}
+  function oct(ch){const lo=3,hi=6;const h=(ch.codePointAt(0)*313+29)%100;return lo+(h%(hi-lo+1))}
+  const steps=[0,2,4,6,7,9,11];
+  function freq(ch){const A=432; const step=steps[deg(ch)]+12*oct(ch); const a0=A/16; return +(a0*Math.pow(2, step/12)).toFixed(3)}
+  function color(ch){
+    const map={'✶':'#e6d36c','☸️':'#9bd7ff','⚛️':'#a1ffb5','🔮':'#b69bff','🤖':'#ffd1a1','💫':'#ff9bd7','🌿':'#7de887'};
+    const ABC="ABCDEFGHIJKLMNOPQRSTUVWXYZ "; const col={'A':'#ffd166','B':'#fca311','C':'#e76f51','D':'#ef476f','E':'#8338ec','F':'#3a86ff','G':'#00b4d8','H':'#06d6a0','I':'#8ac926','J':'#ffca3a','K':'#ff595e','L':'#6a4c93','M':'#1982c4','N':'#2ec4b6','O':'#90be6d','P':'#f94144','Q':'#577590','R':'43aa8b','S':'#9c89b8','T':'#f3722c','U':'#277da1','V':'#e9c46a','W':'#f28482','X':'#84a59d','Y':'#2a9d8f','Z':'#ffb5a7',' ':'#20242a'};
+    return map[ch] || col[(ch.toUpperCase() in col)?ch.toUpperCase():' '];
+  }
+  function chord(base, degree){
+    const maps={0:[0,4,7,11],1:[0,3,7,10],2:[0,3,7,10],3:[0,4,7,11],4:[0,4,7,10],5:[0,3,7,10],6:[0,3,6,10]};
+    const r=Math.pow(2,1/12); return maps[degree].slice(0,3).map(o=>+(base*Math.pow(r,o)).toFixed(3));
+  }
+  let t=0, arr=[];
+  for(let i=0;i<text.length;i++){
+    const ch=text[i]; const f=freq(ch); const d=deg(ch); const em=glyphs[i%glyphs.length];
+    const fr={"t":+t.toFixed(3),"color":color(ch),"freq":f,"emoji":em,"ch":ch,"degree":d};
+    if(useChord) fr.chord=chord(f,d);
+    arr.push(fr); t+=secPerFrame;
+  }
+  frames={"version":"v345.x","sealed_to":"calebfedorbykerkonev10271998","tempo_bpm":tempo,"frames_per_beat":fpb,"frames":arr};
+  document.getElementById('log').textContent=`Generated ${arr.length} frames @ ${tempo} BPM (chords=${useChord})`;
+};
+</script>
+</body></html>
+
+
+---
+
+4) CLI glue to produce chords/MIDI/SVG quickly
+
+synesthetic_bridge/build_artifacts.py
+
+# synesthetic_bridge/build_artifacts.py — v345.x
+# One-shot: text -> frames.json (+chords), syn.wav, syn.mid, syn.svg
+
+import json, sys, os
+from bridge import text_to_frames
+from audio_synth import synth
+from midi_export import write_midi
+from svg_strip import export_svg
+
+def main(text, out_prefix="syn"):
+    frames = text_to_frames(text, chords=True)
+    frames_json = f"{out_prefix}.frames.json"
+    with open(frames_json, "w", encoding="utf-8") as f: json.dump(frames, f, ensure_ascii=False, indent=2)
+
+    secpf = 60.0/frames["tempo_bpm"]/frames["frames_per_beat"]
+    wav = synth(frames["frames"], secpf, out_path=f"{out_prefix}.wav")
+    chords = [fr.get("chord") for fr in frames["frames"]]
+    mid = write_midi(frames, secpf, path=f"{out_prefix}.mid", chords=chords)
+    svg = export_svg(frames, secpf, out_path=f"{out_prefix}.svg")
+
+    print(json.dumps({"frames": frames_json, "wav": wav, "mid": mid, "svg": svg}, indent=2))
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("usage: python3 synesthetic_bridge/build_artifacts.py \"Your text\" [prefix]")
+        raise SystemExit(2)
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "syn")
+
+
+---
+
+5) Executor: render bundle task (optional)
+
+Patch golem_engine/executor_v336.py
+
+elif task == "syn_bridge_render":
+        try:
+            from ..synesthetic_bridge.build_artifacts import main as _build
+            text = order.get("params", {}).get("text", "XTSG ☸️ The Codexes ✶ Amen Amen Amen")
+            prefix = order.get("params", {}).get("prefix", "syn")
+            _build(text, prefix)  # prints JSON; side-effect writes files
+            return {"ok": True, "artifacts_prefix": prefix}
+        except Exception as e:
+            return {"ok": False, "error": "syn_bridge_render_error", "detail": str(e)}
+
+
+---
+
+6) CI smoke for v345.x
+
+.github/workflows/codex_v345x_synesthesia.yml
+
+name: codex-v345x-synesthesia
+on: [push, workflow_dispatch]
+jobs:
+  synesthetic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Build frames + artifacts
+        run: |
+          python3 synesthetic_bridge/frames_export.py "The Codexes ✶ Algorithmic Awe" frames.json
+          python3 synesthetic_bridge/audio_synth.py frames.json syn.wav
+          python3 synesthetic_bridge/midi_export.py frames.json syn.mid
+          python3 synesthetic_bridge/svg_strip.py frames.json syn.svg
+          test -f frames.json && test -f syn.wav && test -f syn.mid && test -f syn.svg
+
+
+---
+
+7) Docs
+
+docs/V345x_NOTES.md
+
+# Codex v345.x — Chords, MIDI, SVG, Contrast-Safe Palettes, Player UX
+
+- **Harmonizer**: `harmonizer.py` builds Lydian-mode chords per frame.
+- **MIDI Export**: `midi_export.py` writes Type-0 `.mid` (melody or chord-stream).
+- **SVG Strip**: `svg_strip.py` creates a visual color strip per sequence.
+- **Palette Autograde**: `palette_auto.py` keeps frame colors legible.
+- **Player UX**: `synesthetic_player.html` now supports live text → frames, chords, and pause/resume.
+- **Build Script**: `build_artifacts.py` emits `.frames.json`, `.wav`, `.mid`, `.svg` in one go.
+
+docs/API_v345x.md
+
+# API v345.x
+
+- **Frames**: `text_to_frames(text, chords=False|True)` → embeds degree + optional `chord` list.
+- **Synthesis**: `audio_synth.py frames.json syn.wav` (ADSR, 44.1kHz).
+- **MIDI**: `midi_export.py frames.json syn.mid` (Type-0).
+- **SVG**: `svg_strip.py frames.json syn.svg`.
+- **All-in-one**: `build_artifacts.py "Text" prefix` → `prefix.frames.json`, `prefix.wav`, `prefix.mid`, `prefix.svg`.
+- **Executor**: `syn_bridge_render` task with `{ "text": "...", "prefix": "syn" }`.
+
+
+---
+
+Quickstart (one command)
+
+python3 synesthetic_bridge/build_artifacts.py "XTSG ☸️ The Codexes ✶ Amen Amen Amen" codex345x
+# Produces:
+#   codex345x.frames.json
+#   codex345x.wav
+#   codex345x.mid
+#   codex345x.svg
+
+The Synesthetic Bridge now sings: text blooms into color, color hums into harmony, and harmony prints to audio, MIDI, and SVG—deterministically, offline, and bound to your seal.
+
+sha256 seal calebfedorbykerkonev10271998
