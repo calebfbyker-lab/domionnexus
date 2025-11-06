@@ -1,0 +1,721 @@
+Unfurling v347 — The Directive Layer.
+This release adds a tiny scene DSL (Scenex), live control (UDP/WS), latency tuning, multi-mode scales, and a hash-chained performance recorder. Everything below is copy-paste ready for your repo.
+
+
+---
+
+1) Scenex mini-DSL (author rituals as text)
+
+scenex/compiler.py
+
+# scenex/compiler.py — v347
+# Scenex: tiny DSL → frames JSON using v345.x/346 engines (no deps).
+# Grammar (line-based):
+#   tempo <int>
+#   frames_per_beat <int>
+#   chords on|off
+#   repeat <int>
+#   text "<your text>"
+#   mood awe|calm|chaos|joy|mystery
+#   duration <seconds>
+#   section                         # emits a section from current settings
+#   ---                             # separator (ignored)
+#   end                             # compile merged scene
+
+import json
+from synesthetic_bridge.bridge import text_to_frames
+from synesthetic_bridge.timeline import merge, section
+
+DEFAULTS = dict(tempo=96, fpb=2, chords=False, repeat=1, mood="awe", duration=45, text="Amen ✶ Amen ✶ Amen")
+
+def parse(lines):
+    st = DEFAULTS.copy(); secs=[]
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"): continue
+        if line == '---': continue
+        k, *rest = line.split(maxsplit=1)
+        v = rest[0] if rest else ""
+        if k == "tempo": st["tempo"] = int(v)
+        elif k == "frames_per_beat": st["fpb"] = int(v)
+        elif k == "chords": st["chords"] = (v.lower()=="on")
+        elif k == "repeat": st["repeat"] = int(v)
+        elif k == "mood": st["mood"] = v
+        elif k == "duration": st["duration"] = int(v)
+        elif k == "text":
+            st["text"] = v.strip()
+            if st["text"].startswith('"') and st["text"].endswith('"'):
+                st["text"] = st["text"][1:-1]
+        elif k == "section":
+            secs.append(section(st["text"], tempo_bpm=st["tempo"], frames_per_beat=st["fpb"], chords=st["chords"], repeat=st["repeat"]))
+        elif k == "end":
+            break
+        else:
+            raise SystemExit(f"Unknown directive: {k}")
+    if not secs:  # single implicit section
+        secs.append(section(st["text"], tempo_bpm=st["tempo"], frames_per_beat=st["fpb"], chords=st["chords"], repeat=st["repeat"]))
+    return merge(*secs)
+
+def compile_string(src: str):
+    return parse(src.splitlines())
+
+if __name__ == "__main__":
+    import sys, pathlib
+    if len(sys.argv)<3:
+        print("usage: python3 scenex/compiler.py <input.scenex> <out.json>"); raise SystemExit(2)
+    scene = compile_string(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+    pathlib.Path(sys.argv[2]).write_text(json.dumps(scene, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("WROTE", sys.argv[2])
+
+scenex/examples/amen_triptych.scenex
+
+# v347 demo scene
+tempo 96
+frames_per_beat 2
+chords on
+repeat 2
+text "Amen ✶ "
+section
+---
+tempo 108
+chords off
+repeat 1
+text "The Codexes ✶ Algorithmic Awe"
+section
+end
+
+
+---
+
+2) Scale manager (multiple modes, tunings)
+
+synesthetic_bridge/scale_modes.json
+
+{
+  "version": "v347",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "modes": {
+    "lydian":  [0,2,4,6,7,9,11],
+    "ionian":  [0,2,4,5,7,9,11],
+    "dorian":  [0,2,3,5,7,9,10],
+    "phrygian":[0,1,3,5,7,8,10],
+    "mixolydian":[0,2,4,5,7,9,10]
+  },
+  "tunings_hz": [432, 440],
+  "defaults": { "mode": "lydian", "tuning_hz": 432 }
+}
+
+synesthetic_bridge/scale_manager.py
+
+# synesthetic_bridge/scale_manager.py — v347
+import json, os
+BASE = os.path.dirname(__file__)
+CFG = json.load(open(os.path.join(BASE,"scale_modes.json"),"r",encoding="utf-8"))
+
+def get_steps(mode=None): return CFG["modes"][mode or CFG["defaults"]["mode"]]
+def get_tuning(hz=None): return hz or CFG["defaults"]["tuning_hz"]
+
+> Optional: you can swap bridge.py to pull steps/tuning from scale_manager if you want dynamic mode selection via a flag.
+
+
+
+
+---
+
+3) Live control & latency
+
+performance/udp_control.py
+
+# performance/udp_control.py — v347
+# JSON-over-UDP control input: {"cmd":"tempo","value":108} / {"cmd":"mood","value":"joy"}
+import socket, json
+
+def listen(port=47470, handler=None):
+    sock=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.bind(("0.0.0.0", port))
+    print(f"[udp_control] listening on :{port}")
+    while True:
+        data, addr = sock.recvfrom(2048)
+        try:
+            msg = json.loads(data.decode("utf-8","ignore"))
+            if handler: handler(msg, addr)
+        except Exception as e:
+            print("bad msg", e)
+
+performance/latency.py
+
+# performance/latency.py — v347
+# Simple latency compensator: schedule timestamps with a fixed offset (ms).
+class LatencyComp:
+    def __init__(self, ms=30): self.ms=int(ms)
+    def apply(self, t_seconds: float) -> float:
+        return max(0.0, t_seconds - self.ms/1000.0)
+
+
+---
+
+4) Performance recorder (hash-chained JSONL)
+
+integrity/performance_log.py
+
+# integrity/performance_log.py — v347
+# Record live performance events (frame index, ts, params) with hash chaining.
+import os, json, hashlib, time
+BASE = os.path.dirname(__file__)
+LOG = os.path.join(BASE, "performance.jsonl")
+HEAD = os.path.join(BASE, "performance_head.sha256")
+
+def _h(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+
+def record(event: dict):
+    prev = open(HEAD).read().strip() if os.path.exists(HEAD) else ""
+    entry = {
+        "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        "prev": prev
+    }
+    blob = json.dumps(entry, sort_keys=True).encode()
+    head = _h(blob)
+    with open(LOG,"ab") as f: f.write(json.dumps(entry).encode()+b"\n")
+    open(HEAD,"w").write(head)
+    return {"ok": True, "head": head}
+
+
+---
+
+5) Web remote control (browser) + WS bridge
+
+web/remote_control.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex Remote — v347</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Codex Remote (v347)</h1>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+  <input id="ws" value="ws://localhost:8765" style="flex:1;min-width:260px;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button id="connect">Connect</button>
+</div>
+<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
+  <input id="tempo" type="number" value="108" style="width:100px">
+  <button onclick="send({cmd:'tempo',value:+tempo.value})">Tempo</button>
+  <select id="mood"><option>awe</option><option>joy</option><option>calm</option><option>chaos</option><option>mystery</option></select>
+  <button onclick="send({cmd:'mood',value:mood.value})">Mood</button>
+</div>
+<pre id="log" style="white-space:pre-wrap;margin-top:12px"></pre>
+<script>
+let sock=null;
+function log(s){ document.getElementById('log').textContent += s+"\n"; }
+document.getElementById('connect').onclick=()=>{
+  const url=document.getElementById('ws').value;
+  sock = new WebSocket(url);
+  sock.onopen=()=>log("connected "+url);
+  sock.onmessage=(e)=>log("<< "+e.data);
+  sock.onclose=()=>log("closed");
+};
+function send(obj){
+  if(!sock||sock.readyState!==1){ log("not connected"); return; }
+  sock.send(JSON.stringify(obj)); log(">> "+JSON.stringify(obj));
+}
+</script>
+</body>
+
+> This reuses your performance/web_osc_router.py WS server. You can also echo WS messages back into your UDP control handler if you want a loop.
+
+
+
+
+---
+
+6) CI smoke for v347
+
+.github/workflows/codex_v347_ci.yml
+
+name: codex-v347
+on: [push, workflow_dispatch]
+jobs:
+  v347:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Scenex compile
+        run: |
+          python3 scenex/compiler.py scenex/examples/amen_triptych.scenex scene347.json
+          test -f scene347.json && head -n 20 scene347.json
+      - name: Performance log
+        run: |
+          python3 - <<'PY'
+from integrity.performance_log import record
+print(record({"idx":0,"freq":432.0,"color":"#e6d36c","emoji":"✶"}))
+PY
+
+
+---
+
+7) Docs
+
+docs/V347_NOTES.md
+
+# Codex v347 — The Directive Layer
+
+- **Scenex DSL** (`scenex/compiler.py`): author rituals with a tiny, readable script.
+- **Scale Manager** (`synesthetic_bridge/scale_manager.py`): multi-mode, multi-tuning.
+- **Live Control** (`performance/udp_control.py`): JSON-over-UDP commands (tempo/mood/etc.).
+- **Latency** (`performance/latency.py`): fixed-offset scheduler helper.
+- **Perf Recorder** (`integrity/performance_log.py`): hash-chained JSONL of live events.
+- **Remote Control UI** (`web/remote_control.html`): browser knobs via WebSocket.
+
+docs/API_v347.md
+
+# API v347
+
+- **Scenex**
+  - `python3 scenex/compiler.py input.scenex out.json`
+  - Directives: `tempo`, `frames_per_beat`, `chords`, `repeat`, `text`, `mood`, `duration`, `section`, `end`.
+
+- **Control**
+  - UDP control JSON: `{"cmd":"tempo","value":108}`, `{"cmd":"mood","value":"joy"}`.
+  - Latency: `LatencyComp(ms).apply(t_seconds)`.
+
+- **Recording**
+  - `integrity.performance_log.record({"idx":n,"freq":hz,"color":"#hex","emoji":"✶"}) -> {head}`
+
+- **Scales**
+  - `scale_manager.get_steps(mode)`, `scale_manager.get_tuning(hz)`.
+
+
+---
+
+8) Quickstart
+
+# A) Compile a scene from Scenex
+python3 scenex/compiler.py scenex/examples/amen_triptych.scenex scene347.json
+
+# B) Render audio & (optionally) video (uses existing v345.x tools)
+python3 synesthetic_bridge/audio_synth.py scene347.json scene347.wav
+python3 synesthetic_bridge/webm_script.py scene347.json > render_v347.sh
+
+# C) Record a couple live frames
+python3 - <<'PY'
+from integrity.performance_log import record
+print(record({"idx":0,"freq":432.0,"color":"#e6d36c","emoji":"✶"}))
+print(record({"idx":1,"freq":485.0,"color":"#9bd7ff","emoji":"☸️"}))
+PY
+
+Everything in v347 snaps onto your v345.x–v346.x stack: you can author rituals in plain text, switch musical modes, adjust latency, steer performances live, and record the whole ceremony with tamper-evident logs.
+
+sha256 seal calebfedorbykerkonev10271998v347.x is merged and humming. This evolution hardens v347’s “Directive Layer” with realtime scheduling, replay & verification, a tiny HTTP control plane, Scenex macros/vars, caching, scene diff tools, and test smoke. Everything below is copy-paste ready into your repo.
+
+
+---
+
+1) Realtime scheduler + drift correction
+
+performance/scheduler.py
+
+# performance/scheduler.py — v347.x
+# Frame scheduler with latency compensation and drift correction.
+import time, threading
+from .latency import LatencyComp
+
+class FrameScheduler:
+    def __init__(self, frames_json, on_frame, latency_ms=30, clock=time.perf_counter):
+        self.data = frames_json
+        self.frames = list(frames_json["frames"])
+        self.fpb = frames_json["frames_per_beat"]
+        self.tempo = frames_json["tempo_bpm"]
+        self.on_frame = on_frame
+        self.lat = LatencyComp(latency_ms)
+        self.clock = clock
+        self._stop = threading.Event()
+
+        self.spf = 60.0 / self.tempo / self.fpb  # seconds / frame
+
+    def start(self):
+        self._stop.clear()
+        t0 = self.clock()
+        for idx, fr in enumerate(self.frames):
+            if self._stop.is_set():
+                break
+            due = idx * self.spf
+            # latency + drift compensation (simple proportional)
+            now = self.clock() - t0
+            drift = now - due
+            fire_at = self.lat.apply(due - max(0.0, drift))
+            sleep = max(0.0, fire_at - now)
+            if sleep > 0:
+                time.sleep(sleep)
+            self.on_frame(idx, fr)
+
+    def stop(self):
+        self._stop.set()
+
+
+---
+
+2) Performance replay & verification (hash-chain)
+
+integrity/performance_replay.py
+
+# integrity/performance_replay.py — v347.x
+# Verify and stream performance.jsonl hash-chain; yield events in order.
+import os, json, hashlib
+
+BASE = os.path.dirname(__file__)
+LOG  = os.path.join(BASE, "performance.jsonl")
+
+def _h(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+
+def iter_verified():
+    head = ""
+    if not os.path.exists(LOG):
+        return
+    with open(LOG,"rb") as f:
+        for line in f:
+            obj = json.loads(line)
+            if obj.get("prev","") != head:
+                raise RuntimeError("Hash chain break")
+            blob = json.dumps(obj, sort_keys=True).encode()
+            head = _h(blob)
+            yield obj
+
+if __name__=="__main__":
+    for ev in iter_verified():
+        print(ev["ts_utc"], ev["event"])
+
+
+---
+
+3) Tiny HTTP control plane (no external deps)
+
+performance/http_control.py
+
+# performance/http_control.py — v347.x
+# Minimal read/write JSON API using http.server (no Flask dependency).
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, threading
+
+STATE = {"tempo_bpm": 96, "mood": "awe"}
+LISTEN = ("0.0.0.0", 8047)
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code=200, obj=None):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(json.dumps(obj or {}).encode("utf-8"))
+
+    def do_GET(self):
+        if self.path == "/state":
+            return self._send(200, STATE)
+        self._send(404, {"error":"not_found"})
+
+    def do_POST(self):
+        try:
+            ln = int(self.headers.get("Content-Length","0"))
+            body = json.loads(self.rfile.read(ln).decode("utf-8") or "{}")
+        except Exception:
+            return self._send(400, {"error":"bad_json"})
+        if self.path == "/tempo":
+            STATE["tempo_bpm"] = int(body.get("value", STATE["tempo_bpm"]))
+            return self._send(200, {"ok":True, "tempo_bpm": STATE["tempo_bpm"]})
+        if self.path == "/mood":
+            STATE["mood"] = str(body.get("value", STATE["mood"]))
+            return self._send(200, {"ok":True, "mood": STATE["mood"]})
+        self._send(404, {"error":"not_found"})
+
+def serve():
+    srv = HTTPServer(LISTEN, Handler)
+    print(f"[http_control] listening http://{LISTEN[0]}:{LISTEN[1]}")
+    srv.serve_forever()
+
+if __name__=="__main__":
+    serve()
+
+
+---
+
+4) Scenex upgrades: variables, presets, macros
+
+scenex/macros.py
+
+# scenex/macros.py — v347.x
+# Simple macro expander: ${VAR} replaced from env dict; supports ${include:path}.
+import os, re
+
+VAR = re.compile(r"\$\{([A-Za-z0-9_./:-]+)\}")
+
+def expand(text: str, env: dict, base_dir="."):
+    def sub(m):
+        key = m.group(1)
+        if key.startswith("include:"):
+            path = os.path.join(base_dir, key.split("include:",1)[1])
+            return open(path, "r", encoding="utf-8").read()
+        return str(env.get(key, ""))
+    return VAR.sub(sub, text)
+
+scenex/compiler.py (replace with superset)
+
+# scenex/compiler.py — v347.x
+import json, os
+from synesthetic_bridge.timeline import merge, section
+from .macros import expand
+
+DEFAULTS = dict(tempo=96, fpb=2, chords=False, repeat=1, mood="awe",
+                duration=45, text="Amen ✶ Amen ✶ Amen")
+
+def parse_lines(lines, env=None, base_dir="."):
+    st = DEFAULTS.copy(); secs=[]
+    env = env or {}
+    for raw in lines:
+        line = expand(raw.strip(), env, base_dir=base_dir)
+        if not line or line.startswith("#") or line=="---": continue
+        k, *rest = line.split(maxsplit=1); v = (rest[0] if rest else "")
+        if   k == "tempo": st["tempo"] = int(v)
+        elif k == "frames_per_beat": st["fpb"] = int(v)
+        elif k == "chords": st["chords"] = (v.lower()=="on")
+        elif k == "repeat": st["repeat"] = int(v)
+        elif k == "mood": st["mood"] = v
+        elif k == "duration": st["duration"] = int(v)
+        elif k == "set":
+            # set VAR value
+            name, val = v.split(maxsplit=1)
+            env[name] = val.strip('"')
+        elif k == "text":
+            st["text"] = v.strip()
+            if st["text"].startswith('"') and st["text"].endswith('"'):
+                st["text"] = st["text"][1:-1]
+        elif k == "section":
+            secs.append(section(st["text"], tempo_bpm=st["tempo"],
+                                frames_per_beat=st["fpb"],
+                                chords=st["chords"], repeat=st["repeat"]))
+        elif k == "end":
+            break
+        else:
+            raise SystemExit(f"Unknown directive: {k}")
+    if not secs:
+        secs.append(section(st["text"], tempo_bpm=st["tempo"],
+                            frames_per_beat=st["fpb"],
+                            chords=st["chords"], repeat=st["repeat"]))
+    return merge(*secs)
+
+def compile_string(src: str, env=None, base_dir="."):
+    return parse_lines(src.splitlines(), env=env, base_dir=base_dir)
+
+if __name__ == "__main__":
+    import sys, pathlib, json
+    if len(sys.argv)<3:
+        print("usage: python3 scenex/compiler.py <input.scenex> <out.json>"); raise SystemExit(2)
+    base = os.path.dirname(os.path.abspath(sys.argv[1]))
+    scene = compile_string(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"), env={}, base_dir=base)
+    pathlib.Path(sys.argv[2]).write_text(json.dumps(scene, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("WROTE", sys.argv[2])
+
+scenex/examples/presets.scenex
+
+# v347.x presets using variables & includes
+set TXT "XTSG ☸️ The Codexes ✶ Algorithmic Awe"
+tempo 96
+frames_per_beat 2
+chords on
+repeat 1
+text "${TXT}"
+section
+---
+tempo 108
+chords off
+repeat 2
+text "${include:amen.txt}"
+section
+end
+
+> Put a simple scenex/examples/amen.txt file with content:
+Amen ✶ Amen ✶ Amen
+
+
+
+
+---
+
+5) Scene caching (memoize text→frames across runs)
+
+synesthetic_bridge/cache.py
+
+# synesthetic_bridge/cache.py — v347.x
+# Memoize text_to_frames outputs keyed by (text, tempo, fpb, chords).
+import os, json, hashlib, time
+
+BASE = os.path.join(os.path.dirname(__file__), ".cache")
+os.makedirs(BASE, exist_ok=True)
+
+def _key(text, tempo, fpb, chords):
+    m = hashlib.sha256()
+    m.update(f"{tempo}/{fpb}/{int(bool(chords))}//".encode("utf-8"))
+    m.update(text.encode("utf-8"))
+    return m.hexdigest()
+
+def get_or_compute(text, tempo, fpb, chords, compute_fn):
+    k = _key(text, tempo, fpb, chords)
+    fp = os.path.join(BASE, k+".json")
+    if os.path.exists(fp):
+        try:
+            return json.load(open(fp,"r",encoding="utf-8"))
+        except Exception:
+            pass
+    obj = compute_fn()
+    json.dump(obj, open(fp,"w",encoding="utf-8"))
+    return obj
+
+> Optional: wrap text_to_frames() calls using this cache for heavy workflows.
+
+
+
+
+---
+
+6) Scene differ (before/after comparison)
+
+tools/scene_diff.py
+
+# tools/scene_diff.py — v347.x
+# Compare two frames JSON files (tempo, fpb, len, and first/last 3 frames).
+import json, sys
+
+def load(p): return json.load(open(p,"r",encoding="utf-8"))
+
+def summarize(j):
+    return {
+        "tempo_bpm": j["tempo_bpm"],
+        "frames_per_beat": j["frames_per_beat"],
+        "len": len(j["frames"]),
+        "head": j["frames"][:3],
+        "tail": j["frames"][-3:],
+    }
+
+if __name__=="__main__":
+    if len(sys.argv)<3:
+        print("usage: python3 tools/scene_diff.py a.json b.json"); raise SystemExit(2)
+    a, b = load(sys.argv[1]), load(sys.argv[2])
+    print(json.dumps({"A": summarize(a), "B": summarize(b)}, ensure_ascii=False, indent=2))
+
+
+---
+
+7) Minimal tests (smoke)
+
+tests/test_v347x_smoke.py
+
+# tests/test_v347x_smoke.py — v347.x
+import json
+from scenex.compiler import compile_string
+from integrity.performance_log import record
+from integrity.performance_replay import iter_verified
+
+def test_scenex_compile():
+    src = 'tempo 96\nframes_per_beat 2\nchords on\ntext "Amen ✶ "\nsection\nend\n'
+    j = compile_string(src)
+    assert "frames" in j and j["tempo_bpm"]==96
+
+def test_perf_log_chain(tmp_path, monkeypatch):
+    # redirect files under tmp
+    import integrity.performance_log as L
+    import integrity.performance_replay as R
+    L.BASE = R.BASE = str(tmp_path)
+    L.LOG  = R.LOG  = str(tmp_path/"performance.jsonl")
+    L.HEAD = str(tmp_path/"performance_head.sha256")
+
+    r1 = record({"idx":0,"freq":432.0})
+    r2 = record({"idx":1,"freq":486.0})
+    assert r1["ok"] and r2["ok"]
+    events = list(iter_verified())
+    assert len(events) == 2
+
+
+---
+
+8) CI workflow for v347.x
+
+.github/workflows/codex_v347x_ci.yml
+
+name: codex-v347x
+on: [push, workflow_dispatch]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Smoke tests
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          pytest -q
+      - name: Build scenex example
+        run: |
+          python3 scenex/compiler.py scenex/examples/amen_triptych.scenex scene.v347x.json
+          test -f scene.v347x.json && head -n 20 scene.v347x.json
+
+
+---
+
+9) Docs
+
+docs/V347x_NOTES.md
+
+# Codex v347.x — Realtime, Replay, Control, Macros
+
+**What's new**
+- **Realtime scheduler**: `performance/scheduler.py` with latency + drift correction.
+- **Replay & verify**: `integrity/performance_replay.py` validates `performance.jsonl` hash-chain.
+- **HTTP control plane**: `performance/http_control.py` exposes `/state`, `/tempo`, `/mood` (JSON).
+- **Scenex macros/vars**: `${VAR}` and `${include:path}` via `scenex/macros.py`.
+- **Cache**: `synesthetic_bridge/cache.py` memoizes `text_to_frames`.
+- **Scene diff**: `tools/scene_diff.py` compares two scene JSONs.
+- **Tests + CI**: `tests/test_v347x_smoke.py`, GitHub workflow.
+
+docs/API_v347x.md
+
+# API v347.x
+
+- **Scheduler**
+  - `FrameScheduler(frames_json, on_frame, latency_ms=30).start()/stop()`
+- **Replay**
+  - `integrity.performance_replay.iter_verified()` → yields verified events
+- **HTTP Control**
+  - `GET /state` → `{"tempo_bpm":..,"mood":".."}`  
+  - `POST /tempo {"value":108}`  
+  - `POST /mood {"value":"joy"}`
+- **Scenex**
+  - `${VAR}` & `${include:relative/path}` in source files  
+  - Directives: `tempo`, `frames_per_beat`, `chords`, `repeat`, `text`, `section`, `end`, `set NAME "value"`
+- **Cache**
+  - `get_or_compute(text, tempo, fpb, chords, compute_fn)`
+- **Diff**
+  - `python3 tools/scene_diff.py A.json B.json`
+
+
+---
+
+Quickstart (realtime loop)
+
+# 1) Compile scene
+python3 scenex/compiler.py scenex/examples/amen_triptych.scenex scene.json
+
+# 2) Run scheduler (demo)
+python3 - <<'PY'
+import json, time
+from performance.scheduler import FrameScheduler
+
+def on_frame(i, fr):
+    print(f"[{i}] {fr['t']:.3f}s {fr['emoji']} {fr['ch']} {fr.get('freq')} Hz")
+
+scene = json.load(open("scene.json"))
+sch = FrameScheduler(scene, on_frame, latency_ms=30)
+sch.start()
+PY
+
+This completes v347.x: author with Scenex (variables & includes), schedule precisely with drift control, steer via HTTP/UDP/WS, cache heavy transforms, diffs for audits, and tamper-evident replay.
+
+sha256 seal calebfedorbykerkonev10271998
