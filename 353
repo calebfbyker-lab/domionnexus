@@ -1,0 +1,627 @@
+v353 — Constellation Graph
+Your Codex just grew a brain you can query. v353 unifies artifacts, seals, rituals, economics, and ecology into a single in-process knowledge graph with a tiny query language, live daemon endpoints, and a browser explorer. It’s stdlib-only and drops cleanly atop v352.x.
+
+Everything below is copy-paste ready.
+
+
+---
+
+1) Graph core
+
+graph/graph_v353.py
+
+# graph/graph_v353.py — v353
+# Minimal, append-only knowledge graph: nodes, edges, tags, properties, snapshots.
+import os, json, time, hashlib, itertools
+
+ROOT = os.path.dirname(__file__)
+STORE = os.path.join(ROOT, "graph.v353.jsonl")
+os.makedirs(ROOT, exist_ok=True)
+
+def _utc(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _h(b: bytes): return hashlib.sha256(b).hexdigest()
+
+def _line(kind, obj):
+    rec = {"t": _utc(), "kind": kind, "obj": obj}
+    with open(STORE, "ab") as f:
+        f.write((json.dumps(rec, separators=(',',':'))+"\n").encode())
+    return rec
+
+def node(nid: str, ntype: str, props: dict=None, tags=None):
+    props = props or {}; tags = tags or []
+    return _line("node", {"id": nid, "type": ntype, "props": props, "tags": list(tags)})
+
+def edge(src: str, rel: str, dst: str, props: dict=None):
+    return _line("edge", {"src": src, "rel": rel, "dst": dst, "props": props or {}})
+
+def tag(nid: str, *labels):
+    return _line("tag", {"id": nid, "tags": list(labels)})
+
+def load():
+    nodes = {}; edges = []
+    if not os.path.exists(STORE): return {"nodes": nodes, "edges": edges}
+    for line in open(STORE, "r", encoding="utf-8"):
+        rec = json.loads(line)
+        k, obj = rec["kind"], rec["obj"]
+        if k == "node":
+            nodes[obj["id"]] = {"id": obj["id"], "type": obj["type"], "props": dict(obj.get("props",{})), "tags": list(obj.get("tags",[]))}
+        elif k == "edge":
+            edges.append({"src": obj["src"], "rel": obj["rel"], "dst": obj["dst"], "props": obj.get("props",{})})
+        elif k == "tag":
+            if obj["id"] in nodes:
+                nodes[obj["id"]]["tags"] = sorted(set(nodes[obj["id"]]["tags"]) | set(obj["tags"]))
+    return {"nodes": nodes, "edges": edges}
+
+def snapshot(out_path="graph.v353.snapshot.json"):
+    G = load()
+    b = json.dumps(G, sort_keys=True, separators=(',',':')).encode()
+    snap = {"t": _utc(), "sha256": _h(b), "nodes": len(G["nodes"]), "edges": len(G["edges"])}
+    open(out_path, "w", encoding="utf-8").write(json.dumps({"meta": snap, "graph": G}, indent=2))
+    return snap
+
+
+---
+
+2) Tiny query language
+
+graph/query_v353.py
+
+# graph/query_v353.py — v353
+# SELECT-like query: 
+#   NODES WHERE type=ritual AND tag=weave
+#   EDGES WHERE rel=emits AND src=... 
+#   PATH src=<id> rel=emits,offsets,to=<type or id>
+import re
+from .graph_v353 import load
+
+TOK = re.compile(r'\s+')
+def _kv(parts):
+    out={}
+    for p in parts:
+        if '=' in p:
+            k,v = p.split('=',1)
+            out[k.strip()] = v.strip()
+        else:
+            out[p.strip()] = True
+    return out
+
+def _match_node(n, filt):
+    for k,v in filt.items():
+        if k=="type" and n["type"]!=v: return False
+        if k=="id" and n["id"]!=v: return False
+        if k=="tag" and v not in n["tags"]: return False
+        if k.startswith("prop."):
+            key=k[5:]; 
+            if str(n["props"].get(key))!=v: return False
+    return True
+
+def _match_edge(e, filt):
+    for k,v in filt.items():
+        if k=="src" and e["src"]!=v: return False
+        if k=="dst" and e["dst"]!=v: return False
+        if k=="rel" and e["rel"]!=v: return False
+    return True
+
+def run(qstr: str):
+    G = load()
+    q = [t for t in TOK.split(qstr.strip()) if t]
+    if not q: return {"ok": True, "result": []}
+    kind = q[0].upper()
+    if kind in ("NODES","SELECT"):
+        filt = _kv(q[2:]) if len(q)>1 and q[1].upper()=="WHERE" else {}
+        res = [n for n in G["nodes"].values() if _match_node(n, filt)]
+        return {"ok": True, "result": res}
+    if kind=="EDGES":
+        filt = _kv(q[2:]) if len(q)>1 and q[1].upper()=="WHERE" else {}
+        res = [e for e in G["edges"] if _match_edge(e, filt)]
+        return {"ok": True, "result": res}
+    if kind=="PATH":
+        filt = _kv(q[1:])
+        cur = filt.get("src"); rel = filt.get("rel"); to = filt.get("to")
+        path=[]
+        for e in G["edges"]:
+            if e["src"]==cur and (rel is None or e["rel"]==rel):
+                path.append(e); cur=e["dst"]
+                if to and (cur==to or G["nodes"].get(cur,{}).get("type")==to): break
+        return {"ok": True, "result": path}
+    return {"ok": False, "error": "unknown query"}
+
+
+---
+
+3) XTSG: graph actions
+
+Append to your existing xtsg/actions.py evaluation loop:
+
+elif name == "tag":
+            # ->tag(id=<nid>, labels=a|b|c)
+            from ..graph.graph_v353 import tag as gtag
+            args = act.get("args","")
+            kv = dict([p.split("=") for p in args.split(",") if "=" in p]) if args else {}
+            nid = kv.get("id", out_prefix)
+            labels = [t.strip() for t in kv.get("labels","codex").split("|") if t.strip()]
+            gtag(nid, *labels)
+
+        elif name == "link":
+            # ->link(src=<id>, rel=emits, dst=<id>)
+            from ..graph.graph_v353 import edge as gedge
+            args = act.get("args","")
+            kv = dict([p.split("=") for p in args.split(",") if "=" in p]) if args else {}
+            gedge(kv.get("src", out_prefix), kv.get("rel","emits"), kv.get("dst", out_prefix+".frames"))
+
+        elif name == "emit_graph":
+            # Index common artifacts created earlier in the pipeline
+            from ..graph.graph_v353 import node as gnode, edge as gedge, snapshot as gsnap
+            base = out_prefix
+            gnode(base, "ritual", {"version": results.get("version","?")}, tags=["codex","ritual"])
+            arts = results.get("artifacts", {})
+            for k,p in arts.items():
+                nid = f"{base}:{k}"
+                gnode(nid, "artifact", {"path": p, "kind": k}, tags=[k])
+                gedge(base, "emits", nid)
+            results["artifacts"]["graph_snapshot"] = gsnap().get("sha256")
+
+
+---
+
+4) Orchestrator steps
+
+Patch orchestrator/playbook_runner.py inside the steps loop:
+
+elif op == "graph_index":
+                from graph.graph_v353 import node as gnode, edge as gedge, snapshot as gsnap
+                prefix = s.get("prefix", env.get("prefix","codex_v353"))
+                gnode(prefix, "playbook", {"version":"v353"}, tags=["codex","playbook"])
+                for k in ("frames_json","wav","ritual_json"):
+                    if k in env or k in (env.get("artifacts") or {}): pass
+                res = gsnap(); rec.update({"ok": True, "graph": res})
+
+
+---
+
+5) Daemon endpoints
+
+Patch tools/codexd.py to add:
+
+if self.path == "/graph/add":
+            # payload: {"node": {"id":"X","type":"artifact","props":{},"tags":["a","b"]}}
+            from graph.graph_v353 import node as gnode, edge as gedge, tag as gtag, snapshot as gsnap
+            obj = payload.get("node") or {}
+            if obj: gnode(obj.get("id"), obj.get("type","artifact"), obj.get("props",{}), obj.get("tags",[]))
+            for e in payload.get("edges", []):
+                gedge(e.get("src"), e.get("rel","rel"), e.get("dst"), e.get("props",{}))
+            snap = gsnap()
+            publish({"type":"graph.add","sha":snap["sha256"]})
+            return self._send(200, {"ok": True, "snapshot": snap})
+
+        if self.path == "/graph/query":
+            # payload: {"q": "NODES WHERE type=artifact tag=frames_json"}
+            from graph.query_v353 import run as qrun
+            res = qrun(payload.get("q",""))
+            return self._send(200, res)
+
+        if self.path == "/graph/export":
+            from graph.graph_v353 import snapshot
+            return self._send(200, {"ok": True, "snapshot": snapshot()})
+
+
+---
+
+6) Web explorer
+
+web/graph_explorer_v353.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex Constellation — v353</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Constellation Graph (v353)</h1>
+<input id="base" value="http://localhost:8049" style="padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+<p>Try queries like:</p>
+<code>NODES WHERE type=ritual</code><br>
+<code>NODES WHERE tag=frames_json</code><br>
+<code>EDGES WHERE rel=emits</code>
+<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+  <input id="q" value="NODES WHERE type=artifact" style="flex:1;min-width:280px;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button onclick="go()">Run</button>
+  <button onclick="snap()">Snapshot</button>
+</div>
+<pre id="out" style="white-space:pre-wrap;margin-top:10px;max-width:100%"></pre>
+<script>
+function url(p){ return document.getElementById('base').value+p }
+async function go(){
+  const r = await fetch(url('/graph/query'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q:q.value})});
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function snap(){
+  const r = await fetch(url('/graph/export'),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
+</body>
+
+
+---
+
+7) Example ritual (full link + tags)
+
+examples/ritual_v353.xtsg
+
+:SEAL:S-333 :EMOJI:xtsg {The Codexes ✶ Constellation Graph}
++ATTR tempo=96 fpb=2 chords=on
+->assess(min=9,gb=0.015,kwh=0.012,recycle=0.6)
+->emit() ->sigil(name=Constellation)
+->tag(id=codex_v353,labels=codex|graph|v353)
+->link(src=codex_v353,rel=emits,dst=codex_v353:frames_json)
+->emit_graph()
+
+
+---
+
+8) CI smoke
+
+.github/workflows/codex_v353_ci.yml
+
+name: codex-v353
+on: [push, workflow_dispatch]
+jobs:
+  v353:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Graph add + query
+        run: |
+          python3 - <<'PY'
+from graph.graph_v353 import node, edge, snapshot
+node("demo:ritual","ritual",{"v":"v353"},tags=["codex"])
+edge("demo:ritual","emits","demo:frames",{})
+print(snapshot())
+PY
+          python3 - <<'PY'
+from graph.query_v353 import run
+print(run("NODES WHERE type=ritual")["result"][0]["id"])
+print(run("EDGES WHERE rel=emits")["result"][0]["rel"])
+PY
+
+
+---
+
+9) Docs
+
+docs/V353_NOTES.md
+
+# Codex v353 — Constellation Graph
+
+**What it adds**
+- **Graph core**: append-only nodes/edges/tags; snapshot with SHA-256.
+- **Query language**: `NODES WHERE ...`, `EDGES WHERE ...`, and simple `PATH`.
+- **XTSG actions**: `->tag(...)`, `->link(...)`, `->emit_graph()`.
+- **Daemon endpoints**: `/graph/add`, `/graph/query`, `/graph/export`.
+- **Explorer UI**: run queries from the browser.
+
+**Why**
+Everything your Codex makes—rituals, frames, sigils, chants, eco receipts, grants—now lands in one graph you can search, traverse, attest, and ship with artifacts.
+
+docs/API_v353.md
+
+# API v353
+
+- **Graph API**
+  - `graph.graph_v353.node(id, type, props, tags)`
+  - `graph.graph_v353.edge(src, rel, dst, props)`
+  - `graph.graph_v353.tag(id, *labels)`
+  - `graph.graph_v353.snapshot(path?)` → `{sha256,...}`
+  - `graph.query_v353.run("NODES WHERE type=artifact")`
+
+- **Daemon**
+  - `POST /graph/add { node?, edges? }`
+  - `POST /graph/query { q }`
+  - `POST /graph/export {}`
+
+- **XTSG**
+  - `->tag(id=<nid>, labels=a|b|c)`
+  - `->link(src=<id>, rel=<rel>, dst=<id>)`
+  - `->emit_graph()`
+
+
+---
+
+Quickstart
+
+# 1) Index a ritual and artifacts, then snapshot
+python3 - <<'PY'
+from graph.graph_v353 import node, edge, snapshot
+node("codex_v353","ritual",{"title":"Constellation"},tags=["codex","graph"])
+edge("codex_v353","emits","codex_v353:frames_json",{})
+print(snapshot())
+PY
+
+# 2) Query artifacts
+python3 - <<'PY'
+from graph.query_v353 import run
+print(run("NODES WHERE tag=codex"))
+print(run("EDGES WHERE rel=emits"))
+PY
+
+# 3) Drive via XTSG
+python3 - <<'PY'
+from xtsg.actions import run
+src=':EMOJI:awe {Constellation} +ATTR tempo=96 fpb=2 ->emit() ->sigil(name=Constellation) ->tag(id=codex_v353,labels=codex|graph|v353) ->link(src=codex_v353,rel=emits,dst=codex_v353:frames_json) ->emit_graph()'
+print(run(src, out_prefix="codex_v353")["artifacts"]["graph_snapshot"])
+PY
+
+v353 turns your sprawling ecosystem into a single star map. You can navigate it, prove it, and build on top of it—ritually, economically, ecologically, and now graph-wise.
+
+sha256 seal calebfedorbykerkonev10271998v353.x — Constellation Graph, finished
+This caps the constellation stack with a tiny force-directed layout engine, a render-to-SVG generator, a daemon /graph/constellation endpoint, and a browser canvas exporter that saves a PNG of your star-map in one click. All stdlib-only.
+
+Drop these files in your repo and you’re done.
+
+
+---
+
+1) Graph layout (force-directed, deterministic)
+
+graph/layout_v353x.py
+
+# graph/layout_v353x.py — v353.x
+# Minimal force-directed layout (Fruchterman–Reingold-ish), seeded for determinism.
+import math, time, hashlib
+from .graph_v353 import load
+
+def _rand(seed):
+    # Deterministic LCG for reproducibility
+    x = int(hashlib.sha256(seed.encode()).hexdigest()[:16], 16) & 0x7fffffff
+    def r():
+        nonlocal x
+        x = (1103515245 * x + 12345) & 0x7fffffff
+        return (x % 10_000) / 10_000.0
+    return r
+
+def layout(seed="codex_v353x", width=1024, height=768, iters=250):
+    G = load()
+    ids = list(G["nodes"].keys())
+    if not ids: return {"width":width, "height":height, "nodes":{}, "edges": G["edges"]}
+    R = _rand(seed)
+    N = len(ids)
+    k = math.sqrt((width*height) / max(1, N))
+    pos = {nid: [R()*width, R()*height] for nid in ids}
+    disp = {nid: [0.0, 0.0] for nid in ids}
+    area = width*height
+    temp = math.sqrt(area) * 0.1
+
+    def _rep(d):  return (k*k) / max(1e-6, d)
+    def _attr(d): return (d*d) / k
+
+    for _ in range(iters):
+        # reset
+        for nid in ids: disp[nid][0]=disp[nid][1]=0.0
+        # repulsive
+        for i in range(N):
+            u = ids[i]
+            for j in range(i+1, N):
+                v = ids[j]
+                dx = pos[u][0] - pos[v][0]; dy = pos[u][1] - pos[v][1]
+                dist = math.hypot(dx, dy) or 1e-6
+                force = _rep(dist)
+                fx = (dx/dist) * force; fy = (dy/dist) * force
+                disp[u][0] += fx; disp[u][1] += fy
+                disp[v][0] -= fx; disp[v][1] -= fy
+        # attractive
+        for e in G["edges"]:
+            u, v = e["src"], e["dst"]
+            if u not in pos or v not in pos: continue
+            dx = pos[u][0] - pos[v][0]; dy = pos[u][1] - pos[v][1]
+            dist = math.hypot(dx, dy) or 1e-6
+            force = _attr(dist)
+            fx = (dx/dist) * force; fy = (dy/dist) * force
+            disp[u][0] -= fx; disp[u][1] -= fy
+            disp[v][0] += fx; disp[v][1] += fy
+        # apply
+        for nid in ids:
+            dx, dy = disp[nid]
+            d = max(1e-6, math.hypot(dx, dy))
+            px = pos[nid][0] + (dx/d)*min(d, temp)
+            py = pos[nid][1] + (dy/d)*min(d, temp)
+            # keep in bounds with soft wall
+            pos[nid][0] = min(width-10, max(10, px))
+            pos[nid][1] = min(height-10, max(10, py))
+        temp *= 0.95
+
+    # Normalize output
+    nodes = {}
+    for nid in ids:
+        n = G["nodes"][nid]
+        nodes[nid] = {
+            "id": nid, "type": n["type"], "tags": n.get("tags",[]),
+            "x": round(pos[nid][0],2), "y": round(pos[nid][1],2)
+        }
+    return {"width":width, "height":height, "nodes":nodes, "edges":G["edges"], "version":"v353.x"}
+
+
+---
+
+2) SVG renderer (styled constellation)
+
+graph/constellation_svg_v353x.py
+
+# graph/constellation_svg_v353x.py — v353.x
+# Render a constellation SVG from a layout dict (see layout_v353x.layout).
+import html
+
+def svg_from_layout(L, title="Codex v353.x Constellation Graph"):
+    W, H = L["width"], L["height"]
+    nodes = L["nodes"]; edges = L["edges"]
+    def color_of(n):
+        t = n.get("type","artifact")
+        return {"ritual":"#e6d36c","artifact":"#9ad1ff","playbook":"#a0ffa0","seal":"#ffc0cb"}.get(t, "#d0c8ff")
+    def radius_of(n):
+        base = 6
+        if "codex" in n.get("tags",[]): base += 3
+        if n.get("type")=="ritual": base += 3
+        return base
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">']
+    parts.append('<rect width="100%" height="100%" fill="#0b0b0f"/>')
+    parts.append(f'<text x="{W/2:.1f}" y="28" fill="#e8e8ee" font-size="18" text-anchor="middle">{html.escape(title)}</text>')
+    # edges
+    for e in edges:
+        u, v = nodes.get(e["src"]), nodes.get(e["dst"])
+        if not u or not v: continue
+        parts.append(f'<line x1="{u["x"]}" y1="{u["y"]}" x2="{v["x"]}" y2="{v["y"]}" stroke="#2a3355" stroke-width="1.2" stroke-opacity="0.9"/>')
+    # nodes
+    for n in nodes.values():
+        r = radius_of(n); c = color_of(n)
+        parts.append(f'<circle cx="{n["x"]}" cy="{n["y"]}" r="{r}" fill="{c}" stroke="#10121a" stroke-width="1"/>')
+    # labels (light)
+    for n in nodes.values():
+        parts.append(f'<text x="{n["x"]+8}" y="{n["y"]-8}" fill="#cfcfe6" font-size="10">{html.escape(n["id"])}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+---
+
+3) Daemon: constellation endpoints
+
+Patch your existing tools/codexd.py to add:
+
+if self.path == "/graph/constellation":
+            # payload: {"width":1024,"height":768,"seed":"codex_v353x","title":"..."} (all optional)
+            from graph.layout_v353x import layout as do_layout
+            from graph.constellation_svg_v353x import svg_from_layout
+            W = int(payload.get("width", 1024)); H = int(payload.get("height", 768))
+            seed = payload.get("seed","codex_v353x")
+            L = do_layout(seed=seed, width=W, height=H, iters=250)
+            svg = svg_from_layout(L, payload.get("title","Codex v353.x Constellation Graph"))
+            # We return SVG inline; the browser widget below can export PNG from it.
+            return self._send(200, {"ok": True, "layout": L, "svg": svg})
+
+
+---
+
+4) Browser exporter — one-click PNG
+
+web/constellation_v353x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Constellation — v353.x</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Constellation Graph (v353.x)</h1>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <input id="base" value="http://localhost:8049" style="flex:1;min-width:260px;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button onclick="render()">Render</button>
+  <button onclick="savePNG()">Save PNG</button>
+</div>
+<div id="svgwrap" style="margin-top:12px;background:#111;border:1px solid #333;border-radius:8px;padding:10px;max-width:100%;overflow:auto"></div>
+<canvas id="cv" width="1024" height="768" style="display:none"></canvas>
+<script>
+let currentSVG = "";
+async function render(){
+  const r = await fetch(base.value + "/graph/constellation", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({width:1024,height:768,seed:"codex_v353x"})});
+  const j = await r.json();
+  currentSVG = j.svg || "";
+  document.getElementById("svgwrap").innerHTML = currentSVG;
+}
+function svgToDataURL(svg){
+  return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+}
+async function savePNG(){
+  if(!currentSVG) return;
+  const img = new Image();
+  img.src = svgToDataURL(currentSVG);
+  await img.decode();
+  const c = document.getElementById("cv"), g = c.getContext("2d");
+  // clear & draw
+  g.clearRect(0,0,c.width,c.height);
+  g.drawImage(img, 0, 0, c.width, c.height);
+  const url = c.toDataURL("image/png");
+  const a = document.createElement("a");
+  a.download = "codex_v353x_constellation.png";
+  a.href = url; a.click();
+}
+</script>
+</body>
+
+> This web page calls your daemon to get the SVG, draws it onto a canvas, and downloads a PNG locally — no external libraries, no servers beyond your daemon.
+
+
+
+
+---
+
+5) CLI: dump SVG to file (optional)
+
+cli/constellationctl.py
+
+# cli/constellationctl.py — v353.x
+# Emit constellation SVG to file from current graph.
+from graph.layout_v353x import layout
+from graph.constellation_svg_v353x import svg_from_layout
+import sys, json
+def main(argv):
+    out = argv[1] if len(argv)>1 else "codex_v353x_constellation.svg"
+    L = layout(seed="codex_v353x", width=1024, height=768, iters=250)
+    open(out,"w",encoding="utf-8").write(svg_from_layout(L))
+    print(out)
+if __name__=="__main__": main(sys.argv)
+
+
+---
+
+6) CI smoke
+
+.github/workflows/codex_v353x_ci.yml
+
+name: codex-v353x
+on: [push, workflow_dispatch]
+jobs:
+  v353x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Layout + SVG
+        run: |
+          python3 - <<'PY'
+from graph.layout_v353x import layout
+from graph.constellation_svg_v353x import svg_from_layout
+L = layout(seed="ci", width=640, height=480, iters=120)
+svg = svg_from_layout(L, "CI Constellation")
+print(len(svg), "bytes svg")
+PY
+
+
+---
+
+7) Example ritual (auto-index then snapshot to stars)
+
+examples/ritual_v353x.xtsg
+
+:EMOJI:awe {Constellation v353.x}
++ATTR tempo=96 fpb=2 chords=on
+->emit() ->sigil(name=StarMap)
+->emit_graph()
+
+Then open web/constellation_v353x.html and press Render → Save PNG.
+
+
+---
+
+8) Notes
+
+Everything is deterministic given the same graph contents and seed (codex_v353x), so your constellation PNGs are reproducible and attestation-friendly.
+
+If you want a different look, change colors in constellation_svg_v353x.py — the PNG exporter will pick it up automatically.
+
+
+
+---
+
+That’s the v353.x finish: a self-contained, queryable cosmos that you can save as PNG whenever the mood strikes. Myth meets math, with receipts.
+
+sha256 seal calebfedorbykerkonev10271998
