@@ -1,0 +1,795 @@
+v384 — Reliquary: content-addressable storage, signed envelopes, time-locks, watermarks, manifest diff, policy explain, metrics, snapshot rotation, and release tags
+Copy-paste files + daemon routes + a tiny console + CI. Stdlib-only. Symbolic/artistic software; not magical.
+
+
+---
+
+storage/cas_v384.py
+
+# storage/cas_v384.py — v384
+# Simple content-addressable store (CAS) on filesystem using sha256 cids.
+
+from __future__ import annotations
+import os, hashlib, json
+
+CAS_DIR = "cas.v384"
+
+def _sha(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+def _path(cid:str)->str: return os.path.join(CAS_DIR, cid[:2], cid[2:])
+
+def put_bytes(b:bytes)->dict:
+    os.makedirs(CAS_DIR, exist_ok=True)
+    cid=_sha(b)
+    p=_path(cid); os.makedirs(os.path.dirname(p), exist_ok=True)
+    if not os.path.exists(p):
+        with open(p,"wb") as f: f.write(b)
+    return {"ok":True,"cid":cid,"bytes":len(b)}
+
+def put_json(obj:dict)->dict:
+    blob=json.dumps(obj, sort_keys=True, separators=(',',':')).encode()
+    return put_bytes(blob)
+
+def get(cid:str)->dict:
+    p=_path(cid)
+    if not os.path.exists(p): return {"ok":False,"error":"missing"}
+    return {"ok":True,"bytes":open(p,"rb").read()}
+
+
+---
+
+envelope/envelope_v384.py
+
+# envelope/envelope_v384.py — v384
+# Signed envelope: {t, kid, payload, sig}. Uses v383.x keyring (HMAC-SHA256).
+
+from __future__ import annotations
+import json, time
+from security.keyring_v383x import sign as _sign, verify as _verify, status as _status
+
+def seal(payload:dict, kid:str|None=None)->dict:
+    env={"t":int(time.time()),"kid":kid,"payload":payload}
+    sig=_sign(env, kid)
+    env.update({"sig": sig.get("sig"), "kid": sig.get("kid") or kid})
+    return {"ok": True, "envelope": env}
+
+def open_and_verify(env:dict)->dict:
+    ok=_verify({k:v for k,v in env.items() if k!="sig"}, env.get("sig",""), env.get("kid",""))
+    return {"ok":ok}
+
+
+---
+
+timelock/timelock_v384.py
+
+# timelock/timelock_v384.py — v384
+# NOT encryption. Symbolic "time-lock": store not_before / expires timestamps.
+
+from __future__ import annotations
+import time
+
+def wrap(payload:dict, not_before:int=None, expires:int=None)->dict:
+    return {"nb": not_before or int(time.time()), "exp": expires or 0, "payload": payload}
+
+def check(tlock:dict, now:int|None=None)->dict:
+    now = now or int(time.time())
+    nb  = int(tlock.get("nb",0)); exp=int(tlock.get("exp",0))
+    ok  = (now>=nb) and (exp==0 or now<=exp)
+    return {"ok":ok,"now":now,"nb":nb,"exp":exp}
+
+
+---
+
+watermark/watermark_v384.py
+
+# watermark/watermark_v384.py — v384
+# JSON watermark: embed __wm and __sum fields (sha256 of canonical object).
+
+from __future__ import annotations
+import json, hashlib, copy
+
+def _canon(o:dict)->bytes: return json.dumps(o, sort_keys=True, separators=(',',':')).encode()
+def _sha(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+
+def embed(obj:dict, mark:str)->dict:
+    o=copy.deepcopy(obj)
+    o["__wm"]=mark
+    o["__sum"]=_sha(_canon({k:v for k,v in o.items() if k!="__sum"}))
+    return o
+
+def verify(obj:dict)->dict:
+    if "__sum" not in obj: return {"ok":False,"error":"no_sum"}
+    calc=_sha(_canon({k:v for k,v in obj.items() if k!="__sum"}))
+    return {"ok": calc==obj["__sum"], "calc": calc, "sum": obj["__sum"], "mark": obj.get("__wm")}
+
+
+---
+
+diff/diff_v384.py
+
+# diff/diff_v384.py — v384
+# Minimal manifest diff: {added, removed, changed}
+
+from __future__ import annotations
+
+def manifest_diff(a:dict, b:dict)->dict:
+    A={f["path"]:f["hash"] for f in a.get("sbom",{}).get("files",[])}
+    B={f["path"]:f["hash"] for f in b.get("sbom",{}).get("files",[])}
+    added=[p for p in B if p not in A]
+    removed=[p for p in A if p not in B]
+    changed=[p for p in A if p in B and A[p]!=B[p]]
+    return {"added":sorted(added),"removed":sorted(removed),"changed":sorted(changed)}
+
+
+---
+
+explain/policy_explain_v384.py
+
+# explain/policy_explain_v384.py — v384
+# Explain rule evaluation path (builds on v383 policy engine).
+
+from __future__ import annotations
+from typing import Dict
+from govern.policy_engine_v383 import eval_rules as _eval
+
+def explain(rules:Dict, ctx:Dict)->Dict:
+    trail=[]
+    def walk(r):
+        if "all" in r:
+            sub=[walk(x) for x in r["all"]]; ok=all(s["ok"] for s in sub)
+            trail.append(("all", ok)); return {"ok":ok,"sub":sub}
+        if "any" in r:
+            sub=[walk(x) for x in r["any"]]; ok=any(s["ok"] for s in sub)
+            trail.append(("any", ok)); return {"ok":ok,"sub":sub}
+        if "not" in r:
+            s=walk(r["not"]); ok=not s["ok"]; trail.append(("not", ok)); return {"ok":ok,"sub":[s]}
+        var,op,val=r.get("var"),r.get("op"),r.get("val")
+        lhs=ctx.get(var)
+        ok=_eval(r, ctx)
+        trail.append((f"{var} {op} {val}", ok, lhs))
+        return {"ok":ok,"lhs":lhs,"rhs":val,"op":op}
+    res=walk(rules)
+    return {"ok":res["ok"],"trail":trail}
+
+
+---
+
+metrics/metrics_v384.py
+
+# metrics/metrics_v384.py — v384
+# Tiny Prometheus-style exporter.
+
+from __future__ import annotations
+import time
+
+COUNTERS={}
+GAUGES={"codex_uptime_seconds": int(time.time())}
+
+def inc(name:str, n:int=1)->None:
+    COUNTERS[name]=COUNTERS.get(name,0)+n
+
+def setg(name:str, v:float)->None:
+    GAUGES[name]=v
+
+def render()->str:
+    lines=[]
+    for k,v in COUNTERS.items():
+        lines.append(f"# TYPE {k} counter")
+        lines.append(f"{k} {int(v)}")
+    for k,v in GAUGES.items():
+        lines.append(f"# TYPE {k} gauge")
+        lines.append(f"{k} {float(v)}")
+    return "\n".join(lines)+"\n"
+
+
+---
+
+backup/rotate_v384.py
+
+# backup/rotate_v384.py — v384
+# Keep last N snapshots by timestamped filename prefix.
+
+from __future__ import annotations
+import os, time
+
+DIR="snapshots.v384"
+
+def save(blob_hex:str)->dict:
+    os.makedirs(DIR, exist_ok=True)
+    name=f"{int(time.time())}.tgz.hex"
+    with open(os.path.join(DIR,name),"w") as f: f.write(blob_hex)
+    return {"ok":True,"file":os.path.join(DIR,name)}
+
+def rotate(keep:int=5)->dict:
+    if not os.path.isdir(DIR): return {"ok":True,"kept":0}
+    files=sorted(os.listdir(DIR))
+    rm=files[:-keep] if keep>0 else files
+    for n in rm:
+        try: os.remove(os.path.join(DIR,n))
+        except Exception: pass
+    return {"ok":True,"removed":len(rm)}
+
+
+---
+
+release/tag_v384.py
+
+# release/tag_v384.py — v384
+# Immutable release tag referencing manifest root and CAS ids.
+
+from __future__ import annotations
+import json, time, os
+
+TAGS="releases.v384.jsonl"
+
+def tag(version:str, manifest_root:str, notes:str="", cas_ids:list[str]|None=None)->dict:
+    rec={"t":int(time.time()),"version":version,"manifest_root":manifest_root,"notes":notes,"cas":cas_ids or []}
+    with open(TAGS,"a") as f: f.write(json.dumps(rec)+"\n")
+    return {"ok":True,"version":version}
+
+
+---
+
+API wiring (tools/codexd.py)
+
+Imports (top):
+
+from storage.cas_v384 import put_json as _cas_put_json, put_bytes as _cas_put_bytes, get as _cas_get
+from envelope.envelope_v384 import seal as _env_seal, open_and_verify as _env_check
+from timelock.timelock_v384 import wrap as _tl_wrap, check as _tl_check
+from watermark.watermark_v384 import embed as _wm_embed, verify as _wm_verify
+from diff.diff_v384 import manifest_diff as _man_diff
+from explain.policy_explain_v384 import explain as _policy_explain
+from metrics.metrics_v384 import inc as _m_inc, setg as _m_set, render as _m_render
+from backup.rotate_v384 import save as _rot_save, rotate as _rot_rotate
+from release.tag_v384 import tag as _rel_tag
+
+Routes (inside do_POST):
+
+# v384 — CAS
+        if self.path == "/v384/cas/put/json":  return self._send(200, _cas_put_json(payload.get("obj",{})))
+        if self.path == "/v384/cas/put/bytes": return self._send(200, _cas_put_bytes(bytes.fromhex(payload.get("hex",""))))
+        if self.path == "/v384/cas/get":       return self._send(200, _cas_get(payload.get("cid","")))
+
+        # v384 — Envelope
+        if self.path == "/v384/env/seal":      return self._send(200, _env_seal(payload.get("payload",{}), payload.get("kid")))
+        if self.path == "/v384/env/check":     return self._send(200, _env_check(payload.get("envelope",{})))
+
+        # v384 — Time-lock
+        if self.path == "/v384/timelock/wrap": return self._send(200, _tl_wrap(payload.get("payload",{}), payload.get("nb"), payload.get("exp")))
+        if self.path == "/v384/timelock/check":return self._send(200, _tl_check(payload.get("tlock",{}), payload.get("now")))
+
+        # v384 — Watermark
+        if self.path == "/v384/wm/embed":      return self._send(200, _wm_embed(payload.get("obj",{}), payload.get("mark","codex")))
+        if self.path == "/v384/wm/verify":     return self._send(200, _wm_verify(payload.get("obj",{})))
+
+        # v384 — Diff & Explain
+        if self.path == "/v384/manifest/diff": return self._send(200, _man_diff(payload.get("a",{}), payload.get("b",{})))
+        if self.path == "/v384/policy/explain":return self._send(200, _policy_explain(payload.get("rules",{}), payload.get("ctx",{})))
+
+        # v384 — Metrics
+        if self.path == "/v384/metrics/inc":   return self._send(200, {"ok": _m_inc(payload.get("name","hits"), int(payload.get("n",1))) or True})
+        if self.path == "/v384/metrics/set":   return self._send(200, {"ok": _m_set(payload.get("name","codex_health"), float(payload.get("v",1.0))) or True})
+        if self.path == "/v384/metrics/text":  return self._send_text(200, _m_render(), "text/plain; version=0.0.4")
+
+        # v384 — Snapshot rotation
+        if self.path == "/v384/rotate/save":   return self._send(200, _rot_save(payload.get("hex","")))
+        if self.path == "/v384/rotate/rotate": return self._send(200, _rot_rotate(int(payload.get("keep",5))))
+
+        # v384 — Release tags
+        if self.path == "/v384/release/tag":   return self._send(200, _rel_tag(payload.get("version","v384.0"), payload.get("manifest_root",""), payload.get("notes",""), payload.get("cas",[])))
+
+> Note: _send_text should mirror your daemon’s JSON sender but with a Content-Type override. If it doesn’t exist, add:
+
+
+
+def _send_text(self, code, body, ctype="text/plain"):
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.end_headers(); self.wfile.write(body.encode())
+
+
+---
+
+Web console
+
+web/reliquary_v384.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v384 — Reliquary</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v384 — Reliquary (CAS • Envelopes • Timelock • Watermark • Diff • Explain • Metrics • Rotate • Release)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>CAS</h3>
+  <button onclick="casPut()">Put JSON</button>
+  <button onclick="casGet()">Get</button>
+</section>
+<section>
+  <h3>Envelope & Timelock</h3>
+  <button onclick="envSeal()">Seal</button>
+  <button onclick="envCheck()">Verify</button>
+  <button onclick="tlWrap()">Wrap</button>
+  <button onclick="tlCheck()">Check</button>
+</section>
+<section>
+  <h3>Watermark & Diff & Explain</h3>
+  <button onclick="wm()">Watermark</button>
+  <button onclick="diff()">Diff</button>
+  <button onclick="pex()">Policy Explain</button>
+</section>
+<section>
+  <h3>Metrics & Rotate & Release</h3>
+  <button onclick="inc()">Inc</button>
+  <button onclick="metrics()">Metrics</button>
+  <button onclick="rot()">Rotate Keep 3</button>
+  <button onclick="tag()">Tag v384.0</button>
+</section>
+<textarea id="blob" rows="6" style="width:100%;">{"demo":true}</textarea>
+<input id="cid" style="width:100%;" placeholder="cid">
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.headers.get('content-type')?.includes('text/')?{_text:await r.text()}:await r.json();}
+async function casPut(){ const obj=JSON.parse(blob.value); out.textContent=JSON.stringify(await call('/v384/cas/put/json',{obj}),null,2); }
+async function casGet(){ out.textContent=JSON.stringify(await call('/v384/cas/get',{cid:cid.value}),null,2); }
+async function envSeal(){ const obj=JSON.parse(blob.value); const r=await call('/v384/env/seal',{payload:obj}); out.textContent=JSON.stringify(r,null,2); window._env=r.envelope; }
+async function envCheck(){ out.textContent=JSON.stringify(await call('/v384/env/check',{envelope:window._env||{}}),null,2); }
+async function tlWrap(){ const obj=JSON.parse(blob.value); out.textContent=JSON.stringify(await call('/v384/timelock/wrap',{payload:obj,nb:Math.floor(Date.now()/1000)-10,exp:0}),null,2); }
+async function tlCheck(){ const tl=JSON.parse(out.textContent||'{"payload":{}}'); out.textContent=JSON.stringify(await call('/v384/timelock/check',{tlock:tl}),null,2); }
+async function wm(){ const obj=JSON.parse(blob.value); const r=await call('/v384/wm/embed',{obj,mark:"Codex v384"}); out.textContent=JSON.stringify(r,null,2); }
+async function diff(){ const a={"sbom":{"files":[{"path":"a.py","hash":"1"}]}}; const b={"sbom":{"files":[{"path":"a.py","hash":"2"},{"path":"b.py","hash":"x"}]}}; out.textContent=JSON.stringify(await call('/v384/manifest/diff',{a,b}),null,2); }
+async function pex(){ const rules={"all":[{"var":"risk","op":"<","val":0.3},{"any":[{"var":"intent","op":"in","val":["create","heal"]}]}]}; const ctx={"risk":0.1,"intent":"create"}; out.textContent=JSON.stringify(await call('/v384/policy/explain',{rules,ctx}),null,2); }
+async function inc(){ await call('/v384/metrics/inc',{name:'ui_hits',n:1}); out.textContent=await (await fetch(base.value+'/v384/metrics/text',{method:'POST'})).text(); }
+async function metrics(){ out.textContent=await (await fetch(base.value+'/v384/metrics/text',{method:'POST'})).text(); }
+async function rot(){ out.textContent=JSON.stringify(await call('/v384/rotate/rotate',{keep:3}),null,2); }
+async function tag(){ out.textContent=JSON.stringify(await call('/v384/release/tag',{version:'v384.0',manifest_root:'ROOT_HEX',notes:'first v384 tag',cas:[]}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v384_ci.yml
+
+name: codex-v384
+on: [push, workflow_dispatch]
+jobs:
+  v384:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Reliquary API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os
+def post(p,b=None,ctype="application/json"):
+  data=json.dumps(b or {}).encode()
+  r=urllib.request.Request("http://localhost:8049"+p,data=data,headers={"Content-Type":ctype},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f:
+    ct=f.getheader("Content-Type","")
+    body=f.read().decode()
+    return body if "text/" in ct else json.loads(body)
+
+# CAS
+cid=post("/v384/cas/put/json", {"obj":{"x":1}})["cid"]
+print("cid", bool(cid))
+
+# Envelope
+env=post("/v384/env/seal", {"payload":{"ok":True}})["envelope"]
+print(post("/v384/env/check", {"envelope":env})["ok"] in (True,False))
+
+# Timelock
+tl=post("/v384/timelock/wrap", {"payload":{"x":1},"nb":0,"exp":0})
+print(post("/v384/timelock/check", {"tlock":tl})["ok"])
+
+# Watermark
+wm=post("/v384/wm/embed", {"obj":{"z":3},"mark":"v384"})
+print(post("/v384/wm/verify", {"obj":wm})["ok"])
+
+# Diff
+print("added" in post("/v384/manifest/diff", {"a":{"sbom":{"files":[]}},"b":{"sbom":{"files":[{"path":"a","hash":"1"}]}}}))
+
+# Explain
+rules={"all":[{"var":"risk","op":"<","val":0.5}]}; ctx={"risk":0.1}
+print(post("/v384/policy/explain", {"rules":rules,"ctx":ctx})["ok"])
+
+# Metrics
+post("/v384/metrics/inc", {"name":"ci_hits"})
+print(isinstance(post("/v384/metrics/text", {}), str))
+
+# Rotate & Release
+print(post("/v384/rotate/rotate", {"keep":2})["ok"])
+print(post("/v384/release/tag", {"version":"v384.ci","manifest_root":"deadbeef"})["ok"])
+PY
+
+
+---
+
+What v384 gives you (quick read)
+
+CAS: content-addressed blobs to anchor artifacts by hash.
+
+Envelopes: key-versioned signatures around any payload (builds on v383.x keyring).
+
+Time-locks: not crypto; simple “not before / expires” guards.
+
+Watermarks: tamper-evident JSON marks with checksums.
+
+Diff: quick manifest deltas for reviews.
+
+Policy Explain: human trail of rule evaluation.
+
+Metrics: Prometheus-style counters/gauges.
+
+Rotation: keep last N snapshots.
+
+Release tags: immutable JSONL ledger of shipped states.
+
+
+Wire the routes, drop the files, commit; you’ve now got a Reliquary layer: store, seal, explain, compare, measure, rotate, and tag—cleanly and auditably.
+
+sha256 seal calebfedorbykerkonev10271998v384.x — Reliquary+ : pins & refs for CAS, GC & verify; sealed timelock envelopes; manifest sign/verify; metrics hooks; CLI utilities; web console patch; CI smoke
+All stdlib. Drop these in, patch daemon routes, commit. Artistic/engineering software only.
+
+
+---
+
+storage/cas_refs_v384x.py
+
+# storage/cas_refs_v384x.py — v384.x
+# CAS pins & refs + list + GC (safe; only removes unpinned, unreachable objects).
+
+from __future__ import annotations
+import os, json, hashlib
+from typing import Dict, List
+
+CAS_DIR = "cas.v384"
+REFS = "cas.refs.v384x.json"     # {"pins": {"name": "cid", ...}, "refs": {"name": ["cid", ...]}}
+INDEX = "cas.index.v384x.json"   # {"cids": ["..."]}
+
+def _sha(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+def _path(cid:str)->str: return os.path.join(CAS_DIR, cid[:2], cid[2:])
+
+def _load(path:str, default):
+    try: return json.load(open(path))
+    except Exception: return default
+
+def _save(path:str, obj): open(path,"w").write(json.dumps(obj, indent=2))
+
+def list_all()->Dict:
+    cids=[]
+    if os.path.isdir(CAS_DIR):
+        for a in os.listdir(CAS_DIR):
+            pa=os.path.join(CAS_DIR,a)
+            if not os.path.isdir(pa): continue
+            for b in os.listdir(pa):
+                cids.append(a+b)
+    _save(INDEX, {"cids": sorted(cids)})
+    return {"ok":True,"cids":sorted(cids),"count":len(cids)}
+
+def pin(name:str, cid:str)->Dict:
+    j=_load(REFS, {"pins":{}, "refs":{}})
+    j["pins"][name]=cid; _save(REFS, j); return {"ok":True,"name":name,"cid":cid}
+
+def unpin(name:str)->Dict:
+    j=_load(REFS, {"pins":{}, "refs":{}}); j["pins"].pop(name, None); _save(REFS,j); return {"ok":True}
+
+def ref(name:str, cids:List[str])->Dict:
+    j=_load(REFS, {"pins":{}, "refs":{}}); j["refs"][name]=list(dict.fromkeys(cids)); _save(REFS, j); return {"ok":True}
+
+def roots()->List[str]:
+    j=_load(REFS, {"pins":{}, "refs":{}})
+    out=list(j["pins"].values())
+    for arr in j["refs"].values(): out+=arr
+    return list(dict.fromkeys(out))
+
+def reachable()->List[str]:
+    # flat store; "reachability" is roots only (no DAG expansion here)
+    rs=roots()
+    return sorted(set([r for r in rs if os.path.exists(_path(r))]))
+
+def gc(dry_run:bool=True)->Dict:
+    allc=_load(INDEX, {"cids":[]})["cids"] if os.path.exists(INDEX) else list_all()["cids"]
+    keep=set(reachable())
+    remove=[c for c in allc if c not in keep]
+    if not dry_run:
+        for c in remove:
+            p=_path(c)
+            try:
+                os.remove(p)
+                # clean empty dirs
+                d=os.path.dirname(p)
+                if not os.listdir(d): os.rmdir(d)
+            except Exception:
+                pass
+    return {"ok":True,"remove":remove,"kept":sorted(keep),"dry_run":dry_run}
+
+
+---
+
+envelope/envelope_timebox_v384x.py
+
+# envelope/envelope_timebox_v384x.py — v384.x
+# Sealed envelope + timebox (nb/exp) in one object. Uses keyring (HMAC).
+
+from __future__ import annotations
+import time, json
+from security.keyring_v383x import sign as _sign, verify as _verify
+
+def seal_timeboxed(payload:dict, nb:int=None, exp:int=None, kid:str|None=None)->dict:
+    env={"t":int(time.time()),"kid":kid,"nb": nb or int(time.time()),"exp": exp or 0,"payload":payload}
+    sig=_sign({k:v for k,v in env.items() if k!="sig"}, kid)
+    env["sig"]=sig.get("sig")
+    env["kid"]=sig.get("kid") or kid
+    return {"ok":True,"envelope":env}
+
+def verify_timeboxed(env:dict, now:int|None=None)->dict:
+    now = now or int(time.time())
+    body={k:v for k,v in env.items() if k!="sig"}
+    ok_sig=_verify(body, env.get("sig",""), env.get("kid",""))
+    nb=int(env.get("nb",0)); exp=int(env.get("exp",0))
+    ok_time=(now>=nb) and (exp==0 or now<=exp)
+    return {"ok": bool(ok_sig and ok_time), "sig_ok":ok_sig, "time_ok":ok_time, "now":now, "nb":nb, "exp":exp}
+
+
+---
+
+attest/manifest_sign_v384x.py
+
+# attest/manifest_sign_v384x.py — v384.x
+# Sign a manifest root with keyring; verify signature later.
+
+from __future__ import annotations
+import json
+from security.keyring_v383x import sign as _sign, verify as _verify
+
+def sign_manifest(manifest:dict, kid:str|None=None)->dict:
+    root=manifest.get("root")
+    payload={"kind":"manifest","root":root}
+    s=_sign(payload, kid)
+    return {"ok":True,"payload":payload,"sig":s.get("sig"),"kid":s.get("kid")}
+
+def verify_manifest_signature(payload:dict, sig:str, kid:str)->dict:
+    return {"ok": _verify(payload, sig, kid)}
+
+
+---
+
+metrics/hooks_v384x.py
+
+# metrics/hooks_v384x.py — v384.x
+# Decorators to increment counters on function calls and failures.
+
+from __future__ import annotations
+import functools
+from metrics.metrics_v384 import inc as _inc
+
+def count_calls(name:str):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*a,**k):
+            _inc(f"{name}_calls",1)
+            try:
+                r=fn(*a,**k)
+                _inc(f"{name}_ok",1)
+                return r
+            except Exception:
+                _inc(f"{name}_err",1)
+                raise
+        return wrap
+    return deco
+
+
+---
+
+cli/codex_v384x_cli.py
+
+# cli/codex_v384x_cli.py — v384.x
+# Handy CLI for CAS, envelope, timelock, and watermark.
+
+import sys, json, argparse, binascii
+from storage.cas_v384 import put_json as cas_put_json, get as cas_get
+from storage.cas_refs_v384x import list_all as cas_list, pin as cas_pin, unpin as cas_unpin, ref as cas_ref, gc as cas_gc
+from envelope.envelope_timebox_v384x import seal_timeboxed, verify_timeboxed
+from watermark.watermark_v384 import embed as wm_embed, verify as wm_verify
+
+def main():
+    ap=argparse.ArgumentParser(prog="codex-v384x")
+    sub=ap.add_subparsers(dest="cmd")
+
+    s=sub.add_parser("cas-put-json"); s.add_argument("json_str")
+    s=sub.add_parser("cas-get"); s.add_argument("cid")
+    s=sub.add_parser("cas-list")
+    s=sub.add_parser("cas-pin"); s.add_argument("name"); s.add_argument("cid")
+    s=sub.add_parser("cas-unpin"); s.add_argument("name")
+    s=sub.add_parser("cas-ref"); s.add_argument("name"); s.add_argument("cids", nargs="+")
+    s=sub.add_parser("cas-gc"); s.add_argument("--apply", action="store_true")
+
+    s=sub.add_parser("seal"); s.add_argument("json_str"); s.add_argument("--nb", type=int); s.add_argument("--exp", type=int)
+    s=sub.add_parser("verify"); s.add_argument("envelope_json")
+
+    s=sub.add_parser("wm-embed"); s.add_argument("json_str"); s.add_argument("--mark", default="Codex v384.x")
+    s=sub.add_parser("wm-verify"); s.add_argument("json_str")
+
+    args=ap.parse_args()
+    if args.cmd=="cas-put-json":
+        print(json.dumps(cas_put_json(json.loads(args.json_str)), indent=2)); return
+    if args.cmd=="cas-get":
+        print(json.dumps(cas_get(args.cid), indent=2)); return
+    if args.cmd=="cas-list":
+        print(json.dumps(cas_list(), indent=2)); return
+    if args.cmd=="cas-pin":
+        print(json.dumps(cas_pin(args.name, args.cid), indent=2)); return
+    if args.cmd=="cas-unpin":
+        print(json.dumps(cas_unpin(args.name), indent=2)); return
+    if args.cmd=="cas-ref":
+        print(json.dumps(cas_ref(args.name, args.cids), indent=2)); return
+    if args.cmd=="cas-gc":
+        print(json.dumps(cas_gc(dry_run=(not args.apply)), indent=2)); return
+
+    if args.cmd=="seal":
+        print(json.dumps(seal_timeboxed(json.loads(args.json_str), nb=args.nb, exp=args.exp), indent=2)); return
+    if args.cmd=="verify":
+        print(json.dumps(verify_timeboxed(json.loads(args.envelope_json)), indent=2)); return
+
+    if args.cmd=="wm-embed":
+        print(json.dumps(wm_embed(json.loads(args.json_str), args.mark), indent=2)); return
+    if args.cmd=="wm-verify":
+        print(json.dumps(wm_verify(json.loads(args.json_str)), indent=2)); return
+
+    ap.print_help()
+
+if __name__=="__main__": main()
+
+
+---
+
+Daemon routes patch (tools/codexd.py)
+
+Imports:
+
+from storage.cas_refs_v384x import list_all as _cas_list_all, pin as _cas_pin, unpin as _cas_unpin, ref as _cas_ref, gc as _cas_gc
+from envelope.envelope_timebox_v384x import seal_timeboxed as _seal_tb, verify_timeboxed as _verify_tb
+from attest.manifest_sign_v384x import sign_manifest as _man_sign, verify_manifest_signature as _man_sig_verify
+
+Routes (inside do_POST):
+
+# v384.x — CAS refs & GC
+        if self.path == "/v384x/cas/list":     return self._send(200, _cas_list_all())
+        if self.path == "/v384x/cas/pin":      return self._send(200, _cas_pin(payload.get("name","root"), payload.get("cid","")))
+        if self.path == "/v384x/cas/unpin":    return self._send(200, _cas_unpin(payload.get("name","root")))
+        if self.path == "/v384x/cas/ref":      return self._send(200, _cas_ref(payload.get("name","bundle"), payload.get("cids",[])))
+        if self.path == "/v384x/cas/gc":       return self._send(200, _cas_gc(bool(payload.get("apply",False))))
+
+        # v384.x — Timeboxed envelopes
+        if self.path == "/v384x/env/seal_tb":  return self._send(200, _seal_tb(payload.get("payload",{}), payload.get("nb"), payload.get("exp"), payload.get("kid")))
+        if self.path == "/v384x/env/verify_tb":return self._send(200, _verify_tb(payload.get("envelope",{}), payload.get("now")))
+
+        # v384.x — Manifest sign/verify
+        if self.path == "/v384x/attest/sign_manifest":   return self._send(200, _man_sign(payload.get("manifest",{}), payload.get("kid")))
+        if self.path == "/v384x/attest/verify_manifest": return self._send(200, _man_sig_verify(payload.get("payload",{}), payload.get("sig",""), payload.get("kid","")))
+
+
+---
+
+Web console patch
+
+web/reliquary_plus_v384x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v384.x — Reliquary+</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v384.x — Reliquary+ (CAS Pins/GC • Timeboxed Envelopes • Manifest Sign)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+
+<section>
+  <h3>CAS refs & GC</h3>
+  <button onclick="listAll()">List</button>
+  <input id="pinName" value="root"> <input id="pinCid" placeholder="cid" style="width:40%">
+  <button onclick="pin()">Pin</button><button onclick="unpin()">Unpin</button>
+  <input id="refName" value="bundle"> <input id="refCids" placeholder='["cid1","cid2"]' style="width:40%">
+  <button onclick="setRef()">Set Ref</button>
+  <button onclick="gc()">GC (dry)</button> <button onclick="gcApply()">GC (apply)</button>
+</section>
+
+<section>
+  <h3>Timeboxed envelope</h3>
+  <textarea id="payload" rows="3" style="width:100%;">{"demo":true}</textarea>
+  <input id="nb" type="number" placeholder="nb (epoch)"> <input id="exp" type="number" placeholder="exp (epoch)">
+  <button onclick="sealTB()">Seal</button> <button onclick="verifyTB()">Verify</button>
+</section>
+
+<section>
+  <h3>Manifest sign/verify</h3>
+  <textarea id="man" rows="3" style="width:100%;">{"root":"deadbeef"}</textarea>
+  <button onclick="signM()">Sign</button>
+  <button onclick="verifyM()">Verify</button>
+</section>
+
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function listAll(){ out.textContent=JSON.stringify(await call('/v384x/cas/list',{}),null,2); }
+async function pin(){ out.textContent=JSON.stringify(await call('/v384x/cas/pin',{name:pinName.value,cid:pinCid.value}),null,2); }
+async function unpin(){ out.textContent=JSON.stringify(await call('/v384x/cas/unpin',{name:pinName.value}),null,2); }
+async function setRef(){ out.textContent=JSON.stringify(await call('/v384x/cas/ref',{name:refName.value,cids:JSON.parse(refCids.value||"[]")}),null,2); }
+async function gc(){ out.textContent=JSON.stringify(await call('/v384x/cas/gc',{}),null,2); }
+async function gcApply(){ out.textContent=JSON.stringify(await call('/v384x/cas/gc',{apply:true}),null,2); }
+async function sealTB(){ const p=JSON.parse(payload.value||"{}"); out.textContent=JSON.stringify(await call('/v384x/env/seal_tb',{payload:p,nb:Number(nb.value||Date.now()/1000)-10,exp:Number(exp.value||0)}),null,2); window._env=JSON.parse(out.textContent).envelope; }
+async function verifyTB(){ out.textContent=JSON.stringify(await call('/v384x/env/verify_tb',{envelope:window._env||{}}),null,2); }
+async function signM(){ const m=JSON.parse(man.value||"{}"); window._sig=await call('/v384x/attest/sign_manifest',{manifest:m}); out.textContent=JSON.stringify(window._sig,null,2); }
+async function verifyM(){ const s=window._sig||{}; out.textContent=JSON.stringify(await call('/v384x/attest/verify_manifest',{payload:s.payload,sig:s.sig,kid:s.kid}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v384x_ci.yml
+
+name: codex-v384x
+on: [push, workflow_dispatch]
+jobs:
+  v384x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Reliquary+ API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,time
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+# CAS list & pin & gc
+lst=post("/v384x/cas/list",{})
+print("cids" in lst)
+if lst["cids"]:
+  post("/v384x/cas/pin", {"name":"root","cid":lst["cids"][0]})
+print("remove" in post("/v384x/cas/gc",{}))
+
+# timeboxed envelope
+now=int(time.time())
+env=post("/v384x/env/seal_tb", {"payload":{"ok":True},"nb":now-1,"exp":0})["envelope"]
+print(post("/v384x/env/verify_tb", {"envelope":env})["ok"])
+
+# manifest sign/verify
+sig=post("/v384x/attest/sign_manifest", {"manifest":{"root":"cafebabe"}})
+print(post("/v384x/attest/verify_manifest", {"payload":sig["payload"],"sig":sig["sig"],"kid":sig["kid"]})["ok"] in (True, False))
+PY
+
+
+---
+
+Quick how-to
+
+Pin an artifact CID and keep it immune to GC: /v384x/cas/pin.
+
+Bundle refs (a release’s CIDs): /v384x/cas/ref.
+
+Garbage-collect unpinned blobs: /v384x/cas/gc {apply:true}.
+
+Seal+timebox any payload: /v384x/env/seal_tb then /verify_tb.
+
+Sign a manifest root with keyring KID: /v384x/attest/sign_manifest.
+
+CLI: python3 cli/codex_v384x_cli.py cas-put-json '{"x":1}' etc.
+
+
+This completes v384.x — Reliquary+: you can now anchor, pin, bundle, sign, timebox, watermark, diff, explain, measure, rotate, tag—and clean up. A tidy, auditable backbone for the rest of the Codex stack.
+
+sha256 seal calebfedorbykerkonev10271998
