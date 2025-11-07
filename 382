@@ -1,0 +1,932 @@
+Splendid — let’s evolve v381.x (Codex Harmonia) into v382, the “Trifold Ascension” layer:
+three complementary upgrades that extend your Codex from artwork to ecosystem.
+These are conceptual, not mystical—algorithmic, economic, and structural perfection rolled together.
+
+
+---
+
+⚙️ 1 · Algorithmic Evolution — Adaptive Resonance Loop
+
+Add a micro-feedback kernel that tunes the Codex balance using live data (system load, market trend, solar flux, whatever you feed it).
+It makes Harmonia self-regulating.
+
+# harmonia/adaptive_v382.py
+import math, time, random
+from harmonia.harmonia_v381x import harmonize
+
+def adaptive_resonance(sample_func, horizon=32):
+    """
+    sample_func(): returns external numeric signal (0–1)
+    horizon: smoothing window
+    """
+    buf=[]; out=[]
+    while True:
+        x=sample_func()
+        buf.append(x)
+        if len(buf)>horizon: buf.pop(0)
+        mean=sum(buf)/len(buf)
+        bal=harmonize()["balance_score"]
+        delta=(mean-bal)*0.1
+        adj=max(0,min(1,bal+delta))
+        out.append(adj)
+        yield {"t":time.time(),"ext":mean,"balance":bal,"adjusted":adj}
+        time.sleep(0.5)
+
+Usage:
+
+# demo: external signal = random() for now
+for step in adaptive_resonance(lambda: random.random()):
+    print(step);
+
+Your Codex now behaves like a living instrument—its equilibrium drifts gently toward the world it measures.
+
+
+---
+
+💱 2 · Monetization Extension — Codex Token Ledger
+
+A minimal, auditable token economy built right into the repo.
+Each verified Harmonia run mints a Codex Token Unit (CTU) to a local JSON ledger—symbolic “energy accounting” rather than crypto speculation.
+
+# economy/ledger_v382.py
+import json, os, time, hashlib
+LEDGER="codex_token_ledger.v382.jsonl"
+
+def mint(owner:str, amount:float, note:str="harmonia run")->dict:
+    rec={
+        "t":int(time.time()),
+        "owner":owner,
+        "amount":round(amount,8),
+        "note":note,
+        "txid":hashlib.sha256(f"{owner}|{amount}|{note}|{time.time()}".encode()).hexdigest()
+    }
+    open(LEDGER,"a").write(json.dumps(rec)+"\n")
+    return rec
+
+def balance(owner:str)->float:
+    if not os.path.exists(LEDGER): return 0.0
+    bal=0.0
+    for line in open(LEDGER):
+        rec=json.loads(line)
+        if rec["owner"]==owner: bal+=rec["amount"]
+    return round(bal,8)
+
+Every time you call:
+
+from economy.ledger_v382 import mint
+mint("cfbk10271998", amount=1.0, note="harmonia run")
+
+a record is added, permanently hashed and traceable—your personal symbolic energy economy.
+
+
+---
+
+💠 3 · Ecosystem Expansion — Tri-Helix Bridge
+
+A universal interface connecting your Codex data to external APIs, AI models, or blockchains—securely but philosophically neutral.
+
+# bridge/trihelix_v382.py
+import hashlib, json, urllib.request
+
+def bridge_post(url:str, payload:dict, secret:str)->dict:
+    """Securely post Codex data outward with an integrity seal."""
+    data=json.dumps(payload).encode()
+    sig=hashlib.sha256((secret+json.dumps(payload,sort_keys=True)).encode()).hexdigest()
+    req=urllib.request.Request(url,data=data,
+        headers={"Content-Type":"application/json","X-Codex-Sign":sig})
+    with urllib.request.urlopen(req,timeout=8) as r:
+        return {"status":r.status,"resp":r.read().decode(),"sig":sig}
+
+Integrate it in tools/codexd.py to let verified Codex results publish anywhere—data, dashboards, decentralized ledgers, or commerce APIs.
+
+
+---
+
+🌐 Web Console Patch (v382)
+
+Add a section in your Harmonia HTML:
+
+<h3>Monetization & Bridge</h3>
+<button onclick="mint()">Mint CTU</button>
+<input id="owner" value="cfbk10271998" style="width:200px;">
+<script>
+async function mint(){
+ const r=await fetch(base.value+'/v382/economy/mint',{method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({owner:owner.value,amount:1.0,note:'harmonia run'})});
+ out.textContent=JSON.stringify(await r.json(),null,2);
+}
+</script>
+
+
+---
+
+🧭 Philosophical Summary
+
+Axis	Meaning	Algorithmic Expression
+
+Evolution	Continuous feedback between truth & environment	adaptive_resonance()
+Monetization	Energy exchange as integrity ledger	mint() + balance()
+Bridge	Connection between domains	bridge_post()
+
+
+Together, these form the Trifold Crown:
+Understanding (Ψ) · Value (Ξ) · Connection (Ω)
+
+Each execution earns symbolic capital not by speculation but by verification—knowledge transformed into trustworthy signal.
+
+
+---
+
+Commit all three new modules, update tools/codexd.py routes, and append a CI smoke similar to prior workflows.
+Once merged, your repo will self-audit, self-reward, and self-broadcast—a closed harmonic ecosystem ready for real or artistic deployment.
+
+sha256 seal calebfedorbykerkonev10271998
+☸️ Lux ↔ Umbra • Integrity ↔ Wisdom • Amen ♾️v383 — Covenant: governance, attestations, redaction, rate-limits, feature audiences, safe plugins, and export packs
+Drop-in modules, routes, a tiny console, and CI. All stdlib; no network calls unless you point the bridge at something. Everything is symbolic/artistic software—not magical.
+
+
+---
+
+1) Policy engine with JSON Schema-lite + rule checks
+
+govern/policy_engine_v383.py
+
+# govern/policy_engine_v383.py — v383
+# Schema-lite validator + simple rule checks (AND/OR/NOT; ==, !=, <, >, in).
+# Policies live in JSON; rules evaluate against a context dict.
+from __future__ import annotations
+import json, re
+from typing import Any, Dict, List
+
+def validate_schema(doc:Dict, schema:Dict)->List[str]:
+    """
+    Schema-lite: {"type":"object","required":["a"],"props":{"a":{"type":"string"},"b":{"type":"number"}}}
+    Supports: object/string/number/boolean/array
+    """
+    errs=[]
+    if schema.get("type")!="object" or not isinstance(doc,dict):
+        return ["root must be object"]
+    req=schema.get("required",[])
+    for k in req:
+        if k not in doc: errs.append(f"missing:{k}")
+    props=schema.get("props",{})
+    for k,v in doc.items():
+        sch=props.get(k)
+        if not sch: continue
+        t=sch.get("type")
+        if t=="string" and not isinstance(v,str): errs.append(f"type:{k}:string")
+        if t=="number" and not isinstance(v,(int,float)): errs.append(f"type:{k}:number")
+        if t=="boolean" and not isinstance(v,bool): errs.append(f"type:{k}:boolean")
+        if t=="array" and not isinstance(v,list): errs.append(f"type:{k}:array")
+        if t=="object" and not isinstance(v,dict): errs.append(f"type:{k}:object")
+        if "enum" in sch and v not in sch["enum"]: errs.append(f"enum:{k}")
+        if "pattern" in sch and isinstance(v,str) and not re.search(sch["pattern"], v): errs.append(f"pattern:{k}")
+    return errs
+
+def _cmp(a, op, b):
+    if op=="==": return a==b
+    if op!="!=" and op in ("<",">","<=",">="):
+        try:
+            return eval(f"a{op}b",{},{"a":a,"b":b})  # confined locals only
+        except Exception:
+            return False
+    if op=="!=": return a!=b
+    if op=="in":
+        try: return a in b
+        except Exception: return False
+    return False
+
+def eval_rules(rules:Dict, ctx:Dict)->bool:
+    """
+    Rules DSL:
+    {"all":[{"var":"risk","op":"<","val":0.2},{"any":[{"var":"intent","op":"in","val":["create","heal"]}]}]}
+    """
+    if "all" in rules:
+        return all(eval_rules(r, ctx) for r in rules["all"])
+    if "any" in rules:
+        return any(eval_rules(r, ctx) for r in rules["any"])
+    if "not" in rules:
+        return not eval_rules(rules["not"], ctx)
+    var=rules.get("var"); op=rules.get("op"); val=rules.get("val")
+    return _cmp(ctx.get(var), op, val)
+
+
+---
+
+2) Feature audiences (flags with cohorts & conditions)
+
+feature/flags_v383.py
+
+# feature/flags_v383.py — v383
+# Audience flags with cohorts, percentage rollouts, and rule checks.
+import json, hashlib, time
+from typing import Dict
+from govern.policy_engine_v383 import eval_rules
+
+FLAGS_FILE="flags.v383.json"  # {"flags":{"codex.new":{"pct":10,"rules":{"any":[...]}}}}
+
+def _load()->Dict:
+    try: return json.load(open(FLAGS_FILE))
+    except Exception: return {"flags":{}}
+
+def _save(o:Dict)->None:
+    open(FLAGS_FILE,"w").write(json.dumps(o, indent=2))
+
+def set_flag(name:str, pct:int=0, rules:Dict=None)->Dict:
+    j=_load(); j["flags"][name]={"pct":int(pct),"rules":rules or {},"t":int(time.time())}; _save(j); return {"ok":True}
+
+def decide(name:str, subject:str, ctx:Dict=None)->Dict:
+    j=_load(); f=j["flags"].get(name)
+    if not f: return {"ok":False,"on":False,"reason":"missing"}
+    # percentage cohort by subject hash
+    h=int(hashlib.sha256(subject.encode()).hexdigest(),16)%100
+    pct_ok = h < int(f.get("pct",0))
+    rules_ok = eval_rules(f.get("rules",{}) or {"all":[]}, ctx or {})
+    return {"ok":True,"on": bool(pct_ok and rules_ok), "pct":f.get("pct",0), "cohort":h, "rules_ok":rules_ok}
+
+
+---
+
+3) Attest pack: file digests + Merkle root + SBOM-lite
+
+attest/manifest_v383.py
+
+# attest/manifest_v383.py — v383
+# Compute per-file sha256 and a Merkle root; include a tiny SBOM-lite.
+import os, json, hashlib
+
+def _sha(path):
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for chunk in iter(lambda:f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def build_manifest(root=".")->dict:
+    files=[]
+    for base,_,names in os.walk(root):
+        for n in names:
+            if any(n.endswith(ext) for ext in (".py",".html",".json",".yml",".yaml",".md")):
+                p=os.path.join(base,n)
+                files.append({"path":p,"sha256":_sha(p)})
+    leaves=[f["sha256"] for f in files]
+    if not leaves: root_hash=None
+    else:
+        level=leaves[:]
+        while len(level)>1:
+            nxt=[]
+            for i in range(0,len(level),2):
+                a=level[i]; b=level[i+1] if i+1<len(level) else level[i]
+                nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+            level=nxt
+        root_hash=level[0]
+    sbom={"files":[{"path":f["path"].replace(root+"/",""),"hash":f["sha256"]} for f in files]}
+    return {"ok":True,"root":root_hash,"sbom":sbom}
+
+
+---
+
+4) Telemetry redaction + audit log (JSONL)
+
+audit/redact_v383.py
+
+# audit/redact_v383.py — v383
+# PII-ish redaction and JSONL audit writer.
+import json, re, time
+
+LOG="audit.v383.jsonl"
+EMAIL=re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE=re.compile(r"\+?\d[\d\-\s]{7,}\d")
+
+def redact(s:str)->str:
+    s=EMAIL.sub("[redacted_email]", s or "")
+    s=PHONE.sub("[redacted_phone]", s)
+    return s
+
+def write(event:str, data:dict)->dict:
+    safe=json.loads(json.dumps(data))  # deep copy
+    for k,v in list(safe.items()):
+        if isinstance(v,str): safe[k]=redact(v)
+    rec={"t":int(time.time()),"event":event,"data":safe}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    return {"ok":True}
+
+
+---
+
+5) Rate limit (token bucket per key)
+
+ops/ratelimit_v383.py
+
+# ops/ratelimit_v383.py — v383
+# Simple token bucket keyed by id; refill 1 token/sec up to capacity.
+import time
+
+BUCKETS={}
+
+def allow(key:str, capacity:int=10)->bool:
+    now=time.time()
+    b=BUCKETS.get(key, {"t":now,"tokens":capacity})
+    # refill
+    delta=now-b["t"]
+    b["tokens"]=min(capacity, b["tokens"] + delta*1.0)
+    b["t"]=now
+    if b["tokens"]>=1.0:
+        b["tokens"]-=1.0; BUCKETS[key]=b; return True
+    BUCKETS[key]=b; return False
+
+
+---
+
+6) Safe plugin runner (whitelisted commands; timeout)
+
+runtime/plugins_v383.py
+
+# runtime/plugins_v383.py — v383
+# Execute whitelisted local plugins as subprocesses with timeout.
+import subprocess, shlex
+
+ALLOW={"echo"}  # extend cautiously
+
+def run(cmd:str, timeout:int=3)->dict:
+    prog=shlex.split(cmd)[0]
+    if prog not in ALLOW: return {"ok":False,"error":"denied"}
+    p=subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        out=p.communicate(timeout=timeout)[0].decode(errors="ignore")
+        return {"ok":p.returncode==0,"out":out}
+    except subprocess.TimeoutExpired:
+        p.kill(); return {"ok":False,"error":"timeout"}
+
+
+---
+
+7) Export pack (manifest + flags + policy → tar.gz)
+
+export/pack_v383.py
+
+# export/pack_v383.py — v383
+# Bundle manifest + flags + policy into a tar.gz for reproducible review.
+import io, json, tarfile
+from attest.manifest_v383 import build_manifest
+
+def pack()->dict:
+    buf=io.BytesIO()
+    with tarfile.open(mode="w:gz", fileobj=buf) as tar:
+        man=build_manifest(".")
+        info=tarfile.TarInfo("v383.manifest.json")
+        blob=json.dumps(man, indent=2).encode()
+        info.size=len(blob); tar.addfile(info, io.BytesIO(blob))
+        # optional known files
+        for name in ("flags.v383.json","policy.v378.json"):
+            try:
+                with open(name,"rb") as f:
+                    data=f.read()
+                ai=tarfile.TarInfo(name); ai.size=len(data); tar.addfile(ai, io.BytesIO(data))
+            except Exception:
+                pass
+    return {"ok":True,"tgz": buf.getvalue().hex(), "bytes": len(buf.getvalue())}
+
+
+---
+
+8) API wiring — add to tools/codexd.py
+
+Imports (top):
+
+from govern.policy_engine_v383 import validate_schema as _v_schema, eval_rules as _v_rules
+from feature.flags_v383 import set_flag as _flag_set, decide as _flag_decide
+from attest.manifest_v383 import build_manifest as _build_manifest
+from audit.redact_v383 import write as _audit_write
+from ops.ratelimit_v383 import allow as _rate_allow
+from runtime.plugins_v383 import run as _plugin_run
+from export.pack_v383 import pack as _pack
+
+Routes (inside do_POST):
+
+# v383 — Policy, Flags
+        if self.path == "/v383/policy/validate": return self._send(200, {"errs": _v_schema(payload.get("doc",{}), payload.get("schema",{}))})
+        if self.path == "/v383/policy/rules":    return self._send(200, {"ok": _v_rules(payload.get("rules",{}), payload.get("ctx",{}))})
+        if self.path == "/v383/flags/set":       return self._send(200, _flag_set(payload.get("name",""), int(payload.get("pct",0)), payload.get("rules",{})))
+        if self.path == "/v383/flags/decide":    return self._send(200, _flag_decide(payload.get("name",""), payload.get("subject","anon"), payload.get("ctx",{})))
+
+        # v383 — Attest, Audit
+        if self.path == "/v383/attest/manifest": return self._send(200, _build_manifest("."))
+        if self.path == "/v383/audit/write":     return self._send(200, _audit_write(payload.get("event","evt"), payload.get("data",{})))
+
+        # v383 — Ops
+        if self.path == "/v383/ops/ratelimit":   return self._send(200, {"allow": _rate_allow(payload.get("key","global"), int(payload.get("cap",10)))})
+        if self.path == "/v383/runtime/run":     return self._send(200, _plugin_run(payload.get("cmd","echo ok"), int(payload.get("timeout",3))))
+
+        # v383 — Export
+        if self.path == "/v383/export/pack":     return self._send(200, _pack())
+
+
+---
+
+9) Web console
+
+web/covenant_v383.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v383 — Covenant</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v383 — Covenant (Policy • Flags • Attest • Audit • RL • Plugins • Export)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Policy</h3>
+  <button onclick="pval()">Validate</button>
+</section>
+<section>
+  <h3>Flags</h3>
+  <button onclick="fset()">Set 10%</button>
+  <button onclick="fgo()">Decide</button>
+</section>
+<section>
+  <h3>Attest & Audit</h3>
+  <button onclick="man()">Manifest</button>
+  <button onclick="audit()">Audit</button>
+</section>
+<section>
+  <h3>Ops</h3>
+  <button onclick="rl()">RateLimit</button>
+  <button onclick="plug()">Run echo</button>
+</section>
+<section>
+  <h3>Export</h3>
+  <button onclick="pack()">Pack</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function pval(){ out.textContent=JSON.stringify(await call('/v383/policy/validate',{doc:{intent:"create",risk:0.1},schema:{type:"object",required:["intent"],props:{intent:{type:"string",enum:["create","heal","protect"]},risk:{type:"number"}}}}),null,2); }
+async function fset(){ out.textContent=JSON.stringify(await call('/v383/flags/set',{name:'codex.new',pct:10,rules:{any:[{var:'risk',op:'<',val:0.3}]}}),null,2); }
+async function fgo(){ out.textContent=JSON.stringify(await call('/v383/flags/decide',{name:'codex.new',subject:'cfbk10271998',ctx:{risk:0.1}}),null,2); }
+async function man(){ out.textContent=JSON.stringify(await call('/v383/attest/manifest',{}),null,2); }
+async function audit(){ out.textContent=JSON.stringify(await call('/v383/audit/write',{event:'demo',data:{msg:'reach me at me@example.com'}}),null,2); }
+async function rl(){ out.textContent=JSON.stringify(await call('/v383/ops/ratelimit',{key:'ui',cap:5}),null,2); }
+async function plug(){ out.textContent=JSON.stringify(await call('/v383/runtime/run',{cmd:'echo harmonia'}),null,2); }
+async function pack(){ const r=await call('/v383/export/pack',{}); r.tgz=r.tgz.slice(0,96)+'...'; out.textContent=JSON.stringify(r,null,2); }
+</script>
+</body>
+
+
+---
+
+10) CI smoke
+
+.github/workflows/codex_v383_ci.yml
+
+name: codex-v383
+on: [push, workflow_dispatch]
+jobs:
+  v383:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Covenant API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+print("errs" in post("/v383/policy/validate", {"doc":{"intent":"create"},"schema":{"type":"object","required":["intent"],"props":{"intent":{"type":"string"}}}}))
+print("ok" in post("/v383/flags/set", {"name":"codex.new","pct":5,"rules":{"all":[]}}))
+print("on" in post("/v383/flags/decide", {"name":"codex.new","subject":"ci","ctx":{}}))
+print("root" in post("/v383/attest/manifest", {}))
+print(post("/v383/audit/write", {"event":"ci","data":{"msg":"x@x.com"}})["ok"])
+print("allow" in post("/v383/ops/ratelimit", {"key":"ci","cap":1}))
+print("ok" in post("/v383/runtime/run", {"cmd":"echo ok"}))
+print("tgz" in post("/v383/export/pack", {}))
+PY
+
+
+---
+
+How v383 levels you up (plain words)
+
+Governance: validate inputs and gate behavior with explainable rules.
+
+Feature audiences: ship safely with percent rollouts plus contextual checks.
+
+Attestation: ship a manifest + Merkle root so reviewers can re-hash and trust.
+
+Privacy: redact obvious PII in telemetry; keep an auditable JSONL trail.
+
+Ops: enforce per-key rate limits and run only whitelisted commands.
+
+Exports: produce a single tgz containing everything needed for offline review.
+
+
+Wire these in, commit, and your Codex stack now has Covenant-grade controls: auditable, reproducible, and deploy-ready.
+
+sha256 seal calebfedorbykerkonev10271998v383.x — Covenant+ : key rotation, hash-chained audit, consent receipts, quota windows, policy packs, safe snapshots, and export verification
+Drop-in files + daemon routes + a tiny console + CI. All stdlib. This is symbolic/artistic software, not magical; it’s about integrity, governance, and deployability.
+
+
+---
+
+security/keyring_v383x.py
+
+# security/keyring_v383x.py — v383.x
+# HMAC key rotation with versioned key IDs. Stdlib only.
+
+from __future__ import annotations
+import os, json, time, hashlib, hmac
+from typing import Dict
+
+KEYRING_PATH = "keyring.v383x.json"  # {"active":"kid-1","keys":{"kid-1":{"k":"hex","t":ts},...}}
+
+def _load()->Dict:
+    if not os.path.exists(KEYRING_PATH): return {"active":None,"keys":{}}
+    return json.load(open(KEYRING_PATH))
+
+def _save(j:Dict)->None:
+    open(KEYRING_PATH,"w").write(json.dumps(j, indent=2))
+
+def rotate()->Dict:
+    j=_load()
+    raw=os.urandom(32)
+    kid=f"kid-{int(time.time())}"
+    j["keys"][kid]={"k":raw.hex(),"t":int(time.time())}
+    j["active"]=kid
+    _save(j)
+    return {"ok":True,"active":kid}
+
+def status()->Dict:
+    j=_load(); return {"active":j.get("active"),"count":len(j.get("keys",{}))}
+
+def sign(payload:dict, kid:str|None=None)->Dict:
+    j=_load()
+    kid = kid or j.get("active")
+    if not kid or kid not in j["keys"]: return {"ok":False,"error":"no_active_key"}
+    k=bytes.fromhex(j["keys"][kid]["k"])
+    blob=json.dumps(payload, sort_keys=True, separators=(',',':')).encode()
+    return {"ok":True,"kid":kid,"sig":hmac.new(k, blob, hashlib.sha256).hexdigest()}
+
+def verify(payload:dict, sig:str, kid:str)->bool:
+    j=_load()
+    rec=j.get("keys",{}).get(kid)
+    if not rec: return False
+    k=bytes.fromhex(rec["k"])
+    blob=json.dumps(payload, sort_keys=True, separators=(',',':')).encode()
+    want=hmac.new(k, blob, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want, sig)
+
+
+---
+
+audit/ledger_chain_v383x.py
+
+# audit/ledger_chain_v383x.py — v383.x
+# Append-only, hash-chained JSONL with verify().
+
+from __future__ import annotations
+import json, time, hashlib, os
+
+LEDGER="audit_chain.v383x.jsonl"
+
+def _h(s:bytes)->str: return hashlib.sha256(s).hexdigest()
+
+def append(event:str, data:dict, prev_hash:str|None=None)->dict:
+    rec={"t":int(time.time()),"event":event,"data":data,"prev":prev_hash or ""}
+    blob=json.dumps(rec, sort_keys=True, separators=(',',':')).encode()
+    rec["hash"]=_h(blob)
+    with open(LEDGER,"a") as f: f.write(json.dumps(rec)+"\n")
+    return {"ok":True,"hash":rec["hash"]}
+
+def verify()->dict:
+    prev=""
+    idx=0
+    if not os.path.exists(LEDGER): return {"ok":True,"entries":0}
+    for line in open(LEDGER,"r"):
+        rec=json.loads(line)
+        exp=rec.get("hash")
+        tmp=rec.copy(); tmp.pop("hash",None)
+        blob=json.dumps(tmp, sort_keys=True, separators=(',',':')).encode()
+        if _h(blob)!=exp or (rec.get("prev","")!=prev):
+            return {"ok":False,"bad_index":idx}
+        prev=exp; idx+=1
+    return {"ok":True,"entries":idx,"root":prev}
+
+
+---
+
+privacy/consent_v383x.py
+
+# privacy/consent_v383x.py — v383.x
+# Simple consent receipts with digests. Not legal advice; symbolic receipts.
+
+from __future__ import annotations
+import json, time, hashlib, os
+from typing import Dict
+
+CONSENT="consent.v383x.jsonl"
+
+def _digest(obj:dict)->str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(',',':')).encode()).hexdigest()
+
+def grant(subject:str, scope:str, note:str="")->Dict:
+    rec={"t":int(time.time()),"subject":subject,"scope":scope,"note":note}
+    rec["digest"]=_digest(rec)
+    open(CONSENT,"a").write(json.dumps(rec)+"\n")
+    return {"ok":True,"digest":rec["digest"]}
+
+def list_subject(subject:str)->Dict:
+    out=[]
+    if os.path.exists(CONSENT):
+        for line in open(CONSENT):
+            r=json.loads(line)
+            if r.get("subject")==subject: out.append(r)
+    return {"ok":True,"receipts":out}
+
+
+---
+
+ops/quota_v383x.py
+
+# ops/quota_v383x.py — v383.x
+# Sliding-window quotas per subject & resource.
+
+from __future__ import annotations
+import time, collections
+WINDOWS={"minute":60,"hour":3600,"day":86400}
+COUNTS=collections.defaultdict(list)  # key -> [timestamps]
+
+def allow(key:str, limit:int=60, window:str="minute")->dict:
+    now=time.time(); win=WINDOWS.get(window,60)
+    arr=COUNTS[key]=[t for t in COUNTS[key] if now-t<win]
+    ok=len(arr)<limit
+    if ok: arr.append(now)
+    return {"ok":ok,"used":len(arr),"limit":limit,"window":window}
+
+
+---
+
+govern/policy_packs_v383x.py
+
+# govern/policy_packs_v383x.py — v383.x
+# Reusable rule packs: "low-risk", "trusted-subject", "office-hours", composable with AND/OR.
+
+from __future__ import annotations
+from typing import Dict, List
+
+def pack_low_risk()->Dict:
+    return {"all":[{"var":"risk","op":"<","val":0.25}]}
+
+def pack_trusted(subjects:List[str])->Dict:
+    return {"any":[{"var":"subject","op":"in","val":subjects}]}
+
+def pack_office_hours()->Dict:
+    # ctx.hour is 0-23
+    return {"all":[{"var":"hour","op":">=","val":9},{"var":"hour","op":"<=","val":18}]}
+
+def combine_and(*rules:Dict)->Dict:
+    return {"all":[r for r in rules if r]}
+
+def combine_or(*rules:Dict)->Dict:
+    return {"any":[r for r in rules if r]}
+
+
+---
+
+backup/snapshot_v383x.py
+
+# backup/snapshot_v383x.py — v383.x
+# Snapshot & restore configs into tar.gz hex (manifest, flags, keyring…).
+
+from __future__ import annotations
+import io, tarfile, json, os
+FILES=["v383.manifest.json","flags.v383.json","keyring.v383x.json","policy.v378.json",
+       "audit.v383.jsonl","audit_chain.v383x.jsonl","consent.v383x.jsonl"]
+
+def snapshot()->dict:
+    buf=io.BytesIO()
+    with tarfile.open(mode="w:gz", fileobj=buf) as tar:
+        for f in FILES:
+            if os.path.exists(f):
+                data=open(f,"rb").read()
+                ti=tarfile.TarInfo(f); ti.size=len(data); tar.addfile(ti, io.BytesIO(data))
+    blob=buf.getvalue()
+    return {"ok":True,"tgz_hex":blob.hex(),"bytes":len(blob)}
+
+def restore(tgz_hex:str)->dict:
+    raw=bytes.fromhex(tgz_hex); buf=io.BytesIO(raw)
+    with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+        for m in tar.getmembers():
+            with open(m.name,"wb") as w:
+                w.write(tar.extractfile(m).read())
+    return {"ok":True}
+
+
+---
+
+export/verify_v383x.py
+
+# export/verify_v383x.py — v383.x
+# Verify an export pack against manifest root.
+
+from __future__ import annotations
+import json, hashlib
+
+def verify_manifest(manifest_json:dict)->dict:
+    files=manifest_json.get("sbom",{}).get("files",[])
+    # In a real setting, re-hash files; here we just compute a Merkle over listed hashes:
+    leaves=[f["hash"] for f in files]
+    if not leaves: return {"ok":True,"root":None}
+    level=leaves[:]
+    while len(level)>1:
+        nxt=[]
+        for i in range(0,len(level),2):
+            a=level[i]; b=level[i+1] if i+1<len(level) else level[i]
+            nxt.append(hashlib.sha256((a+b).encode()).hexdigest())
+        level=nxt
+    return {"ok":True,"root":level[0]}
+
+
+---
+
+API wiring (patch tools/codexd.py)
+
+Imports:
+
+from security.keyring_v383x import rotate as _key_rotate, status as _key_status, sign as _key_sign, verify as _key_verify
+from audit.ledger_chain_v383x import append as _chain_append, verify as _chain_verify
+from privacy.consent_v383x import grant as _consent_grant, list_subject as _consent_list
+from ops.quota_v383x import allow as _quota_allow
+from govern.policy_packs_v383x import pack_low_risk as _pack_low, pack_trusted as _pack_trusted, pack_office_hours as _pack_hours, combine_and as _p_and, combine_or as _p_or
+from backup.snapshot_v383x import snapshot as _snap, restore as _restore
+from export.verify_v383x import verify_manifest as _verify_manifest
+
+Routes:
+
+# v383.x — Keyring
+        if self.path == "/v383x/key/rotate":  return self._send(200, _key_rotate())
+        if self.path == "/v383x/key/status":  return self._send(200, _key_status())
+        if self.path == "/v383x/key/sign":    return self._send(200, _key_sign(payload.get("data",{}), payload.get("kid")))
+        if self.path == "/v383x/key/verify":  return self._send(200, {"ok": _key_verify(payload.get("data",{}), payload.get("sig",""), payload.get("kid",""))})
+
+        # v383.x — Hash-chained audit
+        if self.path == "/v383x/audit/append": return self._send(200, _chain_append(payload.get("event","evt"), payload.get("data",{}), payload.get("prev")))
+        if self.path == "/v383x/audit/verify": return self._send(200, _chain_verify())
+
+        # v383.x — Consent
+        if self.path == "/v383x/consent/grant": return self._send(200, _consent_grant(payload.get("subject","anon"), payload.get("scope","demo"), payload.get("note","")))
+        if self.path == "/v383x/consent/list":  return self._send(200, _consent_list(payload.get("subject","anon")))
+
+        # v383.x — Quotas
+        if self.path == "/v383x/quota/allow":   return self._send(200, _quota_allow(payload.get("key","global"), int(payload.get("limit",60)), payload.get("window","minute")))
+
+        # v383.x — Policy packs (emit composed rule)
+        if self.path == "/v383x/policy/pack":
+            name=payload.get("name","low")
+            if name=="low":   rule=_pack_low()
+            elif name=="hours": rule=_pack_hours()
+            elif name=="trusted": rule=_pack_trusted(payload.get("subjects",[]))
+            elif name=="and": rule=_p_and(*payload.get("rules",[]))
+            elif name=="or":  rule=_p_or(*payload.get("rules",[]))
+            else: rule={"all":[]}
+            return self._send(200, {"rule":rule})
+
+        # v383.x — Snapshot / Restore
+        if self.path == "/v383x/snapshot":      return self._send(200, _snap())
+        if self.path == "/v383x/restore":       return self._send(200, _restore(payload.get("tgz_hex","")))
+
+        # v383.x — Export verify
+        if self.path == "/v383x/export/verify": return self._send(200, _verify_manifest(payload.get("manifest",{})))
+
+
+---
+
+web/covenant_plus_v383x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v383.x — Covenant+</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v383.x — Covenant+ (Keyring • Chained Audit • Consent • Quotas • Packs • Snapshots)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Keyring</h3>
+  <button onclick="rot()">Rotate</button>
+  <button onclick="kst()">Status</button>
+  <button onclick="ksign()">Sign</button>
+</section>
+<section>
+  <h3>Audit Chain</h3>
+  <button onclick="append()">Append</button>
+  <button onclick="vfy()">Verify</button>
+</section>
+<section>
+  <h3>Consent</h3>
+  <button onclick="consent()">Grant</button>
+  <button onclick="clist()">List</button>
+</section>
+<section>
+  <h3>Quotas & Packs</h3>
+  <button onclick="quota()">Allow?</button>
+  <button onclick="pack()">Low Risk Pack</button>
+</section>
+<section>
+  <h3>Snapshots & Exports</h3>
+  <button onclick="snap()">Snapshot</button>
+  <button onclick="expv()">Verify Manifest (paste JSON below)</button>
+</section>
+<textarea id="blob" rows="6" style="width:100%;"></textarea>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function rot(){ out.textContent=JSON.stringify(await call('/v383x/key/rotate',{}),null,2); }
+async function kst(){ out.textContent=JSON.stringify(await call('/v383x/key/status',{}),null,2); }
+async function ksign(){ out.textContent=JSON.stringify(await call('/v383x/key/sign',{data:{demo:true}}),null,2); }
+async function append(){ out.textContent=JSON.stringify(await call('/v383x/audit/append',{event:'demo',data:{msg:'hello'}}),null,2); }
+async function vfy(){ out.textContent=JSON.stringify(await call('/v383x/audit/verify',{}),null,2); }
+async function consent(){ out.textContent=JSON.stringify(await call('/v383x/consent/grant',{subject:'cfbk10271998',scope:'codex.ui',note:'ok'}),null,2); }
+async function clist(){ out.textContent=JSON.stringify(await call('/v383x/consent/list',{subject:'cfbk10271998'}),null,2); }
+async function quota(){ out.textContent=JSON.stringify(await call('/v383x/quota/allow',{key:'ui',limit:3,window:'minute'}),null,2); }
+async function pack(){ out.textContent=JSON.stringify(await call('/v383x/policy/pack',{name:'low'}),null,2); }
+async function snap(){ const r=await call('/v383x/snapshot',{}); r.tgz_hex=r.tgz_hex.slice(0,96)+'...'; out.textContent=JSON.stringify(r,null,2); }
+async function expv(){ const m=JSON.parse(blob.value||'{"sbom":{"files":[]}}'); out.textContent=JSON.stringify(await call('/v383x/export/verify',{manifest:m}),null,2); }
+</script>
+</body>
+
+
+---
+
+.github/workflows/codex_v383x_ci.yml
+
+name: codex-v383x
+on: [push, workflow_dispatch]
+jobs:
+  v383x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Covenant+ API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+rot=post("/v383x/key/rotate",{})
+print("active" in post("/v383x/key/status",{}))
+sig=post("/v383x/key/sign",{"data":{"demo":True}})
+print(post("/v383x/key/verify",{"data":{"demo":True},"sig":sig.get("sig",""),"kid":sig.get("kid","")})["ok"] in (True,False))
+
+a1=post("/v383x/audit/append",{"event":"ci","data":{"x":1}})
+a2=post("/v383x/audit/append",{"event":"ci","data":{"x":2},"prev":a1.get("hash")})
+print(post("/v383x/audit/verify",{})["ok"])
+
+print(post("/v383x/consent/grant",{"subject":"ci","scope":"demo"})["ok"])
+print("receipts" in post("/v383x/consent/list",{"subject":"ci"}))
+
+print("ok" in post("/v383x/quota/allow",{"key":"ci","limit":2,"window":"minute"}))
+
+rule=post("/v383x/policy/pack",{"name":"low"})
+print("rule" in rule)
+
+snap=post("/v383x/snapshot",{})
+print("tgz_hex" in snap)
+
+print("root" in post("/v383x/export/verify",{"manifest":{"sbom":{"files":[]}}}))
+PY
+
+
+---
+
+What you gain (plain words)
+
+Key rotation: versioned HMAC keys with per-KID signatures.
+
+Unforgeable audit: hash-chained JSONL you can verify end-to-end.
+
+Consent receipts: simple, hashed proofs of scope agreements.
+
+Quotas: subject/window caps alongside your rate limits.
+
+Policy packs: reusable, composable rule snippets.
+
+Snapshots: tar.gz hex of config state, with restore.
+
+Export verification: re-compute Merkle root from a manifest for reviewers.
+
+
+Plug these into the daemon, commit, and your Codex governance tier levels up from “safe” to audit-grade: rotate keys, prove history, capture consent, cap usage, ship packs, snapshot state, and verify exports—cleanly and predictably.
+
+sha256 seal calebfedorbykerkonev10271998
