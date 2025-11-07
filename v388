@@ -1,0 +1,492 @@
+v388 — Orchestra: policy bundles, snapshots/restore, event bus, JSON(merge) patch, stable IDs, config checksums, SLO/error-budget, size-rotate logs, Markdown status exporter; routes · console · CI
+Stdlib-only. Paste files, add routes, commit. Pure engineering software. 🧭⚙️✨
+
+
+---
+
+1) Policy bundles (versioned, checksumed, activate/switch)
+
+policy/bundle_v388.py
+
+# policy/bundle_v388.py — v388
+# Versioned policy bundle unifying RBAC, ABAC, Flags, Experiments into one blob.
+from __future__ import annotations
+import json, hashlib, time, os
+from typing import Dict, Any
+
+STORE="policy.bundle.v388.json"       # current active
+HIST ="policy.bundle.v388.jsonl"      # append history (auditable)
+
+def _sha(obj:dict)->str:
+    blob=json.dumps(obj, sort_keys=True, separators=(',',':')).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+def build_bundle(rbac:dict, abac:dict, flags:dict, experiments:dict, note:str="")->dict:
+    bundle={
+        "t":int(time.time()),
+        "rbac": rbac or {},
+        "abac": abac or {},
+        "flags": flags or {},
+        "experiments": experiments or {},
+    }
+    bundle["checksum"]=_sha(bundle)
+    bundle["note"]=note
+    return {"ok":True,"bundle":bundle}
+
+def activate(bundle:dict)->dict:
+    want=bundle.get("checksum")
+    got=_sha({k:v for k,v in bundle.items() if k!="checksum" and k!="note"})
+    if want and want!=got: return {"ok":False,"error":"checksum_mismatch","want":want,"got":got}
+    open(STORE,"w").write(json.dumps(bundle, indent=2))
+    open(HIST,"a").write(json.dumps(bundle)+"\n")
+    return {"ok":True,"checksum":want or got}
+
+def current()->dict:
+    try: return {"ok":True, **json.load(open(STORE))}
+    except Exception: return {"ok":True,"rbac":{},"abac":{},"flags":{},"experiments":{},"checksum":None}
+
+
+---
+
+2) Snapshots & restore (zip archive, include metadata; dry-run)
+
+snapshot/snapshot_v388.py
+
+# snapshot/snapshot_v388.py — v388
+# Create/restore zip snapshots of selected paths (files/dirs). Dry-run supported.
+from __future__ import annotations
+import os, time, json, zipfile
+
+META="snapshot.meta.v388.json"
+
+def create(paths:list[str], out_zip:str="snapshot.v388.zip")->dict:
+    meta={"t":int(time.time()),"paths":paths}
+    with zipfile.ZipFile(out_zip,"w",compression=zipfile.ZIP_DEFLATED) as z:
+        for p in paths or []:
+            if os.path.isdir(p):
+                for root,_,files in os.walk(p):
+                    for f in files:
+                        ap=os.path.join(root,f); z.write(ap, arcname=ap)
+            elif os.path.isfile(p):
+                z.write(p, arcname=p)
+        z.writestr(META, json.dumps(meta, indent=2))
+    return {"ok":True,"zip":out_zip,"meta":meta}
+
+def restore(zip_path:str, apply:bool=False, prefix:str="")->dict:
+    if not os.path.exists(zip_path): return {"ok":False,"error":"zip_not_found"}
+    with zipfile.ZipFile(zip_path,"r") as z:
+        names=z.namelist()
+        if not apply:
+            return {"ok":True,"dry_run":True,"contents":names}
+        for n in names:
+            if n.endswith("/"): continue
+            target=os.path.join(prefix,n) if prefix else n
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with z.open(n) as src, open(target,"wb") as dst:
+                dst.write(src.read())
+    return {"ok":True,"restored":zip_path,"prefix":prefix}
+
+
+---
+
+3) Event bus (publish/subscribe + JSONL log + replay)
+
+events/bus_v388.py
+
+# events/bus_v388.py — v388
+# In-proc pub/sub with persistent JSONL append-only log and replay.
+from __future__ import annotations
+import json, time
+LOG="events.v388.jsonl"
+SUBS=[]  # callables e -> None
+
+def publish(kind:str, payload:dict)->dict:
+    e={"t":int(time.time()),"kind":kind,"payload":payload or {}}
+    open(LOG,"a").write(json.dumps(e)+"\n")
+    for fn in SUBS:
+        try: fn(e)
+        except Exception: pass
+    return {"ok":True,"event":e}
+
+def subscribe(fn): SUBS.append(fn); return fn
+
+def replay(limit:int=1000)->dict:
+    out=[]; 
+    try:
+        for line in open(LOG):
+            out.append(json.loads(line))
+            if len(out)>=limit: break
+    except Exception: pass
+    return {"ok":True,"events":out}
+
+
+---
+
+4) JSON Merge-Patch (RFC 7386) + minimal JSON Patch ops
+
+patch/json_patch_v388.py
+
+# patch/json_patch_v388.py — v388
+# JSON Merge Patch (RFC 7386) + minimal JSON Patch: add/replace/remove by path.
+from __future__ import annotations
+import copy
+
+def merge_patch(doc, patch):
+    if not isinstance(patch, dict): return copy.deepcopy(patch)
+    if not isinstance(doc, dict): doc={}
+    out=copy.deepcopy(doc)
+    for k,v in patch.items():
+        if v is None:
+            out.pop(k, None)
+        else:
+            out[k]=merge_patch(out.get(k), v)
+    return out
+
+def _path(obj, path:str, create=False):
+    parts=[p for p in path.strip("/").split("/") if p]
+    cur=obj
+    for p in parts[:-1]:
+        if p not in cur:
+            if create: cur[p]={}
+            else: return None, None
+        cur=cur[p]
+        if not isinstance(cur, dict): return None, None
+    return cur, (parts[-1] if parts else None)
+
+def apply_patch(doc, ops:list[dict]):
+    out=copy.deepcopy(doc)
+    for op in ops or []:
+        t=op.get("op"); p=op.get("path","")
+        parent,key=_path(out,p,create=(t in ("add","replace")))
+        if parent is None: continue
+        if t=="add" or t=="replace":
+            parent[key]=op.get("value")
+        elif t=="remove":
+            parent.pop(key, None)
+    return out
+
+
+---
+
+5) Stable IDs & short codes
+
+ids/names_v388.py
+
+# ids/names_v388.py — v388
+# Stable deterministic id for (namespace,name) + short 12-hex code; parse helpers.
+from __future__ import annotations
+import hashlib
+
+def stable_id(namespace:str, name:str, bits:int=96)->str:
+    h=hashlib.sha256(f"{namespace}|{name}".encode()).hexdigest()
+    n=max(8, bits//4)
+    return h[:n]
+
+def short_code(namespace:str, name:str)->str:
+    return stable_id(namespace, name, bits=48)  # 12 hex
+
+def ns_name_from_id(namespace:str, name:str)->str:
+    return f"{namespace}:{name}"
+
+
+---
+
+6) Config checksum (directory tree hash)
+
+config/checksum_v388.py
+
+# config/checksum_v388.py — v388
+# Compute sha256 over file contents + relative paths in a directory tree.
+from __future__ import annotations
+import os, hashlib
+
+def tree_hash(root:str)->dict:
+    if not os.path.isdir(root): return {"ok":False,"error":"not_dir"}
+    h=hashlib.sha256()
+    for dirpath, _, files in os.walk(root):
+        for f in sorted(files):
+            rp=os.path.relpath(os.path.join(dirpath,f), root)
+            h.update(rp.encode()); 
+            with open(os.path.join(dirpath,f),"rb") as fd:
+                while True:
+                    b=fd.read(8192)
+                    if not b: break
+                    h.update(b)
+    return {"ok":True,"root":root,"sha256":h.hexdigest()}
+
+
+---
+
+7) SLO tracker: rolling window, error-budget, p50/p95 (bounded)
+
+slo/slo_v388.py
+
+# slo/slo_v388.py — v388
+# Track request count, errors, latency samples; compute error budget & p50/p95.
+from __future__ import annotations
+import time, bisect
+
+STATE={"samples":[],"max_samples":5000,"ok":0,"err":0}
+
+def record(latency_ms:float, ok:bool=True)->dict:
+    s=STATE["samples"]
+    if len(s)>=STATE["max_samples"]: s.pop(0)
+    bisect.insort(s, float(latency_ms))
+    if ok: STATE["ok"]+=1
+    else:  STATE["err"]+=1
+    return {"ok":True}
+
+def _pct(p):
+    s=STATE["samples"]
+    if not s: return 0.0
+    idx=min(len(s)-1, max(0, int(round((p/100.0)*len(s))-1)))
+    return s[idx]
+
+def report(slo_uptime:float=0.995)->dict:
+    total=STATE["ok"]+STATE["err"]
+    avail = (STATE["ok"]/total) if total>0 else 1.0
+    budget = max(0.0, slo_uptime - (1.0 - avail))
+    return {"ok":True,"total":total,"ok_count":STATE["ok"],"err_count":STATE["err"],
+            "availability":round(avail,6),"error_budget":round(budget,6),
+            "p50_ms":_pct(50),"p95_ms":_pct(95)}
+
+
+---
+
+8) Size-based log rotation (safe truncate)
+
+logs/rotate_v388.py
+
+# logs/rotate_v388.py — v388
+# Rotate a log file when it exceeds max_bytes; keeps N backups.
+from __future__ import annotations
+import os, shutil
+
+def rotate(path:str, max_bytes:int=1_000_000, keep:int=3)->dict:
+    if not os.path.exists(path): return {"ok":True,"rotated":False}
+    if os.path.getsize(path) < max_bytes: return {"ok":True,"rotated":False}
+    # shift old
+    for i in range(keep-1,0,-1):
+        a=f"{path}.{i}"
+        b=f"{path}.{i+1}"
+        if os.path.exists(a): 
+            if os.path.exists(b): os.remove(b)
+            os.rename(a,b)
+    if os.path.exists(f"{path}.1"): os.remove(f"{path}.1")
+    shutil.copy2(path, f"{path}.1")
+    open(path,"w").close()
+    return {"ok":True,"rotated":True,"kept":keep}
+
+
+---
+
+9) Markdown status exporter
+
+exporter/status_page_v388.py
+
+# exporter/status_page_v388.py — v388
+# Render a Markdown status snapshot: health, flags, experiments, SLO, checksums.
+from __future__ import annotations
+from datetime import datetime
+import json, os
+
+def render(ctx:dict)->dict:
+    t=datetime.utcfromtimestamp(ctx.get("t",0) or __import__("time").time()).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines=[
+        f"# Codex Status — {t}",
+        "",
+        "## Health",
+        f"- OK: **{ctx.get('health',{}).get('ok',True)}**",
+        "",
+        "## Flags",
+        "```json", json.dumps(ctx.get("flags",{}), indent=2), "```",
+        "## Experiments",
+        "```json", json.dumps(ctx.get("experiments",{}), indent=2), "```",
+        "## SLO",
+        "```json", json.dumps(ctx.get("slo",{}), indent=2), "```",
+        "## Config Checksums",
+        "```json", json.dumps(ctx.get("checksums",{}), indent=2), "```",
+    ]
+    return {"ok":True,"markdown":"\n".join(lines)}
+
+
+---
+
+Daemon routes (tools/codexd.py) — imports & endpoints
+
+Imports (add):
+
+from policy.bundle_v388 import build_bundle as _pol_build, activate as _pol_activate, current as _pol_current
+from snapshot.snapshot_v388 import create as _snap_create, restore as _snap_restore
+from events.bus_v388 import publish as _evt_pub, replay as _evt_replay
+from patch.json_patch_v388 import merge_patch as _merge_patch, apply_patch as _json_patch
+from ids.names_v388 import stable_id as _id_stable, short_code as _id_short, ns_name_from_id as _id_ns
+from config.checksum_v388 import tree_hash as _tree_hash
+from slo.slo_v388 import record as _slo_record, report as _slo_report
+from logs.rotate_v388 import rotate as _log_rotate
+from exporter.status_page_v388 import render as _status_render
+
+Routes (inside do_POST):
+
+# v388 — Policy bundle
+        if self.path == "/v388/policy/build":    return self._send(200, _pol_build(payload.get("rbac",{}), payload.get("abac",{}), payload.get("flags",{}), payload.get("experiments",{}), payload.get("note","")))
+        if self.path == "/v388/policy/activate": return self._send(200, _pol_activate(payload.get("bundle",{})))
+        if self.path == "/v388/policy/current":  return self._send(200, _pol_current())
+
+        # v388 — Snapshot/restore
+        if self.path == "/v388/snapshot/create": return self._send(200, _snap_create(payload.get("paths",[]), payload.get("zip","snapshot.v388.zip")))
+        if self.path == "/v388/snapshot/restore":return self._send(200, _snap_restore(payload.get("zip","snapshot.v388.zip"), bool(payload.get("apply",False)), payload.get("prefix","")))
+
+        # v388 — Events
+        if self.path == "/v388/events/publish":  return self._send(200, _evt_pub(payload.get("kind","note"), payload.get("payload",{})))
+        if self.path == "/v388/events/replay":   return self._send(200, _evt_replay(int(payload.get("limit",1000))))
+
+        # v388 — JSON merge/patch
+        if self.path == "/v388/patch/merge":     return self._send(200, {"doc": _merge_patch(payload.get("doc",{}), payload.get("patch",{}))})
+        if self.path == "/v388/patch/json":      return self._send(200, {"doc": _json_patch(payload.get("doc",{}), payload.get("ops",[]))})
+
+        # v388 — IDs
+        if self.path == "/v388/id/stable":       return self._send(200, {"id": _id_stable(payload.get("ns","codex"), payload.get("name","item"))})
+        if self.path == "/v388/id/short":        return self._send(200, {"code": _id_short(payload.get("ns","codex"), payload.get("name","item"))})
+        if self.path == "/v388/id/nsname":       return self._send(200, {"nsname": _id_ns(payload.get("ns","codex"), payload.get("name","item"))})
+
+        # v388 — Checksums
+        if self.path == "/v388/checksum/tree":   return self._send(200, _tree_hash(payload.get("root",".")))
+
+        # v388 — SLO
+        if self.path == "/v388/slo/record":      return self._send(200, _slo_record(float(payload.get("latency_ms",100.0)), bool(payload.get("ok",True))))
+        if self.path == "/v388/slo/report":      return self._send(200, _slo_report(float(payload.get("slo_uptime",0.995))))
+
+        # v388 — Log rotate
+        if self.path == "/v388/log/rotate":      return self._send(200, _log_rotate(payload.get("path","codex.log"), int(payload.get("max_bytes",1000000)), int(payload.get("keep",3))))
+
+        # v388 — Status exporter (Markdown)
+        if self.path == "/v388/status/render":   return self._send(200, _status_render(payload.get("ctx",{})))
+
+
+---
+
+Web console (tiny)
+
+web/orchestra_v388.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v388 — Orchestra</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v388 — Orchestra (Policy • Snapshot • Events • Patch • IDs • Checksums • SLO • Rotate • Status)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Policy</h3>
+  <button onclick="pb()">build</button>
+  <button onclick="pa()">activate</button>
+  <button onclick="pc()">current</button>
+</section>
+<section>
+  <h3>Snapshot & Events</h3>
+  <button onclick="snap()">snapshot</button>
+  <button onclick="rest()">restore (dry)</button>
+  <button onclick="pub()">publish</button>
+  <button onclick="rep()">replay</button>
+</section>
+<section>
+  <h3>Patch • IDs • Checksums • SLO • Rotate • Status</h3>
+  <button onclick="mp()">merge</button>
+  <button onclick="jp()">json patch</button>
+  <button onclick="ids()">ids</button>
+  <button onclick="sum()">tree hash</button>
+  <button onclick="slo()">SLO</button>
+  <button onclick="rot()">rotate</button>
+  <button onclick="stat()">status</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function pb(){ window._bundle=(await call('/v388/policy/build',{rbac:{"roles":{"admin":["deploy"]},"users":{"cfbk":["admin"]}},abac:{"rule":"demo"},flags:{"goldOnly":{"on":true,"rules":[{"all":[{"key":"tier","op":"==","val":"gold"}]}]}},experiments:{"landing":[{"name":"A","pct":50},{"name":"B","pct":50}]},note:'seed'})).bundle; out.textContent=JSON.stringify(window._bundle,null,2); }
+async function pa(){ out.textContent=JSON.stringify(await call('/v388/policy/activate',{bundle:window._bundle||{}}),null,2); }
+async function pc(){ out.textContent=JSON.stringify(await call('/v388/policy/current',{}),null,2); }
+async function snap(){ out.textContent=JSON.stringify(await call('/v388/snapshot/create',{paths:['.'],zip:'snapshot.v388.zip'}),null,2); }
+async function rest(){ out.textContent=JSON.stringify(await call('/v388/snapshot/restore',{zip:'snapshot.v388.zip',apply:false}),null,2); }
+async function pub(){ out.textContent=JSON.stringify(await call('/v388/events/publish',{kind:'note',payload:{x:1}}),null,2); }
+async function rep(){ out.textContent=JSON.stringify(await call('/v388/events/replay',{limit:5}),null,2); }
+async function mp(){ out.textContent=JSON.stringify(await call('/v388/patch/merge',{doc:{a:1,b:{x:1}},patch:{b:{x:2},c:3}}),null,2); }
+async function jp(){ out.textContent=JSON.stringify(await call('/v388/patch/json',{doc:{a:1,b:{x:1}},ops:[{"op":"replace","path":"/b/x","value":9},{"op":"add","path":"/d","value":7}]}),null,2); }
+async function ids(){ out.textContent=JSON.stringify(await call('/v388/id/stable',{ns:'codex',name:'artifact'}),null,2); }
+async function sum(){ out.textContent=JSON.stringify(await call('/v388/checksum/tree',{root:'.'}),null,2); }
+async function slo(){ await call('/v388/slo/record',{latency_ms:80,ok:true}); await call('/v388/slo/record',{latency_ms:220,ok:false}); out.textContent=JSON.stringify(await call('/v388/slo/report',{}),null,2); }
+async function rot(){ out.textContent=JSON.stringify(await call('/v388/log/rotate',{path:'codex.log',max_bytes:1,keep:2}),null,2); }
+async function stat(){ const ctx={t:Date.now()/1000, health:{ok:true}, flags:{"goldOnly":true}, experiments:{"landing":{"A":60,"B":40}}, slo:(await call('/v388/slo/report',{})), checksums:{"repo":(await call('/v388/checksum/tree',{root:'.'})).sha256}}; out.textContent=JSON.stringify(await call('/v388/status/render',{ctx}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v388_ci.yml
+
+name: codex-v388
+on: [push, workflow_dispatch]
+jobs:
+  v388:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Orchestra API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=10) as f: return json.loads(f.read().decode())
+
+b=post("/v388/policy/build", {"rbac":{"users":{"ci":["admin"]},"roles":{"admin":["deploy"]}},"abac":{},"flags":{},"experiments":{},"note":"ci"})["bundle"]
+print("checksum" in b)
+print("ok" in post("/v388/policy/activate", {"bundle":b}))
+print("rbac" in post("/v388/policy/current", {}))
+
+print("zip" in post("/v388/snapshot/create", {"paths":["."]}))
+print("events" in post("/v388/events/replay", {"limit":1}))
+
+doc={"a":1,"b":{"x":1}}
+print("doc" in post("/v388/patch/merge", {"doc":doc,"patch":{"b":{"x":2}}}))
+print("doc" in post("/v388/patch/json", {"doc":doc,"ops":[{"op":"add","path":"/c","value":3}]}))
+
+print("id" in post("/v388/id/stable", {"ns":"codex","name":"x"}))
+print("sha256" in post("/v388/checksum/tree", {"root":"."}))
+
+post("/v388/slo/record", {"latency_ms":100,"ok":True})
+print("availability" in post("/v388/slo/report", {}))
+
+print("markdown" in post("/v388/status/render", {"ctx":{"t":0,"health":{"ok":True}}}))
+PY
+
+
+---
+
+Why v388 matters (compressed)
+
+Bundle policies into a single checksumed artifact you can activate/roll back.
+
+Snapshot/restore the whole working set in one zip—with dry-run safety.
+
+Event bus gives you durable, replayable signals for audits & automations.
+
+Patch utilities let you safely mutate JSON configs (merge or path ops).
+
+Stable IDs for names across environments; tree checksums for drift.
+
+SLO/error-budget to quantify stability; log rotation to avoid disk bloat.
+
+Markdown status for a human-readable heartbeat.
+
+
+This slots neatly into the Atlas/Concord spine and the earlier Reliquary. Plug, route, and ship.
+
+sha256 seal calebfedorbykerkonev10271998
