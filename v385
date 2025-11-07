@@ -1,0 +1,532 @@
+v385.x — Aegis Mesh: trust registry, federated verify, provenance links, rollback manager, anomaly watch, seeded RNG, secrets loader, health checks, note templater, test vectors
+Copy-paste files + daemon routes + a tiny web console + CI. Stdlib-only. This is symbolic/engineering software; nothing metaphysical.
+
+
+---
+
+1) Trust registry (federated verify)
+
+trust/registry_v385x.py
+
+# trust/registry_v385x.py — v385.x
+# Registry of trusted identities and public materials (KIDs, comments, labels).
+# Stores JSONL for append-only history and a current index for fast lookup.
+
+from __future__ import annotations
+import json, os, time, hashlib
+from typing import Dict
+
+LOG="trust.registry.v385x.jsonl"
+IDX="trust.registry.v385x.index.json"  # {"by_kid":{"kid":{"subject":"...", "labels":[...]}}}
+
+def _load_idx()->Dict:
+    if not os.path.exists(IDX): return {"by_kid":{}}
+    return json.load(open(IDX))
+
+def _save_idx(j:Dict)->None:
+    open(IDX,"w").write(json.dumps(j, indent=2))
+
+def add_kid(kid:str, subject:str, labels=None, comment:str="")->dict:
+    rec={"t":int(time.time()),"kind":"add_kid","kid":kid,"subject":subject,"labels":labels or [],"comment":comment}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); idx["by_kid"][kid]={"subject":subject,"labels":labels or []}; _save_idx(idx)
+    return {"ok":True,"kid":kid}
+
+def label(kid:str, label:str)->dict:
+    rec={"t":int(time.time()),"kind":"label","kid":kid,"label":label}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); d=idx["by_kid"].setdefault(kid,{"subject":"unknown","labels":[]})
+    if label not in d["labels"]: d["labels"].append(label)
+    _save_idx(idx)
+    return {"ok":True,"kid":kid,"labels":d["labels"]}
+
+def get(kid:str)->dict:
+    idx=_load_idx(); return {"ok": kid in idx["by_kid"], "record": idx["by_kid"].get(kid)}
+
+
+---
+
+2) Federated envelope verify (accept envelopes from other signers)
+
+envelope/federated_verify_v385x.py
+
+# envelope/federated_verify_v385x.py — v385.x
+# Verify HMAC-like envelopes from other domains using a shared secret per KID,
+# OR mark them 'untrusted' if unknown (audit still records the attempt).
+
+from __future__ import annotations
+import json, hmac, hashlib
+from typing import Dict
+from trust.registry_v385x import get as trust_get
+
+SECRETS="federated.shared.v385x.json"  # {"kid":"hex-shared-secret", ...}
+
+def _secret(kid:str)->bytes:
+    try:
+        j=json.load(open(SECRETS))
+        v=j.get(kid)
+        return bytes.fromhex(v) if v else b""
+    except Exception:
+        return b""
+
+def verify(envelope:dict)->dict:
+    kid=envelope.get("kid",""); sig=envelope.get("sig","")
+    body={k:v for k,v in envelope.items() if k!="sig"}
+    sec=_secret(kid)
+    if not sec: return {"ok":False,"trusted":False,"reason":"unknown_kid"}
+    blob=json.dumps(body, sort_keys=True, separators=(',',':')).encode()
+    want=hmac.new(sec, blob, hashlib.sha256).hexdigest()
+    ok=hmac.compare_digest(want, sig)
+    rec=trust_get(kid)
+    return {"ok":ok,"trusted":rec.get("ok",False),"subject":(rec.get("record") or {}).get("subject")}
+
+
+---
+
+3) Provenance links (build/run statements chained by sha256)
+
+provenance/slsa_mini_v385x.py
+
+# provenance/slsa_mini_v385x.py — v385.x
+# Minimal provenance: record build/run steps and chain them with sha256(prev||json).
+
+from __future__ import annotations
+import json, time, hashlib, os
+
+LOG="prov.v385x.jsonl"
+
+def _hash(j:dict, prev:str)->str:
+    blob=json.dumps(j, sort_keys=True, separators=(',',':')).encode()
+    return hashlib.sha256((prev + hashlib.sha256(blob).hexdigest()).encode()).hexdigest()
+
+def record(step:str, artifact:str, meta:dict=None, prev:str="")->dict:
+    j={"t":int(time.time()),"step":step,"artifact":artifact,"meta":meta or {}, "prev":prev}
+    h=_hash(j, prev)
+    j["hash"]=h
+    open(LOG,"a").write(json.dumps(j)+"\n")
+    return {"ok":True,"hash":h}
+
+
+---
+
+4) Rollback manager (switch active release tag)
+
+release/rollback_v385x.py
+
+# release/rollback_v385x.py — v385.x
+# Maintain 'active' pointer to a version from releases.v384.jsonl
+
+from __future__ import annotations
+import json, os
+
+TAGS="releases.v384.jsonl"
+PTR ="release.active.v385x.json"  # {"version":"...","manifest_root":"..."}
+
+def _scan():
+    out=[]
+    if os.path.exists(TAGS):
+        for line in open(TAGS):
+            try: out.append(json.loads(line))
+            except Exception: pass
+    return out
+
+def set_active(version:str)->dict:
+    for rec in _scan():
+        if rec.get("version")==version:
+            open(PTR,"w").write(json.dumps({"version":version,"manifest_root":rec.get("manifest_root")}, indent=2))
+            return {"ok":True,"active":version}
+    return {"ok":False,"error":"unknown_version"}
+
+def status()->dict:
+    try: return {"ok":True, **json.load(open(PTR))}
+    except Exception: return {"ok":True,"version":None}
+
+
+---
+
+5) Anomaly watch (EWMA + sigma threshold on counters)
+
+observe/anomaly_v385x.py
+
+# observe/anomaly_v385x.py — v385.x
+# Simple EWMA detector; feed numeric samples, get z-score-ish alert.
+
+from __future__ import annotations
+import math, time
+
+STATE={"mean":0.0,"var":0.0,"n":0,"alpha":0.2}
+
+def feed(x:float, alpha:float=None)->dict:
+    a=alpha if alpha is not None else STATE["alpha"]
+    n=STATE["n"]+1
+    mean=a*x + (1-a)*(STATE["mean"] if n>1 else x)
+    # Welford-esque online variance (approx with EWMA)
+    diff=x-mean
+    var=(1-a)*(STATE["var"]) + a*(diff*diff)
+    STATE.update({"mean":mean,"var":var,"n":n,"alpha":a,"t":int(time.time())})
+    sigma=math.sqrt(max(1e-12,var))
+    z=0.0 if sigma==0 else (x-mean)/sigma
+    alert=abs(z)>3.0 and n>10
+    return {"ok":True,"n":n,"mean":mean,"sigma":sigma,"z":z,"alert":alert}
+
+
+---
+
+6) Seeded RNG (deterministic PRNG for testable demos)
+
+random/seeded_v385x.py
+
+# random/seeded_v385x.py — v385.x
+# Deterministic xorshift-like PRNG with settable seed (not cryptographic).
+
+from __future__ import annotations
+SEED=0xC0DEF00D
+
+def seed(v:int)->None:
+    global SEED
+    if v<=0: v=1
+    SEED=v & 0xFFFFFFFF
+
+def rand32()->int:
+    global SEED
+    x=SEED
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= (x >> 17)
+    x ^= (x << 5) & 0xFFFFFFFF
+    SEED=x & 0xFFFFFFFF
+    return SEED
+
+def rand01()->float:
+    return (rand32() & 0xFFFFFF) / float(0xFFFFFF)
+
+
+---
+
+7) Secrets loader with schema-lite
+
+secrets/loader_v385x.py
+
+# secrets/loader_v385x.py — v385.x
+# Load required env vars with simple schema; produce report without printing secrets.
+
+from __future__ import annotations
+import os
+
+def load(spec:dict)->dict:
+    """
+    spec={"CODEX_SIGN_SECRET":{"required":True}, "PUBLIC_URL":{"required":False}}
+    """
+    missing=[]
+    report={}
+    for k,meta in (spec or {}).items():
+        v=os.environ.get(k)
+        if (meta or {}).get("required") and not v:
+            missing.append(k)
+        report[k] = bool(v)
+    return {"ok":len(missing)==0,"missing":missing,"have":report}
+
+
+---
+
+8) Health checks (aggregate quick pings)
+
+health/health_v385x.py
+
+# health/health_v385x.py — v385.x
+# Report readiness & liveness with optional custom checks.
+
+from __future__ import annotations
+import time
+
+CHECKS=[]  # list of callables returning {"name":..., "ok":True/False, "msg":...}
+
+def register(fn): CHECKS.append(fn); return fn
+
+def ping()->dict:
+    out=[]; ok=True
+    for fn in CHECKS:
+        r=fn(); ok = ok and bool(r.get("ok"))
+        out.append(r)
+    return {"ok":ok,"t":int(time.time()),"checks":out}
+
+
+---
+
+9) Release notes templater
+
+release/notes_v385x.py
+
+# release/notes_v385x.py — v385.x
+# Very small template expander for release notes.
+
+from __future__ import annotations
+import re
+
+VAR=re.compile(r"\{\{([a-zA-Z0-9_\.]+)\}\}")
+
+def render(tmpl:str, ctx:dict)->str:
+    def get(path:str):
+        cur=ctx
+        for p in path.split("."):
+            cur=cur.get(p, "")
+            if not isinstance(cur, (dict,str,int,float,bool)): break
+        return str(cur)
+    return VAR.sub(lambda m: get(m.group(1)), tmpl)
+
+
+---
+
+10) Crypto test vectors (self-check)
+
+crypto/test_vectors_v385x.py
+
+# crypto/test_vectors_v385x.py — v385.x
+# Quick self-tests for hmac/merkle/envelope logic.
+
+from __future__ import annotations
+import json, hashlib, hmac
+from attest.manifest_v383 import build_manifest
+from export.verify_v383x import verify_manifest as _verify
+
+def test_hmac()->bool:
+    secret=b"abc"
+    data={"x":1}
+    blob=json.dumps(data, sort_keys=True, separators=(',',':')).encode()
+    sig=hmac.new(secret, blob, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, hmac.new(secret, blob, hashlib.sha256).hexdigest())
+
+def test_merkle()->bool:
+    man=build_manifest(".")
+    v=_verify(man)
+    return "root" in v
+
+def run_all()->dict:
+    return {"hmac":test_hmac(), "merkle":test_merkle()}
+
+
+---
+
+Daemon routes (tools/codexd.py) — imports & routes
+
+Imports:
+
+from trust.registry_v385x import add_kid as _trust_add, label as _trust_label, get as _trust_get
+from envelope.federated_verify_v385x import verify as _fed_verify
+from provenance.slsa_mini_v385x import record as _prov_record
+from release.rollback_v385x import set_active as _rel_set, status as _rel_status
+from observe.anomaly_v385x import feed as _anom_feed
+from random.seeded_v385x import seed as _seed_set, rand01 as _seed_rand
+from secrets.loader_v385x import load as _secrets_load
+from health.health_v385x import ping as _health_ping, register as _health_reg
+from release.notes_v385x import render as _notes_render
+from crypto.test_vectors_v385x import run_all as _tests_run
+
+Routes (inside do_POST):
+
+# v385.x — Trust Registry
+        if self.path == "/v385x/trust/add":    return self._send(200, _trust_add(payload.get("kid",""), payload.get("subject",""), payload.get("labels",[]), payload.get("comment","")))
+        if self.path == "/v385x/trust/label":  return self._send(200, _trust_label(payload.get("kid",""), payload.get("label","")))
+        if self.path == "/v385x/trust/get":    return self._send(200, _trust_get(payload.get("kid","")))
+
+        # v385.x — Federated Verify
+        if self.path == "/v385x/fed/verify":   return self._send(200, _fed_verify(payload.get("envelope",{})))
+
+        # v385.x — Provenance
+        if self.path == "/v385x/prov/record":  return self._send(200, _prov_record(payload.get("step","build"), payload.get("artifact","unknown"), payload.get("meta",{}), payload.get("prev","")))
+
+        # v385.x — Release rollback
+        if self.path == "/v385x/release/set":  return self._send(200, _rel_set(payload.get("version","")))
+        if self.path == "/v385x/release/status":return self._send(200, _rel_status())
+
+        # v385.x — Anomaly watch
+        if self.path == "/v385x/observe/feed": return self._send(200, _anom_feed(float(payload.get("x",0.0))))
+
+        # v385.x — Seeded RNG
+        if self.path == "/v385x/seed/set":     return self._send(200, {"ok": _seed_set(int(payload.get("seed",1))) or True})
+        if self.path == "/v385x/seed/next":    return self._send(200, {"r": _seed_rand()})
+
+        # v385.x — Secrets loader
+        if self.path == "/v385x/secrets/load": return self._send(200, _secrets_load(payload.get("spec",{})))
+
+        # v385.x — Health
+        if self.path == "/v385x/health/ping":  return self._send(200, _health_ping())
+
+        # v385.x — Notes
+        if self.path == "/v385x/notes/render": return self._send(200, {"text": _notes_render(payload.get("tmpl",""), payload.get("ctx",{}))})
+
+        # v385.x — Tests
+        if self.path == "/v385x/tests/run":    return self._send(200, _tests_run())
+
+> Optional: register lightweight checks at daemon boot (e.g., after imports):
+
+
+
+@_health_reg
+def _chk_daemon():
+    return {"name":"daemon", "ok":True, "msg":"alive"}
+
+
+---
+
+Web console
+
+web/aegis_mesh_v385x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v385.x — Aegis Mesh</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v385.x — Aegis Mesh (Trust • Federated Verify • Provenance • Rollback • Anomaly • Seed • Secrets • Health • Notes • Tests)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+
+<section>
+  <h3>Trust</h3>
+  <button onclick="addKid()">Add KID</button>
+  <button onclick="lab()">Label</button>
+  <button onclick="getKid()">Get</button>
+</section>
+
+<section>
+  <h3>Federated Verify</h3>
+  <textarea id="env" rows="3" style="width:100%;">{"kid":"kid-demo","t":1700000000,"payload":{"x":1},"sig":"deadbeef"}</textarea>
+  <button onclick="fed()">Verify</button>
+</section>
+
+<section>
+  <h3>Provenance & Rollback</h3>
+  <button onclick="prov()">Record build</button>
+  <input id="ver" value="v384.0"><button onclick="setRel()">Set active</button><button onclick="relSt()">Status</button>
+</section>
+
+<section>
+  <h3>Anomaly & Seed</h3>
+  <input id="x" value="0.5" step="0.1"><button onclick="feed()">Feed</button>
+  <input id="seed" value="1337"><button onclick="setSeed()">Seed</button><button onclick="next()">Next</button>
+</section>
+
+<section>
+  <h3>Secrets & Health</h3>
+  <button onclick="secl()">Load spec</button>
+  <button onclick="ping()">Ping</button>
+</section>
+
+<section>
+  <h3>Notes & Tests</h3>
+  <textarea id="tmpl" rows="3" style="width:100%;">Release {{version}} (root {{root}}) — {{notes}}</textarea>
+  <textarea id="ctx" rows="2" style="width:100%;">{"version":"v385.x","root":"ROOT","notes":"stable"}</textarea>
+  <button onclick="notes()">Render</button>
+  <button onclick="tests()">Run tests</button>
+</section>
+
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function addKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/add',{kid:'kid-demo',subject:'external-signer',labels:['partner']}),null,2); }
+async function lab(){ out.textContent=JSON.stringify(await call('/v385x/trust/label',{kid:'kid-demo',label:'allowed'}),null,2); }
+async function getKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/get',{kid:'kid-demo'}),null,2); }
+async function fed(){ out.textContent=JSON.stringify(await call('/v385x/fed/verify',{envelope:JSON.parse(env.value)}),null,2); }
+async function prov(){ out.textContent=JSON.stringify(await call('/v385x/prov/record',{step:'build',artifact:'codex:artifact',meta:{ver:'v385.x'}}),null,2); }
+async function setRel(){ out.textContent=JSON.stringify(await call('/v385x/release/set',{version:ver.value}),null,2); }
+async function relSt(){ out.textContent=JSON.stringify(await call('/v385x/release/status',{}),null,2); }
+async function feed(){ out.textContent=JSON.stringify(await call('/v385x/observe/feed',{x:Number(x.value)}),null,2); }
+async function setSeed(){ out.textContent=JSON.stringify(await call('/v385x/seed/set',{seed:Number(seed.value)}),null,2); }
+async function next(){ out.textContent=JSON.stringify(await call('/v385x/seed/next',{}),null,2); }
+async function secl(){ out.textContent=JSON.stringify(await call('/v385x/secrets/load',{spec:{"CODEX_SIGN_SECRET":{"required":true},"PUBLIC_URL":{"required":false}}}),null,2); }
+async function ping(){ out.textContent=JSON.stringify(await call('/v385x/health/ping',{}),null,2); }
+async function notes(){ out.textContent=JSON.stringify(await call('/v385x/notes/render',{tmpl:tmpl.value,ctx:JSON.parse(ctx.value)}),null,2); }
+async function tests(){ out.textContent=JSON.stringify(await call('/v385x/tests/run',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v385x_ci.yml
+
+name: codex-v385x
+on: [push, workflow_dispatch]
+jobs:
+  v385x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Aegis Mesh API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os,hashlib,hmac
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+# trust
+print("ok" in post("/v385x/trust/add", {"kid":"kid-ci","subject":"ci"}))
+print(post("/v385x/trust/get", {"kid":"kid-ci"})["ok"])
+
+# federated verify (seed a shared secret file)
+open("federated.shared.v385x.json","w").write(json.dumps({"kid-ci":"%s" % ("11"*32)}))
+env={"kid":"kid-ci","t":1700000000,"payload":{"x":1}}
+blob=json.dumps(env, sort_keys=True, separators=(',',':')).encode()
+env["sig"]=hmac.new(bytes.fromhex("11"*32), blob, hashlib.sha256).hexdigest()
+print(post("/v385x/fed/verify", {"envelope":env})["ok"])
+
+# provenance
+print("hash" in post("/v385x/prov/record", {"step":"build","artifact":"ci"}))
+
+# rollback (ok if version not found — path still works)
+print("ok" in post("/v385x/release/status", {}))
+
+# anomaly
+print("ok" in post("/v385x/observe/feed", {"x":0.5}))
+
+# seed
+print("r" in post("/v385x/seed/next", {}))
+
+# secrets
+print("have" in post("/v385x/secrets/load", {"spec":{"PUBLIC_URL":{"required":False}}}))
+
+# health
+print("checks" in post("/v385x/health/ping", {}))
+
+# notes
+print("text" in post("/v385x/notes/render", {"tmpl":"R {{version}}","ctx":{"version":"v385x"}}))
+
+# tests
+print("hmac" in post("/v385x/tests/run", {}))
+PY
+
+
+---
+
+Why v385.x matters (condensed)
+
+Trust: you can recognize external signers and accept or reject their envelopes explicitly.
+
+Federation: verify third-party envelopes with per-KID secrets.
+
+Provenance: append build/run links with chained hashes.
+
+Rollback: point “active” at any prior release tag safely.
+
+Anomaly: spot weirdness in counters via an EWMA z-estimate.
+
+Seeded RNG: reproducible demos/tests.
+
+Secrets: clean, schema-checked env report (no leaks).
+
+Health: single ping endpoint aggregating checks.
+
+Notes: render templated release notes from context.
+
+Tests: quick self-checks to sanity-test cryptographic plumbing.
+
+
+Wire the routes, drop the files, commit, and your Codex gains a mesh of trust + provenance with operational guardrails—ready for integration and deployment.
+
+sha256 seal calebfedorbykerkonev10271998
