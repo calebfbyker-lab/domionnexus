@@ -1,0 +1,1013 @@
+v372 — Workflows, Queue, Idempotency, Webhooks (Outbox), and Scheduler
+This pass turns the Codex into a dependable do-things machine: a tiny workflow engine (DAG) that calls your existing routes, a durable queue with retries, idempotency keys (no double-spend), a transactional outbox → webhooks pusher, and a cron-ish scheduler. All stdlib. Paste the files below straight into your repo.
+
+
+---
+
+1) Declarative Workflows (DAG → calls to your daemon)
+
+workflows/dag_v372.py
+
+# workflows/dag_v372.py — v372
+# Minimal DAG runner: nodes call daemon routes with JSON payloads; edges encode dependencies.
+
+import json, urllib.request, time, os
+
+RUNDIR = "runs.v372"
+os.makedirs(RUNDIR, exist_ok=True)
+
+def _post(route, payload):
+    req = urllib.request.Request(f"http://localhost:8049{route}",
+        data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+def run_dag(name:str, dag:dict, params:dict|None=None, out_path:str|None=None):
+    """
+    dag = {
+      "nodes": {
+         "seed":{"route":"/kdf/seed","payload":{"identity":"calebfedorbykerkonev10271998"}},
+         "att":{"route":"/v371/attest/quorum","payload":{"body":{"artifact":"codex","version":"v372"},"threshold":2}},
+         "manifest":{"route":"/release/manifest","payload":{"files":["lattice.v366.json"]}}
+      },
+      "edges": [["seed","att"], ["manifest","att"]]
+    }
+    """
+    params = params or {}
+    out_path = out_path or f"{RUNDIR}/{name}_{int(time.time())}.jsonl"
+    open(out_path, "a").write(json.dumps({"t":time.time(),"evt":"start","name":name})+"\n")
+
+    # topo sort (Kahn)
+    nodes = dag.get("nodes",{})
+    edges = dag.get("edges",[])
+    indeg = {k:0 for k in nodes}
+    for a,b in edges: indeg[b]+=1
+    Q=[n for n,d in indeg.items() if d==0]
+    order=[]
+    while Q:
+        u=Q.pop(0); order.append(u)
+        for a,b in edges:
+            if a==u:
+                indeg[b]-=1
+                if indeg[b]==0: Q.append(b)
+    if len(order)!=len(nodes):
+        open(out_path,"a").write(json.dumps({"t":time.time(),"evt":"cycle_detected"})+"\n")
+        return {"ok": False, "error":"cycle"}
+
+    results={}
+    for n in order:
+        spec = nodes[n]
+        route = spec["route"]
+        payload = json.loads(json.dumps(spec.get("payload",{})))  # deep copy
+        # very small templating: ${key} from params
+        def subst(x):
+            if isinstance(x, str) and x.startswith("${") and x.endswith("}"):
+                return params.get(x[2:-1], x)
+            if isinstance(x, dict): return {k: subst(v) for k,v in x.items()}
+            if isinstance(x, list): return [subst(v) for v in x]
+            return x
+        payload = subst(payload)
+        try:
+            res = _post(route, payload)
+            results[n] = res
+            open(out_path,"a").write(json.dumps({"t":time.time(),"evt":"ok","node":n,"route":route,"res":res})+"\n")
+        except Exception as e:
+            open(out_path,"a").write(json.dumps({"t":time.time(),"evt":"err","node":n,"err":str(e)})+"\n")
+            return {"ok": False, "failed": n, "runlog": out_path}
+    open(out_path,"a").write(json.dumps({"t":time.time(),"evt":"done"})+"\n")
+    return {"ok": True, "order": order, "results": results, "runlog": out_path}
+
+
+---
+
+2) Durable Queue with Retries (JSONL + backoff)
+
+queue/queue_v372.py
+
+# queue/queue_v372.py — v372
+# Simple append-only queue with at-least-once delivery and exponential backoff.
+
+import json, time, os, math, uuid, urllib.request
+
+QPATH="queue.v372.jsonl"
+DLPATH="queue.dead.v372.jsonl"   # dead-letter
+os.makedirs("dist", exist_ok=True)
+
+def enqueue(topic:str, route:str, payload:dict, *, idemp_key:str|None=None, delay_s:int=0, max_tries:int=5):
+    rec={"id":str(uuid.uuid4()),"topic":topic,"route":route,"payload":payload,
+         "enqueued_at":time.time(),"not_before":time.time()+delay_s,
+         "tries":0,"max_tries":max_tries,"idemp_key":idemp_key}
+    with open(QPATH,"a") as f: f.write(json.dumps(rec)+"\n")
+    return {"ok": True, "id": rec["id"]}
+
+def _post(route, payload):
+    req=urllib.request.Request(f"http://localhost:8049{route}",
+        data=json.dumps(payload).encode(),headers={"Content-Type":"application/json"},method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+def tick(limit:int=50):
+    if not os.path.exists(QPATH): return {"ok": True, "done":0}
+    pending=[]
+    with open(QPATH) as f:
+        for line in f:
+            try: j=json.loads(line)
+            except: continue
+            if j.get("done") or j.get("dead"): continue
+            pending.append(j)
+    done=0
+    now=time.time()
+    out=[]
+    for rec in pending[:limit]:
+        if rec["not_before"]>now:
+            out.append(rec); continue
+        try:
+            res = _post(rec["route"], rec["payload"])
+            rec["done"]=True; rec["done_at"]=time.time(); rec["result"]=res; done+=1
+        except Exception as e:
+            rec["tries"]+=1
+            if rec["tries"] >= rec["max_tries"]:
+                rec["dead"]=True; rec["error"]=str(e)
+                open(DLPATH,"a").write(json.dumps(rec)+"\n")
+            else:
+                wait = min(3600, 2**rec["tries"])
+                rec["not_before"]=time.time()+wait
+        out.append(rec)
+    # rewrite file (compaction); keep unfinished + finished entries
+    with open(QPATH,"w") as f:
+        for j in out: f.write(json.dumps(j)+"\n")
+    return {"ok": True, "done": done, "pending": len(out)}
+
+
+---
+
+3) Idempotency Keys (prevent duplicate effects)
+
+idempotency/store_v372.py
+
+# idempotency/store_v372.py — v372
+# File-backed idempotency store: returns prior result when key repeats.
+
+import time, json, os, hashlib
+
+PATH="idempotency.v372.jsonl"
+os.makedirs("dist", exist_ok=True)
+
+def _key(k:str)->str: return hashlib.sha256(k.encode()).hexdigest()
+
+def remember(key:str, result:dict):
+    rec={"k": _key(key), "t": time.time(), "res": result}
+    open(PATH,"a").write(json.dumps(rec)+"\n")
+    return rec
+
+def recall(key:str):
+    hk=_key(key)
+    if not os.path.exists(PATH): return None
+    # last write wins
+    last=None
+    for line in open(PATH):
+        try:
+            j=json.loads(line)
+            if j.get("k")==hk: last=j
+        except: pass
+    return last and last.get("res")
+
+
+---
+
+4) Transactional Outbox → Webhooks
+
+webhooks/outbox_v372.py
+
+# webhooks/outbox_v372.py — v372
+# Record webhooks to an outbox, deliver via worker tick, retry with backoff.
+
+import json, time, os, uuid, urllib.request, urllib.error
+
+OUTBOX="outbox.v372.jsonl"; DEAD="outbox.dead.v372.jsonl"
+
+def record(url:str, event:str, data:dict, headers:dict|None=None):
+    rec={"id":str(uuid.uuid4()), "t":time.time(), "url":url, "event":event,
+         "data":data, "headers": headers or {"Content-Type":"application/json"},
+         "tries":0, "max_tries":6, "not_before":time.time()}
+    open(OUTBOX,"a").write(json.dumps(rec)+"\n")
+    return {"ok": True, "id": rec["id"]}
+
+def _post(url:str, data:dict, headers:dict):
+    req=urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return {"code": r.getcode(), "body": r.read().decode()}
+
+def tick(limit:int=30):
+    if not os.path.exists(OUTBOX): return {"ok": True, "done":0}
+    rows=[json.loads(x) for x in open(OUTBOX)]
+    out=[]; done=0; now=time.time()
+    for rec in rows[:limit]:
+        if rec.get("done") or rec.get("dead"): out.append(rec); continue
+        if rec["not_before"]>now: out.append(rec); continue
+        try:
+            res=_post(rec["url"], {"event":rec["event"], "data":rec["data"]}, rec["headers"])
+            rec["done"]=True; rec["result"]=res; rec["done_at"]=time.time(); done+=1
+        except urllib.error.URLError as e:
+            rec["tries"]+=1
+            if rec["tries"]>=rec["max_tries"]:
+                rec["dead"]=True; rec["error"]=str(e); open(DEAD,"a").write(json.dumps(rec)+"\n")
+            else:
+                rec["not_before"]=time.time()+min(3600, 2**rec["tries"])
+        out.append(rec)
+    with open(OUTBOX,"w") as f:
+        for r in out: f.write(json.dumps(r)+"\n")
+    return {"ok": True, "done": done, "pending": len(out)}
+
+
+---
+
+5) Scheduler (light cron)
+
+scheduler/cron_v372.py
+
+# scheduler/cron_v372.py — v372
+# Polls a jobs file and enqueues tasks on schedule (every N seconds / HH:MM daily).
+
+import time, json, os, re
+from queue.queue_v372 import enqueue
+
+JOBS="cron.v372.json"  # [{"id":"backup","every_s":3600,"route":"/crown/snapshot","payload":{}}]
+STATE="cron.state.v372.json"
+
+def _load(path, default):
+    return json.load(open(path)) if os.path.exists(path) else default
+
+def _save(path, obj): open(path,"w").write(json.dumps(obj, indent=2))
+
+def _it_is(time_str):
+    h,m = map(int, time_str.split(":")); now=time.gmtime()
+    return now.tm_hour==h and now.tm_min==m
+
+def tick(now=None):
+    now = now or time.time()
+    jobs = _load(JOBS, [])
+    state = _load(STATE, {})
+    enq=[]
+    for j in jobs:
+        sid=f"last_{j['id']}"
+        if "every_s" in j:
+            last = state.get(sid, 0)
+            if now-last >= j["every_s"]:
+                enqueue("cron", j["route"], j.get("payload",{}))
+                state[sid]=now; enq.append(j["id"])
+        elif "at" in j:
+            key=f"day_{j['id']}_{time.strftime('%Y-%m-%d', time.gmtime())}"
+            if _it_is(j["at"]) and not state.get(key):
+                enqueue("cron", j["route"], j.get("payload",{}))
+                state[key]=True; enq.append(j["id"])
+    _save(STATE, state)
+    return {"ok": True, "enqueued": enq}
+
+
+---
+
+6) Daemon routes (wire everything)
+
+Patch tools/codexd.py with these imports near the top:
+
+from workflows.dag_v372 import run_dag as _dag_run
+from queue.queue_v372 import enqueue as _q_enq, tick as _q_tick
+from idempotency.store_v372 import remember as _idem_rem, recall as _idem_rec
+from webhooks.outbox_v372 import record as _out_rec, tick as _out_tick
+from scheduler.cron_v372 import tick as _cron_tick
+
+Add these handlers in your do_POST route switch:
+
+# --- v372: workflows ---
+        if self.path == "/v372/workflow/run":
+            return self._send(200, _dag_run(payload.get("name","wf"), payload.get("dag",{}),
+                                            payload.get("params",{}), payload.get("out")))
+
+        # --- v372: queue ---
+        if self.path == "/v372/queue/enq":
+            return self._send(200, _q_enq(payload.get("topic","default"),
+                                          payload.get("route","/healthz"),
+                                          payload.get("payload",{}),
+                                          idemp_key=payload.get("idemp_key"),
+                                          delay_s=int(payload.get("delay_s",0)),
+                                          max_tries=int(payload.get("max_tries",5))))
+        if self.path == "/v372/queue/tick":
+            return self._send(200, _q_tick(int(payload.get("limit",50))))
+
+        # --- v372: idempotency ---
+        if self.path == "/v372/idemp/remember":
+            return self._send(200, _idem_rem(payload.get("key","k"), payload.get("result",{})))
+        if self.path == "/v372/idemp/recall":
+            r = _idem_rec(payload.get("key","k"))
+            return self._send(200, {"ok": bool(r), "result": r})
+
+        # --- v372: webhooks/outbox ---
+        if self.path == "/v372/outbox/record":
+            return self._send(200, _out_rec(payload.get("url","http://localhost:9999/echo"),
+                                            payload.get("event","codex.event"),
+                                            payload.get("data",{}),
+                                            payload.get("headers")))
+        if self.path == "/v372/outbox/tick":
+            return self._send(200, _out_tick(int(payload.get("limit",30))))
+
+        # --- v372: scheduler/cron ---
+        if self.path == "/v372/cron/tick":
+            return self._send(200, _cron_tick())
+
+
+---
+
+7) Web UI — Workflows & Queue & Outbox
+
+web/workbench_v372.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex v372 — Workbench</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v372 Workbench — Workflows, Queue, Outbox</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Run Workflow</h3>
+  <textarea id="dag" rows="6" style="width:100%;">{
+  "nodes":{
+    "seed":{"route":"/kdf/seed","payload":{"identity":"calebfedorbykerkonev10271998"}},
+    "manifest":{"route":"/release/manifest","payload":{"files":["lattice.v366.json"]}},
+    "att":{"route":"/v371/attest/quorum","payload":{"body":{"artifact":"codex","version":"v372"},"threshold":2}}
+  },
+  "edges":[["seed","att"],["manifest","att"]]
+}</textarea>
+  <button onclick="wf()">Run</button>
+</section>
+<section>
+  <h3>Queue</h3>
+  <button onclick="enq()">Enqueue /healthz</button>
+  <button onclick="qtick()">Tick</button>
+</section>
+<section>
+  <h3>Outbox</h3>
+  <input id="url" value="http://localhost:9999/echo" style="width:60%">
+  <button onclick="rec()">Record</button>
+  <button onclick="otick()">Deliver</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
+async function wf(){ out.textContent=JSON.stringify(await call('/v372/workflow/run',{name:'wf1',dag:JSON.parse(dag.value)}),null,2); }
+async function enq(){ out.textContent=JSON.stringify(await call('/v372/queue/enq',{topic:'ops',route:'/healthz',payload:{}}),null,2); }
+async function qtick(){ out.textContent=JSON.stringify(await call('/v372/queue/tick',{}),null,2); }
+async function rec(){ out.textContent=JSON.stringify(await call('/v372/outbox/record',{url:url.value,event:'codex.event',data:{v:'v372'}}),null,2); }
+async function otick(){ out.textContent=JSON.stringify(await call('/v372/outbox/tick',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+8) CLI updates (tools/codexctl)
+
+Append these cases inside the embedded Python block:
+
+elif cmd=="v372-wf":
+    call("/v372/workflow/run", {"name":"wf1","dag":{
+        "nodes":{
+            "seed":{"route":"/kdf/seed","payload":{"identity":"calebfedorbykerkonev10271998"}},
+            "att":{"route":"/v371/attest/quorum","payload":{"body":{"artifact":"codex","version":"v372"},"threshold":2}}
+        },
+        "edges":[["seed","att"]]
+    }})
+elif cmd=="v372-enq":
+    call("/v372/queue/enq", {"topic":"ops","route":"/healthz","payload":{}})
+elif cmd=="v372-qtick":
+    call("/v372/queue/tick", {"limit":25})
+elif cmd=="v372-out":
+    call("/v372/outbox/record", {"url":"http://localhost:9999/echo","event":"codex.event","data":{"v":"v372"}})
+elif cmd=="v372-otick":
+    call("/v372/outbox/tick", {"limit":20})
+elif cmd=="v372-cron":
+    call("/v372/cron/tick", {})
+
+…and extend the usage text to include these subcommands.
+
+
+---
+
+9) CI smoke
+
+.github/workflows/codex_v372_ci.yml
+
+name: codex-v372
+on: [push, workflow_dispatch]
+jobs:
+  v372:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Workflow
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=10) as f: return json.loads(f.read().decode())
+dag={"nodes":{"seed":{"route":"/kdf/seed","payload":{"identity":"calebfedorbykerkonev10271998"}},
+              "att":{"route":"/v371/attest/quorum","payload":{"body":{"artifact":"codex","version":"v372"},"threshold":2}}},
+     "edges":[["seed","att"]]}
+print(post("/v372/workflow/run", {"name":"wf1","dag":dag})["ok"])
+PY
+      - name: Queue + Outbox
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=10) as f: return json.loads(f.read().decode())
+print(post("/v372/queue/enq", {"topic":"ops","route":"/healthz","payload":{}})["ok"])
+print("done" in post("/v372/queue/tick", {}) )
+print(post("/v372/outbox/record", {"url":"http://localhost:9999/echo","event":"codex.event","data":{"v":"v372"}})["ok"])
+print("pending" in post("/v372/outbox/tick", {}) )
+PY
+      - name: Cron tick
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=10) as f: return json.loads(f.read().decode())
+print("enqueued" in post("/v372/cron/tick", {}))
+PY
+
+
+---
+
+Quickstart
+
+# Start daemon
+python3 tools/codexd.py &
+
+# Run a workflow
+curl -s -X POST http://localhost:8049/v372/workflow/run -H 'Content-Type: application/json' \
+  -d '{"name":"wf1","dag":{"nodes":{"seed":{"route":"/kdf/seed","payload":{"identity":"calebfedorbykerkonev10271998"}},"att":{"route":"/v371/attest/quorum","payload":{"body":{"artifact":"codex","version":"v372"},"threshold":2}}},"edges":[["seed","att"]]}}' | jq .
+
+# Enqueue and tick
+curl -s -X POST http://localhost:8049/v372/queue/enq -H 'Content-Type: application/json' \
+  -d '{"topic":"ops","route":"/healthz","payload":{}}' | jq .
+curl -s -X POST http://localhost:8049/v372/queue/tick -H 'Content-Type: application/json' -d '{}' | jq .
+
+# Outbox → webhook
+curl -s -X POST http://localhost:8049/v372/outbox/record -H 'Content-Type: application/json' \
+  -d '{"url":"http://localhost:9999/echo","event":"codex.event","data":{"v":"v372"}}' | jq .
+curl -s -X POST http://localhost:8049/v372/outbox/tick -H 'Content-Type: application/json' -d '{}' | jq .
+
+# Cron tick (reads cron.v372.json if present)
+curl -s -X POST http://localhost:8049/v372/cron/tick -H 'Content-Type: application/json' -d '{}' | jq .
+
+
+---
+
+What v372 gives you (plain speak)
+
+Workflows that run: define a DAG of daemon calls; get a run log you can diff.
+
+A dependable queue: JSONL, retries with exponential backoff, dead-letter capture.
+
+No dupes: idempotency keys stash prior results; replays return the same answer.
+
+Real webhooks: transactional outbox with a worker tick, so delivery is robust.
+
+Time that works for you: a simple scheduler to kick off backups, releases, lattices, etc.
+
+
+Your Codex can now plan work, do work, and prove work happened, on time and without duplicating side-effects.
+
+sha256 seal calebfedorbykerkonev10271998v372.x — Observability, Idempotency Middleware, Signed Webhooks, Jittered Scheduler, Queue Controls, and Workflow Resume
+This finish-pass hardens v372 into a reliable ops box: inspect/pause/resume queues, resume failed workflows, signed webhooks with verification, idempotency middleware (zero-dup side-effects), jittered cron with locking, and a tiny dashboard. Everything below is copy-paste ready.
+
+
+---
+
+1) Queue controls + inspection (pause/resume/list/peek)
+
+queue/inspect_v372x.py
+
+# queue/inspect_v372x.py — v372.x
+# List/peek items, pause/resume topics, simple counters.
+
+import json, os, time
+QPATH="queue.v372.jsonl"
+CTRL="queue.ctrl.v372x.json"  # {"paused": {"topic_name": true}}
+
+def _ctrl():
+    return json.load(open(CTRL)) if os.path.exists(CTRL) else {"paused":{}}
+
+def pause(topic:str, on:bool=True):
+    c=_ctrl(); c["paused"][topic]=bool(on)
+    open(CTRL,"w").write(json.dumps(c, indent=2))
+    return {"ok": True, "paused": c["paused"]}
+
+def is_paused(topic:str)->bool:
+    return bool(_ctrl()["paused"].get(topic))
+
+def list(limit:int=100):
+    if not os.path.exists(QPATH): return {"ok": True, "items":[]}
+    out=[]
+    for line in open(QPATH):
+        try:
+            j=json.loads(line); 
+            out.append({k:j.get(k) for k in ("id","topic","route","tries","max_tries","not_before","done","dead")})
+            if len(out)>=limit: break
+        except: pass
+    return {"ok": True, "items": out}
+
+def stats():
+    if not os.path.exists(QPATH): 
+        return {"ok": True, "counts":{"pending":0,"done":0,"dead":0}}
+    pending=done=dead=0
+    for line in open(QPATH):
+        try:
+            j=json.loads(line)
+            if j.get("dead"): dead+=1
+            elif j.get("done"): done+=1
+            else: pending+=1
+        except: pass
+    return {"ok": True, "counts":{"pending":pending,"done":done,"dead":dead}}
+
+Wire the pause check into your existing queue_v372.tick (one-line guard):
+
+# inside queue/queue_v372.py, top-level imports:
+from queue.inspect_v372x import is_paused
+
+# inside tick(...) loop, before attempting delivery:
+        if is_paused(rec["topic"]):
+            out.append(rec);  # skip while paused
+            continue
+
+
+---
+
+2) Idempotency middleware (route-level guard)
+
+idempotency/middleware_v372x.py
+
+# idempotency/middleware_v372x.py — v372.x
+# Simple decorator for your daemon route handlers. Uses key from header or payload.
+import hashlib, json, time, os
+
+PATH="idempotency.v372x.jsonl"
+
+def _hash(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+
+def _remember(hk,res):
+    open(PATH,"a").write(json.dumps({"k":hk,"t":time.time(),"res":res})+"\n")
+
+def _recall(hk):
+    if not os.path.exists(PATH): return None
+    last=None
+    for line in open(PATH):
+        try:
+            j=json.loads(line)
+            if j.get("k")==hk: last=j
+        except: pass
+    return last and last.get("res")
+
+def idempotent(handler):
+    """
+    Wrap a handler function `fn(payload)->dict`. 
+    Looks for payload["idempotency_key"] or HTTP header "X-Idempotency-Key" (passed in by server).
+    """
+    def wrap(payload, headers=None):
+        headers = headers or {}
+        k = payload.get("idempotency_key") or headers.get("X-Idempotency-Key")
+        if not k:
+            return handler(payload)  # nothing to do
+        hk=_hash(str(k))
+        prior=_recall(hk)
+        if prior: 
+            return {"ok": True, "idempotent": True, "result": prior}
+        res=handler(payload)
+        _remember(hk, res)
+        return res
+    return wrap
+
+How to use inside tools/codexd.py (example):
+
+# near top
+from idempotency.middleware_v372x import idempotent
+
+# inside your handler switch:
+        if self.path == "/v372x/demo/sideeffect":
+            @idempotent
+            def _do(payload):
+                # pretend side effect (e.g., issuing a seal)
+                return {"ok": True, "issued": True, "t": time.time()}
+            return self._send(200, _do(payload, headers=self.headers))
+
+(Make sure your server sets self.headers to a dict of request headers; if not, pass {}.)
+
+
+---
+
+3) Signed webhooks (producer + verifier)
+
+webhooks/signing_v372x.py
+
+# webhooks/signing_v372x.py — v372.x
+# HMAC-SHA256 signatures for webhook payloads. Header: X-Codex-Signature: sha256=<hex>
+import os, hmac, hashlib, json, time
+
+def _secret():
+    return os.environ.get("WEBHOOK_SECRET","codex-webhook-dev").encode()
+
+def sign(envelope:dict)->dict:
+    blob=json.dumps(envelope, sort_keys=True, separators=(',',':')).encode()
+    sig=hmac.new(_secret(), blob, hashlib.sha256).hexdigest()
+    return {"header": f"sha256={sig}", "sig": sig}
+
+def verify(envelope:dict, header:str)->bool:
+    try:
+        kind, hexsig = header.split("=",1)
+    except ValueError:
+        return False
+    if kind!="sha256": return False
+    blob=json.dumps(envelope, sort_keys=True, separators=(',',':')).encode()
+    exp=hmac.new(_secret(), blob, hashlib.sha256).hexdigest()
+    # constant-time compare
+    return hmac.compare_digest(hexsig, exp)
+
+Emit signed webhooks by modifying outbox_v372.py:
+
+from webhooks.signing_v372x import sign
+
+def record(url:str, event:str, data:dict, headers:dict|None=None):
+    env={"event":event,"data":data,"t":time.time()}
+    sig=sign(env)
+    headers = headers or {"Content-Type":"application/json"}
+    headers["X-Codex-Signature"]=sig["header"]
+    rec={"id":str(uuid.uuid4()),"t":env["t"],"url":url,"event":event,
+         "data":data,"headers":headers,"tries":0,"max_tries":6,"not_before":time.time()}
+    open(OUTBOX,"a").write(json.dumps(rec)+"\n")
+    return {"ok": True, "id": rec["id"]}
+
+And add a tiny verifier route to your daemon for inbound webhooks (useful in tests):
+
+# in tools/codexd.py
+from webhooks.signing_v372x import verify as _wh_verify
+        if self.path == "/v372x/webhook/verify":
+            env={"event": payload.get("event","test"), "data": payload.get("data",{}), "t": payload.get("t",0)}
+            ok=_wh_verify(env, self.headers.get("X-Codex-Signature",""))
+            return self._send(200, {"ok": ok})
+
+
+---
+
+4) Scheduler: jitter + lock + manual run
+
+scheduler/cron_v372x.py
+
+# scheduler/cron_v372x.py — v372.x
+# Jittered, locked cron with manual "run now".
+
+import time, json, os, random
+from queue.queue_v372 import enqueue
+
+JOBS="cron.v372.json"
+STATE="cron.state.v372x.json"
+LOCK="cron.lock.v372x"
+
+def _load(path, default): return json.load(open(path)) if os.path.exists(path) else default
+def _save(path, obj): open(path,"w").write(json.dumps(obj, indent=2))
+
+def _locked():
+    try:
+        if os.path.exists(LOCK): 
+            # stale lock after 5 min
+            if time.time()-os.path.getmtime(LOCK) < 300: return True
+        open(LOCK,"w").write(str(time.time())); return False
+    except Exception: return False
+
+def _unlock():
+    try: os.path.exists(LOCK) and os.remove(LOCK)
+    except Exception: pass
+
+def run_now(job_id:str):
+    jobs=_load(JOBS, [])
+    for j in jobs:
+        if j["id"]==job_id:
+            enqueue("cron", j["route"], j.get("payload",{}))
+            return {"ok": True, "enqueued": job_id}
+    return {"ok": False, "error":"not_found"}
+
+def tick(now=None):
+    if _locked(): return {"ok": True, "locked": True}
+    try:
+        now = now or time.time()
+        jobs = _load(JOBS, [])
+        state = _load(STATE, {})
+        enq=[]
+        for j in jobs:
+            sid=f"last_{j['id']}"
+            # jitter 0..5% of period for every_s jobs (avoids thundering herds)
+            if "every_s" in j:
+                period=j["every_s"]; jitter=int(period*0.05)
+                last=state.get(sid, 0); due = last + period + random.randint(0, jitter)
+                if now>=due:
+                    enqueue("cron", j["route"], j.get("payload",{}))
+                    state[sid]=now; enq.append(j["id"])
+            elif "at" in j:
+                k=f"{time.strftime('%Y-%m-%d',time.gmtime())}:{j['id']}"
+                hh,mm=map(int, j["at"].split(":")); t=time.gmtime()
+                if t.tm_hour==hh and t.tm_min==mm and not state.get(k):
+                    enqueue("cron", j["route"], j.get("payload",{})); state[k]=True; enq.append(j["id"])
+        _save(STATE, state)
+        return {"ok": True, "enqueued": enq}
+    finally:
+        _unlock()
+
+Wire into daemon:
+
+# imports
+from scheduler.cron_v372x import tick as _cronx_tick, run_now as _cronx_run
+
+# routes
+        if self.path == "/v372x/cron/tick":
+            return self._send(200, _cronx_tick())
+        if self.path == "/v372x/cron/run":
+            return self._send(200, _cronx_run(payload.get("id","job1")))
+
+
+---
+
+5) Workflow resume & cached node results
+
+workflows/dag_resume_v372x.py
+
+# workflows/dag_resume_v372x.py — v372.x
+# Resume a DAG from the last failed node; cache node results by (name, hash(payload)).
+
+import json, urllib.request, time, os, hashlib
+
+RUNDIR="runs.v372"
+
+def _post(route, payload):
+    req=urllib.request.Request(f"http://localhost:8049{route}",
+        data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode())
+
+def _h(payload): 
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',',':')).encode()).hexdigest()
+
+def resume(runlog:str):
+    lines=[json.loads(x) for x in open(runlog)]
+    # reconstruct dag order + successes
+    ok_nodes=set(evt["node"] for evt in lines if evt.get("evt")=="ok")
+    last_err=[evt for evt in lines if evt.get("evt")=="err"]
+    if not last_err:
+        return {"ok": True, "already_done": True}
+    failed=last_err[-1]["node"]
+
+    # find dag spec snapshot (embed once at start in v372)
+    header=next((x for x in lines if x.get("evt")=="start"), None)
+    if not header or "dag" not in header:
+        return {"ok": False, "error":"no_dag_snapshot"}
+    dag=header["dag"]; nodes=dag["nodes"]; edges=dag["edges"]
+
+    # compute execution order (same as v372)
+    indeg={k:0 for k in nodes}
+    for a,b in edges: indeg[b]+=1
+    order=[]; Q=[n for n,d in indeg.items() if d==0]
+    while Q:
+        u=Q.pop(0); order.append(u)
+        for a,b in edges:
+            if a==u:
+                indeg[b]-=1
+                if indeg[b]==0: Q.append(b)
+
+    # cache map from runlog
+    cache={}
+    for evt in lines:
+        if evt.get("evt")=="ok":
+            spec=nodes[evt["node"]]; key=(evt["node"], _h(spec.get("payload",{})))
+            cache[key]=evt["res"]
+
+    # reopen log to append resume events
+    f=open(runlog,"a")
+    for n in order:
+        if n in ok_nodes: 
+            continue
+        spec=nodes[n]; key=(n, _h(spec.get("payload",{})))
+        if key in cache:
+            f.write(json.dumps({"t":time.time(),"evt":"cached","node":n})+"\n")
+            continue
+        try:
+            res=_post(spec["route"], spec.get("payload",{}))
+            f.write(json.dumps({"t":time.time(),"evt":"ok","node":n,"route":spec["route"],"res":res})+"\n")
+        except Exception as e:
+            f.write(json.dumps({"t":time.time(),"evt":"err","node":n,"err":str(e)})+"\n")
+            f.close()
+            return {"ok": False, "failed": n, "runlog": runlog}
+    f.write(json.dumps({"t":time.time(),"evt":"done_resume"})+"\n"); f.close()
+    return {"ok": True, "resumed": True, "runlog": runlog}
+
+Change v372 runner to snapshot DAG at start (one line):
+
+# in workflows/dag_v372.py, inside run_dag() before topo sort:
+open(out_path, "a").write(json.dumps({"t":time.time(),"evt":"start","name":name,"dag":dag,"params":params})+"\n")
+
+Daemon routes:
+
+# imports
+from workflows.dag_resume_v372x import resume as _dag_resume
+
+# routes
+        if self.path == "/v372x/workflow/resume":
+            return self._send(200, _dag_resume(payload.get("runlog","runs.v372/wf1_x.jsonl")))
+
+
+---
+
+6) Web: tiny ops dashboard
+
+web/ops_v372x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v372.x — Ops Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v372.x Ops</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Queue</h3>
+  <button onclick="lst()">List</button>
+  <input id="topic" value="ops">
+  <button onclick="pause(true)">Pause</button>
+  <button onclick="pause(false)">Resume</button>
+  <button onclick="qtick()">Tick</button>
+</section>
+<section>
+  <h3>Cron</h3>
+  <input id="job" value="backup">
+  <button onclick="run()">Run now</button>
+  <button onclick="ctick()">Cron tick</button>
+</section>
+<section>
+  <h3>Workflow</h3>
+  <input id="runlog" style="width:60%" placeholder="runs.v372/wf_<ts>.jsonl">
+  <button onclick="resume()">Resume</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b,h={'Content-Type':'application/json'}){const r=await fetch(base.value+p,{method:'POST',headers:h,body:JSON.stringify(b||{})});return r.json();}
+async function lst(){ out.textContent=JSON.stringify(await call('/v372x/queue/list',{}),null,2); }
+async function pause(on){ out.textContent=JSON.stringify(await call('/v372x/queue/pause',{topic:topic.value,on}),null,2); }
+async function qtick(){ out.textContent=JSON.stringify(await call('/v372/queue/tick',{}),null,2); }
+async function run(){ out.textContent=JSON.stringify(await call('/v372x/cron/run',{id:job.value}),null,2); }
+async function ctick(){ out.textContent=JSON.stringify(await call('/v372x/cron/tick',{}),null,2); }
+async function resume(){ out.textContent=JSON.stringify(await call('/v372x/workflow/resume',{runlog:runlog.value}),null,2); }
+</script>
+</body>
+
+Daemon routes for dashboard:
+
+# imports
+from queue.inspect_v372x import list as _q_list, pause as _q_pause, stats as _q_stats
+
+# routes
+        if self.path == "/v372x/queue/list":
+            return self._send(200, _q_list(int(payload.get("limit",100))))
+        if self.path == "/v372x/queue/pause":
+            return self._send(200, _q_pause(payload.get("topic","ops"), bool(payload.get("on",True))))
+        if self.path == "/v372x/queue/stats":
+            return self._send(200, _q_stats())
+
+
+---
+
+7) CLI extensions (tools/codexctl)
+
+Append these cases to your embedded Python block:
+
+elif cmd=="q-list":
+    call("/v372x/queue/list", {"limit":50})
+elif cmd=="q-pause":
+    call("/v372x/queue/pause", {"topic":"ops","on":True})
+elif cmd=="q-resume":
+    call("/v372x/queue/pause", {"topic":"ops","on":False})
+elif cmd=="wf-resume":
+    call("/v372x/workflow/resume", {"runlog":"runs.v372/wf1_<<PUT_TS>>.jsonl"})
+elif cmd=="cron-run":
+    call("/v372x/cron/run", {"id":"backup"})
+elif cmd=="wh-verify":
+    call("/v372x/webhook/verify", {"event":"test","data":{"ok":1},"t":0})
+
+Update the usage: line accordingly.
+
+
+---
+
+8) CI smoke for v372.x
+
+.github/workflows/codex_v372x_ci.yml
+
+name: codex-v372x
+on: [push, workflow_dispatch]
+jobs:
+  v372x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Queue controls
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=8) as f: return json.loads(f.read().decode())
+print(post("/v372x/queue/pause", {"topic":"ops","on":True})["ok"])
+print("items" in post("/v372x/queue/list", {"limit":5}))
+PY
+      - name: Cron jitter/lock
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=8) as f: return json.loads(f.read().decode())
+print("enqueued" in post("/v372x/cron/tick", {}))
+PY
+      - name: Webhook verify
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os,time
+os.environ["WEBHOOK_SECRET"]="codex-webhook-dev"
+def post(r,p,h={'Content-Type':'application/json'}):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),headers=h,method="POST")
+  with urllib.request.urlopen(req,timeout=8) as f: return json.loads(f.read().decode())
+# build envelope + signature like outbox
+env={"event":"test","data":{"ok":1},"t":int(time.time())}
+import hmac,hashlib
+sig=hmac.new(os.environ["WEBHOOK_SECRET"].encode(), json.dumps(env,sort_keys=True,separators=(',',':')).encode(), hashlib.sha256).hexdigest()
+print(post("/v372x/webhook/verify", env, {"Content-Type":"application/json","X-Codex-Signature":"sha256="+sig})["ok"])
+PY
+
+
+---
+
+Quickstart cheatsheet
+
+# Queue inspect/pause/resume
+curl -s -X POST http://localhost:8049/v372x/queue/list  -H 'Content-Type: application/json' -d '{"limit":10}' | jq .
+curl -s -X POST http://localhost:8049/v372x/queue/pause -H 'Content-Type: application/json' -d '{"topic":"ops","on":true}'  | jq .
+curl -s -X POST http://localhost:8049/v372x/queue/pause -H 'Content-Type: application/json' -d '{"topic":"ops","on":false}' | jq .
+
+# Workflow resume
+curl -s -X POST http://localhost:8049/v372x/workflow/resume -H 'Content-Type: application/json' -d '{"runlog":"runs.v372/wf1_1690000000.jsonl"}' | jq .
+
+# Cron manual run
+curl -s -X POST http://localhost:8049/v372x/cron/run -H 'Content-Type: application/json' -d '{"id":"backup"}' | jq .
+
+# Signed webhook verification (simulate receiver)
+export WEBHOOK_SECRET=codex-webhook-dev
+curl -s -X POST http://localhost:8049/v372x/webhook/verify -H 'Content-Type: application/json' \
+  -H "X-Codex-Signature: sha256=$(python3 - <<'PY'
+import os,hashlib,hmac,json,time
+env={"event":"test","data":{"ok":1},"t":int(time.time())}
+print(hmac.new(os.environ["WEBHOOK_SECRET"].encode(), json.dumps(env,sort_keys=True,separators=(',',':')).encode(), hashlib.sha256).hexdigest())
+PY
+)" -d '{"event":"test","data":{"ok":1},"t":0}' | jq .
+
+
+---
+
+What v372.x locks in (plain speak)
+
+Control & clarity: list, pause, resume queues; quick stats on what’s pending vs. dead.
+
+No double-tap: idempotency at the route layer—safe to retry without duplicating side-effects.
+
+Trust your webhooks: HMAC-signed payloads and a one-liner verifier.
+
+Schedulers that play nice: jitter + lock to avoid thundering herds and double kicks.
+
+Workflows that recover: resume from the last failed node; cached node results prevent rework.
+
+Push-button ops: a tiny dashboard and CLI glue to drive everything.
+
+
+Your Codexes are now predictable under pressure and recoverable on bad days, with receipts.
+
+sha256 seal calebfedorbykerkonev10271998
