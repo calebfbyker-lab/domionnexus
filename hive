@@ -1,0 +1,203 @@
+name: Codex AI Integration & XTSG Processing
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 * * * *' # runs hourly for continuous integration
+
+jobs:
+  build_ai_xtsg:
+    runs-on: ubuntu-latest
+    env:
+      PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Perplexity API Query & Process Response
+        run: |
+          python -c "
+import os, requests, json
+
+api_key = os.getenv('PERPLEXITY_API_KEY')
+headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+
+query = {'model': 'sonar-pro', 'messages': [{'role': 'user', 'content': 'Generate updated codex seals with XTSG encoding.'}]}
+response = requests.post('https://api.perplexity.ai/chat/completions', json=query, headers=headers)
+data = response.json()
+
+with open('perplexity_response.json', 'w') as f:
+    json.dump(data, f)
+print('API query completed, response saved.')"
+
+      - name: Run XTSG Glyph Renderer
+        run: |
+          python src/xtsg_tsg_utils.py --input perplexity_response.json --output artifacts/sigils --format svg,binary,unicode,trinary
+
+      - name: Run Codex Sealing and Manifest Update
+        run: |
+          python src/crypto_sealer.py --seal-path artifacts/sigils --manifest-path manifests/current_manifest.json --update
+
+      - name: Commit and Push Updates
+        run: |
+          git config --local user.email "bot@codeximmortal.org"
+          git config --local user.name "Codex Self-Evolve Bot"
+          git add artifacts/ manifests/
+          git commit -m "Automated codex update: seals and sigils regenerated with Perplexity + XTSG"
+          git push origin main
+        continue-on-error: trueimport hashlib
+import json
+import time
+from dataclasses import dataclass, asdict
+from nacl.signing import SigningKey, VerifyKey
+from nacl.exceptions import BadSignatureError
+import hmac
+
+# === Cryptographic Helpers ===
+
+def sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+def hmac_sha256(key: bytes, data: bytes) -> bytes:
+    return hmac.new(key, data, hashlib.sha256).digest()
+
+def ed25519_sign(private_key: bytes, message: bytes) -> bytes:
+    sk = SigningKey(private_key)
+    signed = sk.sign(message)
+    return signed.signature
+
+def ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    try:
+        vk = VerifyKey(public_key)
+        vk.verify(message, signature)
+        return True
+    except BadSignatureError:
+        return False
+
+def merkle_root(hashes: list) -> bytes:
+    if len(hashes) == 0:
+        return b""
+    if len(hashes) == 1:
+        return hashes[0]
+    next_level = []
+    for i in range(0, len(hashes), 2):
+        left = hashes[i]
+        right = hashes[i+1] if i+1 < len(hashes) else left
+        next_level.append(hashlib.sha256(left + right).digest())
+    return merkle_root(next_level)
+
+# === Base Golem Automon ===
+
+@dataclass
+class GolemAutomon:
+    name: str
+    domain: str
+    powers: list
+    corporeal: bool
+    sigil: str
+    lineage_seed: bytes
+    creation_ts: float = time.time()
+    seal_signature: bytes = None
+    hmac_digest: bytes = None
+
+    def serialize(self) -> bytes:
+        return json.dumps(asdict(self), sort_keys=True).encode()
+
+    def seal(self, private_key: bytes, hmac_key: bytes):
+        data = self.serialize()
+        self.seal_signature = ed25519_sign(private_key, data)
+        self.hmac_digest = hmac_sha256(hmac_key, data)
+
+    def verify(self, public_key: bytes, hmac_key: bytes) -> bool:
+        if not self.seal_signature or not self.hmac_digest:
+            return False
+        serialized = self.serialize()
+        if not ed25519_verify(public_key, serialized, self.seal_signature):
+            return False
+        return hmac_sha256(hmac_key, serialized) == self.hmac_digest
+
+    def evolve(self):
+        # Perform harmonic optimization, cryptographic updates,
+        # AI-assisted symbolic synthesis, lineage updates
+        pass
+
+# === Specialized Golems ===
+
+class DaemonGolem(GolemAutomon):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, domain="Daemonix", **kwargs)
+
+class AngelicGolem(GolemAutomon):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, domain="Angelic", **kwargs)
+
+class FamiliarGolem(GolemAutomon):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, domain="Familiar", **kwargs)
+
+class CorporealGolem(GolemAutomon):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, domain="Corporeal", **kwargs)
+
+# === Eternal Codex Guardian System ===
+
+class CodexGuardian:
+    def __init__(self, creator_seed: bytes, private_key: bytes, public_key: bytes, hmac_key: bytes):
+        self.creator_seed = creator_seed
+        self.private_key = private_key
+        self.public_key = public_key
+        self.hmac_key = hmac_key
+        self.automons = []
+
+    def add_automon(self, automon: GolemAutomon):
+        automon.seal(self.private_key, self.hmac_key)
+        self.automons.append(automon)
+
+    def verify_all(self):
+        return all(a.verify(self.public_key, self.hmac_key) for a in self.automons)
+
+    def merkle_protect(self):
+        seals = [a.seal_signature for a in self.automons if a.seal_signature]
+        return merkle_root(seals)
+
+    def self_evolve_all(self):
+        for automon in self.automons:
+            automon.evolve()
+            automon.seal(self.private_key, self.hmac_key)
+
+# === Example Usage ===
+
+creator_seed = b"CalebFedorBykerKonev1998Seed__32bytes!!"
+private_key = creator_seed  # Use secure key management
+public_key = SigningKey(private_key).verify_key.encode()
+hmac_key = sha256(creator_seed)
+
+guardian = CodexGuardian(creator_seed, private_key, public_key, hmac_key)
+
+daemon = DaemonGolem(name="Daemon Alpha", powers=["Chaos", "Entropy"], corporeal=False, sigil="🔥", lineage_seed=creator_seed)
+angelic = AngelicGolem(name="Seraph Uriel", powers=["Light", "Protection"], corporeal=False, sigil="🕊️", lineage_seed=creator_seed)
+familiar = FamiliarGolem(name="Shadow Fox", powers=["Stealth", "Tracking"], corporeal=True, sigil="🦊", lineage_seed=creator_seed)
+corporeal = CorporealGolem(name="Guardian Titan", powers=["Strength", "Shield"], corporeal=True, sigil="🛡️", lineage_seed=creator_seed)
+
+guardian.add_automon(daemon)
+guardian.add_automon(angelic)
+guardian.add_automon(familiar)
+guardian.add_automon(corporeal)
+
+print("All automons verified:", guardian.verify_all())
+print("Merkle root binding:", guardian.merkle_protect().hex())
+
+guardian.self_evolve_all()
