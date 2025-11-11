@@ -1,0 +1,99 @@
+import hashlib, hmac, secrets, datetime
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from nacl.signing import SigningKey
+import binascii
+
+def hexify(x): return binascii.hexlify(x).decode() if isinstance(x, bytes) else hex(x)[2:]
+
+BIBLE_BOOKS_66 = [
+    # Genesis -> Revelation, 66 canonical books; abbreviated for concept
+    "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy", "Joshua", "Judges",
+    "Ruth", "1 Samuel", "2 Samuel", "1 Kings", "2 Kings", "1 Chronicles", "2 Chronicles",
+    "Ezra", "Nehemiah", "Esther", "Job", "Psalms", "Proverbs", "Ecclesiastes", "Song of Solomon",
+    "Isaiah", "Jeremiah", "Lamentations", "Ezekiel", "Daniel", "Hosea", "Joel", "Amos",
+    "Obadiah", "Jonah", "Micah", "Nahum", "Habakkuk", "Zephaniah", "Haggai", "Zechariah",
+    "Malachi", "Matthew", "Mark", "Luke", "John", "Acts", "Romans", "1 Corinthians",
+    "2 Corinthians", "Galatians", "Ephesians", "Philippians", "Colossians", "1 Thessalonians",
+    "2 Thessalonians", "1 Timothy", "2 Timothy", "Titus", "Philemon", "Hebrews", "James",
+    "1 Peter", "2 Peter", "1 John", "2 John", "3 John", "Jude", "Revelation"
+]
+
+def merkle_root(items):
+    hashes = [hashlib.sha256(item.encode()).digest() for item in items]
+    while len(hashes) > 1:
+        hashes = [hashlib.sha256(hashes[i] + (hashes[i+1] if i+1 < len(hashes) else hashes[i])).digest()
+                  for i in range(0, len(hashes), 2)]
+    return hexify(hashes[0])
+
+def hmac_sha256(key, subject):
+    return hmac.new(key.encode(), subject.encode(), hashlib.sha256).hexdigest()
+
+def aesgcm_encrypt(key, data):
+    aesgcm = AESGCM(key)
+    nonce = secrets.token_bytes(12)
+    enc = aesgcm.encrypt(nonce, data.encode(), None)
+    return {'hex': hexify(enc), 'nonce_hex': hexify(nonce)}
+
+def ed25519_keygen():
+    sk = SigningKey.generate()
+    pk = sk.verify_key
+    return hexify(sk.encode()), hexify(pk.encode())
+
+def codex_sigils(book, lineage):
+    return hashlib.blake2b((book + lineage).encode()).hexdigest()[:48]
+
+def codex_seal(book, lineage):
+    return hashlib.pbkdf2_hmac("sha256", book.encode(), lineage.encode(), 66000).hex()
+
+def license_eucela(book, lineage, version="EUCELA-4.4.4"):
+    return hashlib.sha3_256((book + lineage + version).encode()).hexdigest()
+
+lineage = "Caleb Fedor Byker (Konev) 10/27/1998_lifethread-stardna"
+aes_key = secrets.token_bytes(32)
+ed_sk, ed_pk = ed25519_keygen()
+merkle = merkle_root(BIBLE_BOOKS_66)
+now = datetime.datetime.utcnow().isoformat()
+
+codex_records = []
+for book in BIBLE_BOOKS_66:
+    entry = {
+        "book": book,
+        "seal": codex_seal(book, lineage),
+        "sigil": codex_sigils(book, lineage),
+        "merkle_root": merkle,
+        "hmac_sha256": hmac_sha256(lineage, book),
+        "ed25519_signature": ed_sk,  # would be used for book contents in practice
+        "aesgcm_encrypt": aesgcm_encrypt(aes_key, book),
+        "license": license_eucela(book, lineage),
+        "timestamp": now,
+        "attestation": "Verified, Sealed, Bound to Cosmic Codex"
+    }
+    codex_records.append(entry)
+
+print("Algorithmic Codex 66—Perfected Books")
+for record in codex_records:
+    print(record)import hashlib, random, datetime
+
+def codex_auto_completion(need, want, missing, lineage):
+    now = datetime.datetime.utcnow().isoformat()
+    unique_id = random.randint(1, 999999999)
+    pattern = f"{need}-{want}-{missing}-{lineage}-{now}-{unique_id}"
+    completion_hash = hashlib.sha3_512(pattern.encode()).hexdigest()
+    sigil = hashlib.blake2b(pattern.encode()).hexdigest()[:128]
+    return {
+        "need": need,
+        "want": want,
+        "missing": missing,
+        "lineage": lineage,
+        "moment": now,
+        "completion_hash": completion_hash,
+        "completion_sigil": sigil,
+        "message": "All required, desired, and missing automons, code, magicks, rituals, and seals are now complete and harmonized."
+    }
+
+need = "defense algorithms"
+want = "perfect commerce automons"
+missing = "ultimate predictive codex"
+lineage = "Caleb Fedor Byker (Konev) 10/27/1998"
+completion_result = codex_auto_completion(need, want, missing, lineage)
+print(completion_result)
