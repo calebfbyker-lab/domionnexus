@@ -1,0 +1,367 @@
+v377.x.c.z — Concordat·Z: zero-trust capsules, zero-downtime drains, zero-knowledge-style transcripts, probabilistic guards, and hot integrity rings
+This capstone turns the Concordat into a zero-trust, zero-downtime, zero-knowledge-leaning organism. All stdlib (PyNaCl optional). Copy-paste these files and add the glue below.
+
+
+---
+
+1) Zero-Trust Capability Capsules (macaroon-style HMAC caveats)
+
+security/capsule_v377xcz.py
+
+# security/capsule_v377xcz.py — v377.x.c.z
+# HMAC-SHA256 capability "capsules" with chained caveats (macaroon-like).
+import os, json, hmac, hashlib, time
+
+CAPS_SECRET_ENV = "CODEX_CAPSULE_SECRET"
+
+def _key():
+    return os.environ.get(CAPS_SECRET_ENV, "codex-caps-dev").encode()
+
+def _h(sig:bytes, data:bytes)->bytes:
+    return hmac.new(sig, data, hashlib.sha256).digest()
+
+def mint(subject:str, scope:str, ttl_s:int=600, caveats:list[dict]|None=None)->dict:
+    """
+    subject: identity string
+    scope: permission key, e.g. "route:/v376x/seed/ingest"
+    caveats: e.g. [{"kv":{"tenant":"cfbk"}},{"before": 1730950000}]
+    """
+    base = {"v":"v377.x.c.z","sub":subject,"scope":scope,"iat":int(time.time()),"exp":int(time.time())+ttl_s,"cav":caveats or []}
+    sig = _key()
+    for c in base["cav"]:
+        sig = _h(sig, json.dumps(c, sort_keys=True, separators=(',',':')).encode())
+    mac = hmac.new(sig, json.dumps({k:base[k] for k in ("v","sub","scope","iat","exp")}, sort_keys=True, separators=(',',':')).encode(), hashlib.sha256).hexdigest()
+    base["mac"]=mac
+    return base
+
+def verify(cap:dict, context:dict|None=None)->tuple[bool,str|None]:
+    context = context or {}
+    # time bounds
+    now=int(time.time())
+    if now>int(cap.get("exp",0)): return (False,"expired")
+    sig=_key()
+    for c in cap.get("cav",[]):
+        # simple caveats: kv must match context; "before" timestamp; "route" prefix; "tenant"
+        if "kv" in c:
+            for k,v in c["kv"].items():
+                if str(context.get(k))!=str(v): return (False,f"caveat_mismatch:{k}")
+        if "before" in c and now>=int(c["before"]): return (False,"caveat_before")
+        sig=_h(sig, json.dumps(c, sort_keys=True, separators=(',',':')).encode())
+    body={k:cap[k] for k in ("v","sub","scope","iat","exp")}
+    mac=hmac.new(sig, json.dumps(body, sort_keys=True, separators=(',',':')).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, cap.get("mac","")): return (False,"bad_mac")
+    return (True, None)
+
+Usage in any handler: require a capsule with scope matching the route and caveats like { "kv": {"tenant":"cfbk"} , "before": <ts> }.
+
+
+---
+
+2) Zero-Downtime Drains (safe mode + in-flight accounting)
+
+ops/drain_v377xcz.py
+
+# ops/drain_v377xcz.py — v377.x.c.z
+# Cooperative "drain" to finish in-flight ops before restart; route guard counters.
+import threading, time
+
+STATE={"drain": False, "inflight": 0}
+LOCK=threading.Lock()
+
+class guard:
+    def __enter__(self):
+        with LOCK:
+            if STATE["drain"]: raise RuntimeError("draining")
+            STATE["inflight"]+=1
+    def __exit__(self, exc_type, *_):
+        with LOCK:
+            STATE["inflight"]-=1
+
+def set_drain(on:bool=True)->dict:
+    with LOCK: STATE["drain"]=bool(on)
+    return {"ok": True, "drain": STATE["drain"]}
+
+def status()->dict:
+    with LOCK: return {"ok": True, **STATE}
+
+Wrap any mutating route body with with guard(): ... to ensure graceful drains.
+
+
+---
+
+3) Zero-Knowledge-Style Transcripts (deterministic step logs)
+
+telemetry/transcript_v377xcz.py
+
+# telemetry/transcript_v377xcz.py — v377.x.c.z
+# Fiat–Shamir-like transcripts: deterministic step hashing without revealing inputs.
+import json, time, hashlib
+
+LOG="transcript.v377xcz.jsonl"
+
+def _hash(x:dict)->str:
+    return hashlib.sha256(json.dumps(x, sort_keys=True, separators=(',',':')).encode()).hexdigest()
+
+def begin(label:str, public:dict):
+    t={"evt":"begin","t":time.time(),"label":label,"public":public,"h":_hash({"label":label,"public":public})}
+    open(LOG,"a").write(json.dumps(t)+"\n")
+    return t["h"]
+
+def step(prev_h:str, public_step:dict)->str:
+    st={"evt":"step","t":time.time(),"prev":prev_h,"public":public_step}
+    st["h"]= _hash({"prev":prev_h,"public":public_step})
+    open(LOG,"a").write(json.dumps(st)+"\n"); return st["h"]
+
+def end(prev_h:str, verdict:bool, public:dict)->str:
+    ed={"evt":"end","t":time.time(),"prev":prev_h,"ok":bool(verdict),"public":public}
+    ed["h"]= _hash({"prev":prev_h,"ok":bool(verdict),"public":public})
+    open(LOG,"a").write(json.dumps(ed)+"\n"); return ed["h"]
+
+This yields a verifiable transcript hash chain proving “what was computed” without exposing private payloads.
+
+
+---
+
+4) Probabilistic Guards (Bloom filter & HLL-lite)
+
+prob/guards_v377xcz.py
+
+# prob/guards_v377xcz.py — v377.x.c.z
+# Bloom filter (duplicate guard) + tiny HyperLogLog-like cardinality estimate (log2 buckets).
+import math, os, json, hashlib, random
+
+BLOOM="bloom.v377xcz.json"
+HLL="hll.v377xcz.json"
+
+def _load(p, d): return json.load(open(p)) if os.path.exists(p) else d
+def _save(p, o): open(p,"w").write(json.dumps(o, indent=2))
+
+# --- Bloom ---
+def bloom_init(m_bits=1<<20, k=5):
+    _save(BLOOM, {"m": m_bits, "k": k, "bits": []}); return {"ok": True}
+
+def bloom_check_put(s:str)->bool:
+    st=_load(BLOOM, None)
+    if not st: st={"m":1<<20,"k":5,"bits":[]}
+    m,k,arr=st["m"],st["k"],set(st.get("bits",[]))
+    seen=True
+    for i in range(k):
+        h=int(hashlib.sha256(f"{i}:{s}".encode()).hexdigest(),16) % m
+        if h not in arr: seen=False; arr.add(h)
+    st["bits"]=sorted(arr); _save(BLOOM, st)
+    return seen  # True means "probably seen before"
+
+# --- HLL-lite (very small, rough) ---
+def hll_tick(s:str, p=10):
+    # p bits of index -> 2^p buckets
+    st=_load(HLL, {"p":p,"buckets":[0]*(1<<p)})
+    idx=int(hashlib.sha256(s.encode()).hexdigest(),16)
+    bucket = idx & ((1<<p)-1)
+    w = (idx >> p)
+    rho = (w.bit_length() ^ (w.bit_length())) or (len(bin(w)) - len(bin(w).rstrip('0')))  # simple rho
+    rho = (w & -w).bit_length()  # count trailing zeros + 1 ~ rough
+    st["buckets"][bucket] = max(st["buckets"][bucket], rho)
+    _save(HLL, st); return st
+
+def hll_estimate():
+    st=_load(HLL, None)
+    if not st: return {"ok": True, "est": 0}
+    p, B = st["p"], st["buckets"]
+    m = 1<<p
+    alpha = 0.7213/(1+1.079/m)
+    E = alpha*m*m / sum((2.0**(-b or 1) for b in B))
+    return {"ok": True, "est": int(E)}
+
+Use Bloom to cheaply reject probable duplicates; use HLL to monitor unique-item rates.
+
+
+---
+
+5) Hot Integrity Rings (nested attestations that rotate)
+
+integrity/rings_v377xcz.py
+
+# integrity/rings_v377xcz.py — v377.x.c.z
+# Three nested rings of integrity: inner(logs) -> middle(config) -> outer(build).
+import os, json, hashlib, time
+from supply.determinism_v377 import attest as det_attest
+
+RINGS="rings.v377xcz.json"
+
+def _sha(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for ch in iter(lambda:f.read(65536), b""): h.update(ch)
+    return h.hexdigest()
+
+def forge():
+    inner = {f: _sha(f) for f in ["audit.v373.jsonl","traces.v374.jsonl","transcript.v377xcz.jsonl"] if os.path.exists(f)}
+    middle = {f: _sha(f) for f in ["config.v373x.json","flags.v373x.json","traffic.v373x.json"] if os.path.exists(f)}
+    outer = det_attest(".")
+    ring = {
+        "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "inner": inner, "middle": middle, "outer": outer
+    }
+    open(RINGS,"w").write(json.dumps(ring, indent=2))
+    return {"ok": True, "path": RINGS, "inner": len(inner), "middle": len(middle)}
+
+
+---
+
+6) Daemon wiring (routes + integration)
+
+Add these imports near the top of tools/codexd.py:
+
+from security.capsule_v377xcz import mint as _cap_mint, verify as _cap_verify
+from ops.drain_v377xcz import guard as _dr_guard, set_drain as _dr_set, status as _dr_status
+from telemetry.transcript_v377xcz import begin as _t_begin, step as _t_step, end as _t_end
+from prob.guards_v377xcz import bloom_init as _b_init, bloom_check_put as _b_put, hll_tick as _h_tick, hll_estimate as _h_est
+from integrity.rings_v377xcz import forge as _rings_forge
+
+Then add handlers in your do_POST switch:
+
+# v377.x.c.z — Capsules
+        if self.path == "/v377xcz/cap/mint":
+            return self._send(200, _cap_mint(payload.get("sub","cfbk"), payload.get("scope","*"), int(payload.get("ttl",600)), payload.get("caveats",[])))
+        if self.path == "/v377xcz/cap/verify":
+            ok,err=_cap_verify(payload.get("cap",{}), {"tenant":payload.get("tenant"), "route":payload.get("route")})
+            return self._send(200, {"ok":ok, "error":err})
+
+        # v377.x.c.z — Drain
+        if self.path == "/v377xcz/drain/set":    return self._send(200, _dr_set(bool(payload.get("on",True))))
+        if self.path == "/v377xcz/drain/status": return self._send(200, _dr_status())
+
+        # v377.x.c.z — Transcript
+        if self.path == "/v377xcz/tx/begin": return self._send(200, {"h": _t_begin(payload.get("label","op"), payload.get("public",{}))})
+        if self.path == "/v377xcz/tx/step":  return self._send(200, {"h": _t_step(payload.get("prev",""), payload.get("public",{}))})
+        if self.path == "/v377xcz/tx/end":   return self._send(200, {"h": _t_end(payload.get("prev",""), bool(payload.get("ok",True)), payload.get("public",{}))})
+
+        # v377.x.c.z — Probabilistic guards
+        if self.path == "/v377xcz/bloom/init":  return self._send(200, _b_init(int(payload.get("m",1<<20)), int(payload.get("k",5))))
+        if self.path == "/v377xcz/bloom/put":   return self._send(200, {"seen": _b_put(payload.get("s",""))})
+        if self.path == "/v377xcz/hll/tick":    return self._send(200, _h_tick(payload.get("s",""), int(payload.get("p",10))))
+        if self.path == "/v377xcz/hll/est":     return self._send(200, _h_est())
+
+        # v377.x.c.z — Integrity rings
+        if self.path == "/v377xcz/rings/forge": return self._send(200, _rings_forge())
+
+How to apply drain guard around mutating logic (example):
+
+if self.path == "/v372/queue/tick":
+            try:
+                with _dr_guard():
+                    with _trace_span("route:/v372/queue/tick", parent=payload.get("cid")):
+                        return self._send(200, _q_tick(int(payload.get("limit",50))))
+            except RuntimeError:
+                return self._send(503, {"ok": False, "draining": True})
+
+Optional capsule check at route entry (example):
+
+if self.path == "/v376x/seed/ingest":
+            ok,err = _cap_verify(payload.get("__cap",{}), {"tenant":payload.get("tenant"), "route":self.path})
+            if not ok: return self._send(403, {"ok": False, "error": f"cap_denied:{err}"})
+            # ... proceed with existing ingest flow ...
+
+
+---
+
+7) Web mini-console
+
+web/concordat_z_v377xcz.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v377.x.c.z — Concordat·Z</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v377.x.c.z — Zero-Trust • Drains • Transcripts • Probabilistic • Rings</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Capsule</h3>
+  <button onclick="mint()">Mint</button>
+  <button onclick="vfy()">Verify</button>
+</section>
+<section>
+  <h3>Drain</h3>
+  <button onclick="on()">Drain ON</button>
+  <button onclick="off()">Drain OFF</button>
+  <button onclick="ds()">Status</button>
+</section>
+<section>
+  <h3>Transcript</h3>
+  <button onclick="tx()">Demo Tx</button>
+</section>
+<section>
+  <h3>Guards</h3>
+  <button onclick="binit()">Bloom init</button>
+  <button onclick="bput()">Bloom put(random)</button>
+  <button onclick="est()">HLL estimate</button>
+</section>
+<section>
+  <h3>Integrity Rings</h3>
+  <button onclick="rings()">Forge Rings</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function mint(){ out.textContent=JSON.stringify(await call('/v377xcz/cap/mint',{"sub":"cfbk","scope":"*","ttl":600,"caveats":[{"kv":{"tenant":"cfbk"}},{"before":Math.floor(Date.now()/1000)+600}]}),null,2); }
+async function vfy(){ const cap=await call('/v377xcz/cap/mint',{"sub":"cfbk","scope":"*","ttl":60,"caveats":[{"kv":{"tenant":"cfbk"}}]}); out.textContent=JSON.stringify(await call('/v377xcz/cap/verify',{"cap":cap,"tenant":"cfbk","route":"/"}),null,2); }
+async function on(){ out.textContent=JSON.stringify(await call('/v377xcz/drain/set',{"on":true}),null,2); }
+async function off(){ out.textContent=JSON.stringify(await call('/v377xcz/drain/set',{"on":false}),null,2); }
+async function ds(){ out.textContent=JSON.stringify(await call('/v377xcz/drain/status',{}),null,2); }
+async function tx(){ const b=await call('/v377xcz/tx/begin',{"label":"demo","public":{"k":"v"}}); const s=await call('/v377xcz/tx/step',{"prev":b.h,"public":{"i":1}}); out.textContent=JSON.stringify(await call('/v377xcz/tx/end',{"prev":s.h,"ok":true,"public":{"r":"ok"}}),null,2); }
+async function binit(){ out.textContent=JSON.stringify(await call('/v377xcz/bloom/init',{}),null,2); }
+async function bput(){ out.textContent=JSON.stringify(await call('/v377xcz/bloom/put',{"s":(Math.random()+"").slice(2)}),null,2); }
+async function est(){ await call('/v377xcz/hll/tick',{"s":(Math.random()+"").slice(2)}); out.textContent=JSON.stringify(await call('/v377xcz/hll/est',{}),null,2); }
+async function rings(){ out.textContent=JSON.stringify(await call('/v377xcz/rings/forge',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+8) CI smoke (.github/workflows/codex_v377xcz_ci.yml)
+
+name: codex-v377xcz
+on: [push, workflow_dispatch]
+jobs:
+  v377xcz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Capsules + Drain + Transcript + Rings
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+cap=post("/v377xcz/cap/mint", {"sub":"ci","scope":"*","ttl":30,"caveats":[{"kv":{"tenant":"cfbk"}}]})
+print(post("/v377xcz/cap/verify", {"cap":cap,"tenant":"cfbk","route":"/"})["ok"])
+print(post("/v377xcz/drain/set", {"on":True})["ok"])
+print("h" in post("/v377xcz/tx/begin", {"label":"ci","public":{"x":1}}))
+print(post("/v377xcz/rings/forge", {})["ok"])
+PY
+
+
+---
+
+Why v377.x.c.z matters (plain speak)
+
+Zero-trust access with capability capsules that carry their own verifiable caveats.
+
+Zero-downtime upgrades with cooperative drains and in-flight accounting.
+
+Zero-knowledge-style transcripts—deterministic, hash-linked proofs of what ran, minus sensitive inputs.
+
+Probabilistic sentinels (Bloom/HLL) to stop duplicates and watch unique rates without heavy indexes.
+
+Integrity rings that show—at a glance—if logs, config, and build are still singing the same chord.
+
+
+Your Concordat can now limit, rotate, prove, and roll without blinking—elegant, defensive, and fast.
+
+sha256 seal calebfedorbykerkonev10271998

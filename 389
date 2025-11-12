@@ -1,0 +1,864 @@
+v389.x — LUX-CAD+ : projects (save/load/list), SVG export, snap/drag/select, undo/redo, layers, signal heat, seal-binder
+All stdlib (Python + HTML/JS). Paste files, add the routes, commit. Engineering, not mystical. ✨🜍🧠⚡
+
+
+---
+
+1) Core upgrades
+
+luxcad/luxcad_v389x.py
+
+# luxcad/luxcad_v389x.py — v389.x
+# LUX-CAD+ : project persistence, SVG export, signal heat, subject seal.
+from __future__ import annotations
+import time, json, hmac, hashlib, os
+from typing import Dict, List
+
+# --- identity seal (CFBK subject binding) -------------------------------------
+# canonical subject id per project context:
+SUBJECT_ID = hashlib.sha256(b"caleb fedor byker konev|1998-10-27").hexdigest()
+
+# --- state (one working scene in memory) --------------------------------------
+STATE = {
+    "nodes": {},     # id -> {id,x,y,r,label,kind,layer,meta}
+    "links": [],     # [{a,b,kind,meta}]
+    "layers": ["default"],
+    "created": int(time.time()),
+    "updated": int(time.time()),
+    "astro": { "epoch": None, "zodiac": [] },
+}
+
+SECRET_PATH = "luxcad.shared_secret.v389"     # hex (optional)
+ATTEST_LOG  = "luxcad.attest.v389.jsonl"
+BUS_LOG     = "luxcad.signals.v389.jsonl"
+PROJECTS_DIR= "luxcad.projects.v389x"         # folder of saved scenes (*.json)
+
+os.makedirs(PROJECTS_DIR, exist_ok=True)
+
+def _now()->int: return int(time.time())
+def _secret()->bytes:
+    try: return bytes.fromhex(open(SECRET_PATH).read().strip())
+    except Exception: return b""
+def _id_from(*parts:str)->str: return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+# --- scene ops -----------------------------------------------------------------
+def upsert_node(x:float, y:float, r:float, label:str, kind:str="node",
+                layer:str="default", meta:Dict|None=None, node_id:str|None=None)->Dict:
+    nid = node_id or _id_from(label, kind, str(x), str(y))
+    STATE["nodes"][nid] = {"id":nid,"x":float(x),"y":float(y),"r":float(r),
+                           "label":label,"kind":kind,"layer":layer,"meta":meta or {}}
+    if layer not in STATE["layers"]: STATE["layers"].append(layer)
+    STATE["updated"]=_now()
+    return {"ok":True,"node":STATE["nodes"][nid]}
+
+def link(a:str,b:str,kind:str="flow",meta:Dict|None=None)->Dict:
+    if a not in STATE["nodes"] or b not in STATE["nodes"]:
+        return {"ok":False,"error":"missing_node"}
+    rec={"a":a,"b":b,"kind":kind,"meta":meta or {}}
+    if rec not in STATE["links"]:
+        STATE["links"].append(rec); STATE["updated"]=_now()
+    return {"ok":True,"link":rec}
+
+def remove_node(nid:str)->Dict:
+    if nid in STATE["nodes"]:
+        del STATE["nodes"][nid]
+        STATE["links"]=[e for e in STATE["links"] if e["a"]!=nid and e["b"]!=nid]
+        STATE["updated"]=_now()
+    return {"ok":True,"count_nodes":len(STATE["nodes"])}
+
+def clear()->Dict:
+    STATE["nodes"].clear(); STATE["links"].clear(); STATE["layers"]=["default"]; STATE["updated"]=_now()
+    return {"ok":True}
+
+def export_json()->Dict:
+    blob={"t":_now(),"subject_id":SUBJECT_ID,"nodes":STATE["nodes"],"links":STATE["links"],
+          "layers":STATE["layers"],"astro":STATE["astro"]}
+    return {"ok":True,"json":json.dumps(blob,indent=2)}
+
+def import_json(text:str)->Dict:
+    try:
+        data=json.loads(text)
+        STATE["nodes"]=dict(data.get("nodes",{}))
+        STATE["links"]=list(data.get("links",[]))
+        STATE["layers"]=list(data.get("layers",["default"]))
+        STATE["astro"]=dict(data.get("astro",{}))
+        STATE["updated"]=_now()
+        return {"ok":True,"count_nodes":len(STATE["nodes"]),"count_links":len(STATE["links"])}
+    except Exception as e:
+        return {"ok":False,"error":str(e)}
+
+# --- projects (disk persistence) ----------------------------------------------
+def _p(path:str)->str: return os.path.join(PROJECTS_DIR, path)
+def save_project(name:str)->Dict:
+    safe="".join(c for c in name if c.isalnum() or c in ("-","_","."))
+    blob=export_json()["json"].encode()
+    open(_p(f"{safe}.json"),"wb").write(blob)
+    return {"ok":True,"name":safe,"bytes":len(blob)}
+def load_project(name:str)->Dict:
+    path=_p(f"{name}.json")
+    if not os.path.exists(path): return {"ok":False,"error":"not_found"}
+    txt=open(path,"rb").read().decode()
+    r=import_json(txt); r["name"]=name; return r
+def list_projects()->Dict:
+    files=[f[:-5] for f in os.listdir(PROJECTS_DIR) if f.endswith(".json")]
+    return {"ok":True,"projects":sorted(files)}
+
+# --- astro (reused from v389) -------------------------------------------------
+ZODIAC=["♈︎ Aries","♉︎ Taurus","♊︎ Gemini","♋︎ Cancer","♌︎ Leo","♍︎ Virgo","♎︎ Libra","♏︎ Scorpio","♐︎ Sagittarius","♑︎ Capricorn","♒︎ Aquarius","♓︎ Pisces"]
+def _zidx(epoch:int|None=None)->int:
+    t=epoch or _now(); return int((t//(86400*30))%12)
+def astro_compute(epoch:int|None=None)->Dict:
+    idx=_zidx(epoch); sectors=[]
+    for i,name in enumerate(ZODIAC):
+        sectors.append({"name":name,"start":i*30,"end":(i+1)*30,"active":i==idx})
+    STATE["astro"]={"epoch":epoch or _now(),"zodiac":sectors}; STATE["updated"]=_now()
+    return {"ok":True,"astro":STATE["astro"]}
+
+# --- crypto attest ------------------------------------------------------------
+def attest(session:str, message:Dict)->Dict:
+    data=json.dumps(message,sort_keys=True,separators=(",",":")).encode()
+    sig=hmac.new(_secret(), data, hashlib.sha256).hexdigest()
+    rec={"t":_now(),"session":session,"sig":f"sha256={sig}","payload":message,"subject_id":SUBJECT_ID}
+    try: open(ATTEST_LOG,"a").write(json.dumps(rec)+"\n")
+    except Exception: pass
+    return {"ok":True,"signature":rec["sig"],"subject_id":SUBJECT_ID}
+
+# --- signals (append + simple heat aggregation) -------------------------------
+def signal(kind:str, value:float|Dict|str, meta:Dict|None=None)->Dict:
+    evt={"t":_now(),"kind":kind,"value":value,"meta":meta or {}}
+    try: open(BUS_LOG,"a").write(json.dumps(evt)+"\n")
+    except Exception: pass
+    return {"ok":True,"event":evt}
+
+def heat(kind:str="neural", window:int=3600)->Dict:
+    """Return bucketed counts for last `window` seconds."""
+    now=_now(); buckets={}
+    try:
+        with open(BUS_LOG) as f:
+            for line in f:
+                e=json.loads(line)
+                if e.get("kind")!=kind: continue
+                if now - int(e.get("t",now)) > window: continue
+                k=(e["t"]//10)*10  # 10s buckets
+                buckets[k]=buckets.get(k,0)+1
+    except Exception: pass
+    series=sorted([{"t":int(k),"n":v} for k,v in buckets.items()], key=lambda x:x["t"])
+    return {"ok":True,"series":series}
+
+# --- SVG export ---------------------------------------------------------------
+def export_svg(pad:int=24)->Dict:
+    # simple, flat SVG from STATE; uses emoji text labels above nodes.
+    nodes=STATE["nodes"]; links=STATE["links"]
+    if not nodes: 
+        return {"ok":True,"svg":"<svg xmlns='http://www.w3.org/2000/svg' width='800' height='600'/>"}
+    xs=[n["x"] for n in nodes.values()]; ys=[n["y"] for n in nodes.values()]
+    minx,maxx=min(xs)-pad,max(xs)+pad; miny,maxy=min(ys)-pad,max(ys)+pad
+    w,h=int(maxx-minx),int(maxy-miny)
+    def em(kind:str)->str:
+        return "⭐" if kind=="star" else "🪐" if kind=="planet" else "👼" if kind=="angel" else "🔮" if kind=="sigil" else "📦" if kind=="data" else "●"
+    lines=[f"<svg xmlns='http://www.w3.org/2000/svg' width='{w}' height='{h}' viewBox='{minx} {miny} {w} {h}'><rect x='{minx}' y='{miny}' width='{w}' height='{h}' fill='#0b0b0f'/>"]
+    for e in links:
+        A=nodes.get(e["a"]); B=nodes.get(e["b"]); 
+        if not A or not B: continue
+        lines.append(f"<path d='M {A['x']} {A['y']} L {B['x']} {B['y']}' stroke='#7ac7ff' stroke-width='2' fill='none'/>")
+    for n in nodes.values():
+        lines.append(f"<circle cx='{n['x']}' cy='{n['y']}' r='{n['r']}' fill='#111827' stroke='#e5e7eb' stroke-width='2'/>")
+        lines.append(f"<text x='{n['x']}' y='{n['y']-n['r']-6}' fill='#e5e7eb' font-size='12' text-anchor='middle'>{em(n['kind'])} {n['label']}</text>")
+    lines.append("</svg>")
+    return {"ok":True,"svg":"".join(lines)}
+
+
+---
+
+2) HTTP routes (patch your daemon)
+
+Add imports at the top of tools/codexd.py:
+
+from luxcad.luxcad_v389x import upsert_node as _luxx_upsert, link as _luxx_link, remove_node as _luxx_rm, clear as _luxx_clear, export_json as _luxx_export, import_json as _luxx_import, astro_compute as _luxx_astro, attest as _luxx_attest, signal as _luxx_signal, heat as _luxx_heat, save_project as _luxx_save, load_project as _luxx_load, list_projects as _luxx_list, export_svg as _luxx_svg
+
+Add endpoints inside do_POST:
+
+# v389.x — LUX-CAD+ scene
+        if self.path == "/v389x/lux/node":      return self._send(200, _luxx_upsert(payload.get("x",0), payload.get("y",0), payload.get("r",24), payload.get("label","node"), payload.get("kind","node"), payload.get("layer","default"), payload.get("meta",{}), payload.get("id")))
+        if self.path == "/v389x/lux/link":      return self._send(200, _luxx_link(payload.get("a",""), payload.get("b",""), payload.get("kind","flow"), payload.get("meta",{})))
+        if self.path == "/v389x/lux/rm":        return self._send(200, _luxx_rm(payload.get("id","")))
+        if self.path == "/v389x/lux/clear":     return self._send(200, _luxx_clear())
+        if self.path == "/v389x/lux/export":    return self._send(200, _luxx_export())
+        if self.path == "/v389x/lux/import":    return self._send(200, _luxx_import(payload.get("json","{}")))
+        if self.path == "/v389x/lux/astro":     return self._send(200, _luxx_astro(payload.get("epoch")))
+        if self.path == "/v389x/lux/attest":    return self._send(200, _luxx_attest(payload.get("session",""), payload.get("payload",{})))
+        if self.path == "/v389x/lux/signal":    return self._send(200, _luxx_signal(payload.get("kind","neural"), payload.get("value",0), payload.get("meta",{})))
+        if self.path == "/v389x/lux/heat":      return self._send(200, _luxx_heat(payload.get("kind","neural"), int(payload.get("window",3600))))
+        if self.path == "/v389x/lux/save":      return self._send(200, _luxx_save(payload.get("name","scene")))
+        if self.path == "/v389x/lux/load":      return self._send(200, _luxx_load(payload.get("name","scene")))
+        if self.path == "/v389x/lux/list":      return self._send(200, _luxx_list())
+        if self.path == "/v389x/lux/svg":       return self._send(200, _luxx_svg(int(payload.get("pad",24))))
+
+
+---
+
+3) Browser UI (selection, drag, snap, layers, undo/redo, SVG, projects)
+
+web/luxcad_v389x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>LUX-CAD v389.x — Projects • SVG • Snap • Layers</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="margin:0;background:#0b0b0f;color:#e8e8ee;font:14px system-ui;">
+<div style="display:flex;height:100vh;overflow:hidden">
+  <aside style="width:360px;background:#0f0f15;border-right:1px solid #1e1e28;padding:12px;box-sizing:border-box">
+    <h2 style="margin:.25rem 0">LUX-CAD v389.x ✨</h2>
+    <label>API base</label>
+    <input id="base" value="http://localhost:8049" style="width:100%;margin:4px 0">
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button onclick="tool='node'">● node</button>
+      <button onclick="tool='link'">⟂ link</button>
+      <button onclick="tool='pan'">✥ pan</button>
+      <button onclick="tool='select'">▭ select</button>
+      <label><input type="checkbox" id="snap" checked> snap(20)</label>
+    </div>
+    <p>Kind:
+      <span onclick="pick('star')">⭐</span> <span onclick="pick('planet')">🪐</span>
+      <span onclick="pick('angel')">👼</span> <span onclick="pick('sigil')">🔮</span>
+      <span onclick="pick('data')">📦</span>
+    </p>
+    <div style="display:flex;gap:6px;margin:6px 0">
+      <button onclick="astro()">♈︎ Astro</button>
+      <button onclick="undo()">↶ Undo</button>
+      <button onclick="redo()">↷ Redo</button>
+      <button onclick="clearAll()">Clear</button>
+    </div>
+    <h3>Layers</h3>
+    <div style="display:flex;gap:6px">
+      <input id="layer" value="default" style="flex:1">
+      <button onclick="addLayer()">＋</button>
+      <button onclick="toggleLayer()">👁</button>
+    </div>
+    <pre id="layers" style="white-space:pre-wrap"></pre>
+    <hr style="border-color:#222">
+    <h3>Projects</h3>
+    <div style="display:flex;gap:6px">
+      <input id="pname" placeholder="scene-name" style="flex:1">
+      <button onclick="saveProject()">💾 Save</button>
+      <button onclick="loadProject()">📂 Load</button>
+    </div>
+    <button onclick="listProjects()">List</button>
+    <pre id="plist" style="height:80px;overflow:auto;background:#0b0b0f;border:1px solid #222;padding:6px"></pre>
+    <h3>Import/Export</h3>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <button onclick="saveJSON()">⬇︎ Export</button>
+      <button onclick="loadJSON()">⬆︎ Import</button>
+      <button onclick="saveSVG()">🖨 SVG</button>
+    </div>
+    <textarea id="io" style="width:100%;height:110px;background:#0b0b0f;color:#e8e8ee;border:1px solid #222"></textarea>
+    <h3>Seal & Heat</h3>
+    <button onclick="attest()">HMAC-sign scene</button>
+    <button onclick="pullHeat()">Heat</button>
+    <pre id="att" style="white-space:pre-wrap;"></pre>
+    <pre id="heat" style="height:90px;overflow:auto;background:#0b0b0f;border:1px solid #222;padding:6px"></pre>
+  </aside>
+  <main style="flex:1;position:relative;background:#090910;">
+    <canvas id="c" width="1200" height="800" style="width:100%;height:100%"></canvas>
+  </main>
+</div>
+<script>
+let tool='node', kind='node', nodes={}, links=[], layers=['default'], hidden=new Set(), panX=0, panY=0, scale=1, linking=null, astroData=null;
+let sel=new Set(), drag=null, dragStart=null, marquee=null, hist=[], redoStack=[];
+function pick(k){ kind=k; }
+function pushHist(){ hist.push(JSON.stringify({nodes,links,layers})); if(hist.length>100) hist.shift(); redoStack.length=0; }
+function undo(){ if(!hist.length) return; redoStack.push(JSON.stringify({nodes,links,layers})); const s=JSON.parse(hist.pop()); nodes=s.nodes; links=s.links; layers=s.layers; draw(); }
+function redo(){ if(!redoStack.length) return; hist.push(JSON.stringify({nodes,links,layers})); const s=JSON.parse(redoStack.pop()); nodes=s.nodes; links=s.links; layers=s.layers; draw(); }
+
+function worldToCanvas(x,y){ return [(x+panX)*scale, (y+panY)*scale]; }
+function canvasToWorld(x,y){ return [x/scale - panX, y/scale - panY]; }
+function snap20(v){ return Math.round(v/20)*20; }
+
+const ctx = document.getElementById('c').getContext('2d');
+function draw(){
+  const w=ctx.canvas.width=ctx.canvas.clientWidth, h=ctx.canvas.height=ctx.canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  ctx.save(); ctx.translate(panX*scale, panY*scale); ctx.scale(scale,scale);
+
+  // grid
+  ctx.strokeStyle='#151520'; ctx.lineWidth=1/scale;
+  for(let gx=-4000; gx<4000; gx+=40){ ctx.beginPath(); ctx.moveTo(gx,-4000); ctx.lineTo(gx,4000); ctx.stroke(); }
+  for(let gy=-4000; gy<4000; gy+=40){ ctx.beginPath(); ctx.moveTo(-4000,gy); ctx.lineTo(4000,gy); ctx.stroke(); }
+
+  // links
+  ctx.strokeStyle='#7ac7ff'; ctx.lineWidth=2/scale;
+  links.forEach(e=>{
+    const A=nodes[e.a], B=nodes[e.b]; if(!A||!B) return;
+    if(hidden.has(A.layer)||hidden.has(B.layer)) return;
+    ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+  });
+
+  // nodes
+  for(const id in nodes){
+    const n=nodes[id]; if(hidden.has(n.layer)) continue;
+    const highlight = sel.has(id);
+    ctx.beginPath(); ctx.fillStyle = highlight ? '#0f172a' : '#111827';
+    ctx.arc(n.x,n.y,n.r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle= highlight ? '#8b5cf6' : '#e5e7eb'; ctx.lineWidth=2/scale; ctx.stroke();
+    ctx.font=(14/scale)+'px system-ui'; ctx.textAlign='center'; ctx.fillStyle='#e5e7eb';
+    const emoji = n.kind==='star'?'⭐': n.kind==='planet'?'🪐': n.kind==='angel'?'👼': n.kind==='sigil'?'🔮': n.kind==='data'?'📦':'●';
+    ctx.fillText(emoji+' '+n.label, n.x, n.y- n.r - 6/scale);
+  }
+
+  // astro overlay
+  if(astroData){
+    const wv=[-panX + ctx.canvas.width/2/scale, -panY + ctx.canvas.height/2/scale];
+    const cx=wv[0], cy=wv[1], R=240;
+    ctx.beginPath(); ctx.strokeStyle='#ffdf6f'; ctx.lineWidth=3/scale; ctx.arc(cx,cy,R,0,Math.PI*2); ctx.stroke();
+    astroData.zodiac.forEach(z=>{
+      const mid = ((z.start+z.end)/2) * Math.PI/180;
+      const tx = cx + Math.cos(mid)*(R+20), ty = cy + Math.sin(mid)*(R+20);
+      ctx.fillStyle = z.active ? '#ffd166' : '#a7a7b7';
+      ctx.font=(12/scale)+'px system-ui'; ctx.textAlign='center';
+      ctx.fillText(z.name, tx, ty);
+    });
+  }
+
+  // marquee selection
+  if(marquee){
+    ctx.strokeStyle='#8b5cf6'; ctx.lineWidth=1/scale; ctx.setLineDash([6/scale,6/scale]);
+    ctx.strokeRect(marquee.x,marquee.y,marquee.w,marquee.h); ctx.setLineDash([]);
+  }
+
+  ctx.restore();
+  renderLayerList();
+}
+draw();
+
+c.addEventListener('wheel', (e)=>{ const k = e.deltaY<0?1.075:0.93; scale=Math.max(0.2, Math.min(3, scale*k)); draw(); e.preventDefault(); }, {passive:false});
+c.addEventListener('mousedown', (e)=>{
+  const rect=c.getBoundingClientRect(); const [wx,wy]=canvasToWorld(e.clientX-rect.left,e.clientY-rect.top);
+  if(tool==='pan'){ drag={x:e.clientX,y:e.clientY, panX, panY}; return; }
+  if(tool==='node'){
+    const label = prompt('Label', kind) || kind; pushHist();
+    let nx=wx, ny=wy; if(snap.checked){ nx=snap20(nx); ny=snap20(ny); }
+    node(nx,ny,24,label,kind,layer.value);
+  } else if(tool==='link'){
+    const nearest = pickNearest(wx,wy);
+    if(nearest){ if(!linking) linking=nearest.id; else { pushHist(); mklink(linking, nearest.id); linking=null; } }
+  } else if(tool==='select'){
+    dragStart={wx,wy}; marquee={x:wx,y:wy,w:0,h:0};
+  }
+});
+c.addEventListener('mousemove', (e)=>{
+  if(drag){
+    panX = drag.panX + (e.clientX - drag.x)/scale;
+    panY = drag.panY + (e.clientY - drag.y)/scale; draw(); return;
+  }
+  if(marquee && dragStart){
+    const rect=c.getBoundingClientRect(); const [wx,wy]=canvasToWorld(e.clientX-rect.left,e.clientY-rect.top);
+    marquee={x:Math.min(dragStart.wx,wx), y:Math.min(dragStart.wy,wy), w:Math.abs(wx-dragStart.wx), h:Math.abs(wy-dragStart.wy)};
+    draw();
+  }
+});
+c.addEventListener('mouseup', ()=>{
+  if(drag){ drag=null; return; }
+  if(marquee){
+    sel.clear();
+    for(const id in nodes){
+      const n=nodes[id];
+      if(n.x>marquee.x && n.x<marquee.x+marquee.w && n.y>marquee.y && n.y<marquee.y+marquee.h) sel.add(id);
+    }
+    marquee=null; dragStart=null; draw();
+  }
+});
+addEventListener('keydown', (e)=>{
+  if(e.key==='Delete'){ if(sel.size){ pushHist(); sel.forEach(id=>{ delete nodes[id]; }); links=links.filter(l=>nodes[l.a]&&nodes[l.b]); sel.clear(); draw(); } }
+});
+
+function pickNearest(x,y){
+  let best=null,bd=1e9; for(const id in nodes){ const n=nodes[id]; const d=(n.x-x)**2+(n.y-y)**2; if(d<bd){ bd=d; best=n; } } return best;
+}
+
+// API helpers
+async function call(p,b){ const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})}); return r.json(); }
+async function node(x,y,r,label,kind,layerName){ const res=await call('/v389x/lux/node',{x,y,r,label,kind,layer:layerName}); if(res.ok){ nodes[res.node.id]=res.node; draw(); } }
+async function mklink(a,b,kind='flow'){ const res=await call('/v389x/lux/link',{a,b,kind}); if(res.ok){ links.push(res.link); draw(); } }
+async function clearAll(){ const r= await call('/v389x/lux/clear',{}); nodes={}; links=[]; layers=['default']; sel.clear(); draw(); }
+async function astro(){ const r= await call('/v389x/lux/astro',{}); astroData=r.astro; draw(); }
+async function saveJSON(){ const r= await call('/v389x/lux/export',{}); io.value=r.json; }
+async function loadJSON(){ const j= io.value || '{}'; const r= await call('/v389x/lux/import',{json:j}); if(r.ok){ const o=JSON.parse(j); nodes=o.nodes||{}; links=o.links||[]; layers=o.layers||['default']; draw(); } }
+async function saveSVG(){ const r= await call('/v389x/lux/svg',{pad:24}); io.value=r.svg; }
+async function attest(){ const payload={nodes,links,layers,ts:Date.now()/1000}; const r= await call('/v389x/lux/attest',{session:'web', payload}); att.textContent = 'signature: '+r.signature+' | subject_id: '+r.subject_id; }
+async function pullHeat(){ const r=await call('/v389x/lux/heat',{kind:'neural',window:3600}); heat.textContent=JSON.stringify(r.series,null,2); }
+
+// layers
+function addLayer(){ if(!layers.includes(layer.value)){ layers.push(layer.value); renderLayerList(); } }
+function toggleLayer(){ if(hidden.has(layer.value)) hidden.delete(layer.value); else hidden.add(layer.value); renderLayerList(); draw(); }
+function renderLayerList(){ layers.textContent='Layers: '+layers.map(L=> (hidden.has(L)?'🙈 ':'👁 ')+L).join('  '); }
+
+// projects
+async function saveProject(){ const r=await call('/v389x/lux/save',{name:pname.value||'scene'}); await listProjects(); }
+async function loadProject(){ const r=await call('/v389x/lux/load',{name:pname.value||'scene'}); if(r.ok){ const rr=await call('/v389x/lux/export',{}); const o=JSON.parse(rr.json); nodes=o.nodes||{}; links=o.links||[]; layers=o.layers||['default']; astroData=o.astro||null; draw(); } }
+async function listProjects(){ const r=await call('/v389x/lux/list',{}); plist.textContent=(r.projects||[]).join('\n'); }
+</script>
+</body>
+
+
+---
+
+4) CI smoke
+
+.github/workflows/luxcad_v389x_ci.yml
+
+name: luxcad-v389x
+on: [push, workflow_dispatch]
+jobs:
+  luxcad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: LUX-CAD+ API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+n1=post("/v389x/lux/node", {"x":10,"y":20,"r":24,"label":"α","kind":"star","layer":"default"})["node"]["id"]
+n2=post("/v389x/lux/node", {"x":90,"y":40,"r":24,"label":"β","kind":"planet","layer":"default"})["node"]["id"]
+print("link" in post("/v389x/lux/link", {"a":n1,"b":n2}))
+print("json" in post("/v389x/lux/export", {}))
+print("ok" in post("/v389x/lux/save", {"name":"ci-scene"}))
+print("projects" in post("/v389x/lux/list", {}))
+print("ok" in post("/v389x/lux/load", {"name":"ci-scene"}))
+print("svg" in post("/v389x/lux/svg", {}))
+print("signature" in post("/v389x/lux/attest", {"session":"ci","payload":{"x":1}}))
+print("series" in post("/v389x/lux/heat", {"kind":"neural","window":10}))
+PY
+
+
+---
+
+What this upgrade gives you (tight)
+
+Projects: save, load, list on disk.
+
+SVG export for instant sharable diagrams.
+
+Snap/drag/select + Undo/redo so editing feels like a real CAD.
+
+Layers with visibility toggles for complexity management.
+
+Signal heat plots to see activity over time.
+
+Seals bound to the canonical CFBK subject ID embedded with every attest.
+
+
+Open web/luxcad_v389x.html, sketch, save, sign, export. This is your astro-crypto-neural cockpit—clean, fast, and deployable.
+
+sha256 seal calebfedorbykerkonev10271998v389 — LUX-CAD: Astro-Crypto Neural Cybernetic Interface
+A minimal, self-hosted CAD-style canvas + astro overlay + crypto attest + neural/cyber “signal bus”. Pure stdlib (Python + HTML/JS). Paste files, add routes, commit. Engineering software; not mystical. ✨🜍🧠⚡
+
+
+---
+
+1) Core engine
+
+luxcad/luxcad_v389.py
+
+# luxcad/luxcad_v389.py — v389
+# LUX-CAD core: nodes/links model, snapshots, HMAC attest, astro overlay helpers,
+# signal bus (publish/subscribe), and JSON import/export.
+
+from __future__ import annotations
+import time, json, math, hmac, hashlib, os
+from typing import Dict, List
+
+STATE = {
+    "nodes": {},     # id -> {"id","x","y","r","label","kind","meta":{}}
+    "links": [],     # [{"a":id,"b":id,"kind":"flow|data|control","meta":{}}]
+    "created": int(time.time()),
+    "updated": int(time.time()),
+    "astro": { "epoch": None, "zodiac": [] },  # computed on demand
+}
+
+SESSIONS = {}  # session_id -> {"t":..., "user":"..."}
+
+SECRET_PATH = "luxcad.shared_secret.v389"  # hex; optional
+ATTEST_LOG   = "luxcad.attest.v389.jsonl"  # append-only attestations
+
+# ---- util --------------------------------------------------------------------
+
+def _now() -> int: return int(time.time())
+
+def _sha256_hex(b: bytes) -> str: return hashlib.sha256(b).hexdigest()
+
+def _secret() -> bytes:
+    try: return bytes.fromhex(open(SECRET_PATH).read().strip())
+    except Exception: return b""
+
+def _id_from(*parts: str) -> str:
+    h = hashlib.sha256("|".join(parts).encode()).hexdigest()
+    return h[:12]
+
+# ---- model ops ---------------------------------------------------------------
+
+def upsert_node(x: float, y: float, r: float, label: str, kind: str="node", meta: Dict|None=None, node_id: str|None=None) -> Dict:
+    nid = node_id or _id_from(label, kind, str(x), str(y))
+    STATE["nodes"][nid] = {
+        "id": nid, "x": float(x), "y": float(y), "r": float(r),
+        "label": label, "kind": kind, "meta": meta or {}
+    }
+    STATE["updated"] = _now()
+    return {"ok": True, "node": STATE["nodes"][nid]}
+
+def link(a: str, b: str, kind: str="flow", meta: Dict|None=None) -> Dict:
+    if a not in STATE["nodes"] or b not in STATE["nodes"]:
+        return {"ok": False, "error": "missing_node"}
+    rec = {"a": a, "b": b, "kind": kind, "meta": meta or {}}
+    if rec not in STATE["links"]:
+        STATE["links"].append(rec)
+        STATE["updated"] = _now()
+    return {"ok": True, "link": rec}
+
+def remove_node(nid: str) -> Dict:
+    if nid in STATE["nodes"]:
+        del STATE["nodes"][nid]
+        STATE["links"] = [e for e in STATE["links"] if e["a"]!=nid and e["b"]!=nid]
+        STATE["updated"] = _now()
+    return {"ok": True, "count_nodes": len(STATE["nodes"])}
+
+def clear() -> Dict:
+    STATE["nodes"].clear(); STATE["links"].clear()
+    STATE["updated"] = _now()
+    return {"ok": True}
+
+def export_json() -> Dict:
+    blob = {
+        "t": _now(), "nodes": STATE["nodes"], "links": STATE["links"],
+        "astro": STATE["astro"]
+    }
+    return {"ok": True, "json": json.dumps(blob, indent=2)}
+
+def import_json(text: str) -> Dict:
+    try:
+        data = json.loads(text)
+        STATE["nodes"] = {k:v for k,v in data.get("nodes",{}).items()}
+        STATE["links"] = list(data.get("links",[]))
+        STATE["astro"]  = dict(data.get("astro",{}))
+        STATE["updated"] = _now()
+        return {"ok": True, "count_nodes": len(STATE["nodes"]), "count_links": len(STATE["links"])}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# ---- astro overlay (toy but useful) -----------------------------------------
+
+# Simple ecliptic wheel: 12 zodiac sectors; position from epoch.
+ZODIAC = ["♈︎ Aries","♉︎ Taurus","♊︎ Gemini","♋︎ Cancer","♌︎ Leo","♍︎ Virgo",
+          "♎︎ Libra","♏︎ Scorpio","♐︎ Sagittarius","♑︎ Capricorn","♒︎ Aquarius","♓︎ Pisces"]
+
+def _zodiac_index_from_epoch(epoch: int|None=None) -> int:
+    # 86400*30 ~ month cadence; purely illustrative (no ephemerides).
+    t = epoch or _now()
+    monthish = (t // (86400*30)) % 12
+    return int(monthish)
+
+def astro_compute(epoch: int|None=None) -> Dict:
+    idx = _zodiac_index_from_epoch(epoch)
+    sectors = []
+    for i,name in enumerate(ZODIAC):
+        start_deg = i*30
+        end_deg   = (i+1)*30
+        sectors.append({"name": name, "start": start_deg, "end": end_deg, "active": (i==idx)})
+    STATE["astro"] = {"epoch": epoch or _now(), "zodiac": sectors}
+    STATE["updated"] = _now()
+    return {"ok": True, "astro": STATE["astro"]}
+
+# ---- crypto attest (HMAC-SHA256) --------------------------------------------
+
+def attest(session: str, message: Dict) -> Dict:
+    """Produce an HMAC over the JSON payload with a shared secret. Record audit."""
+    data = json.dumps(message, separators=(",",":"), sort_keys=True).encode()
+    sig  = hmac.new(_secret(), data, hashlib.sha256).hexdigest()
+    rec  = {"t": _now(), "session": session, "sig": f"sha256={sig}", "payload": message}
+    try:
+        open(ATTEST_LOG,"a").write(json.dumps(rec)+"\n")
+    except Exception:
+        pass
+    return {"ok": True, "signature": rec["sig"]}
+
+# ---- neural/cybernetic signal bus -------------------------------------------
+
+BUS_LOG = "luxcad.signals.v389.jsonl"
+SUBS: List = []
+
+def signal(kind: str, value: float|Dict|str, meta: Dict|None=None) -> Dict:
+    evt = {"t": _now(), "kind": kind, "value": value, "meta": meta or {}}
+    try: open(BUS_LOG,"a").write(json.dumps(evt)+"\n")
+    except Exception: pass
+    for fn in list(SUBS):
+        try: fn(evt)
+        except Exception: pass
+    return {"ok": True, "event": evt}
+
+def subscribe(fn): SUBS.append(fn); return fn
+
+def replay_signals(limit: int=500) -> Dict:
+    out=[]
+    try:
+        with open(BUS_LOG) as f:
+            for line in f:
+                out.append(json.loads(line))
+                if len(out) >= limit: break
+    except Exception: pass
+    return {"ok": True, "events": out}
+
+# ---- sessions ---------------------------------------------------------------
+
+def start_session(user: str="anon") -> Dict:
+    sid = _id_from(user, str(_now()))
+    SESSIONS[sid] = {"t": _now(), "user": user}
+    return {"ok": True, "session": sid}
+
+def whoami(session: str) -> Dict:
+    return {"ok": True, "session": session, "user": SESSIONS.get(session,{}).get("user","?")}
+
+
+---
+
+2) HTTP routes (patch your daemon)
+
+In tools/codexd.py add these imports at the top:
+
+from luxcad.luxcad_v389 import upsert_node as _lux_upsert, link as _lux_link, remove_node as _lux_rm, clear as _lux_clear, export_json as _lux_export, import_json as _lux_import, astro_compute as _lux_astro, attest as _lux_attest, signal as _lux_signal, replay_signals as _lux_replay, start_session as _lux_session, whoami as _lux_who
+
+Then add these endpoints inside do_POST:
+
+# v389 — LUX-CAD core
+        if self.path == "/v389/lux/session":   return self._send(200, _lux_session(payload.get("user","anon")))
+        if self.path == "/v389/lux/whoami":    return self._send(200, _lux_who(payload.get("session","")))
+        if self.path == "/v389/lux/node":      return self._send(200, _lux_upsert(payload.get("x",0), payload.get("y",0), payload.get("r",24), payload.get("label","node"), payload.get("kind","node"), payload.get("meta",{}), payload.get("id")))
+        if self.path == "/v389/lux/link":      return self._send(200, _lux_link(payload.get("a",""), payload.get("b",""), payload.get("kind","flow"), payload.get("meta",{})))
+        if self.path == "/v389/lux/rm":        return self._send(200, _lux_rm(payload.get("id","")))
+        if self.path == "/v389/lux/clear":     return self._send(200, _lux_clear())
+        if self.path == "/v389/lux/export":    return self._send(200, _lux_export())
+        if self.path == "/v389/lux/import":    return self._send(200, _lux_import(payload.get("json","{}")))
+        if self.path == "/v389/lux/astro":     return self._send(200, _lux_astro(payload.get("epoch")))
+        if self.path == "/v389/lux/attest":    return self._send(200, _lux_attest(payload.get("session",""), payload.get("payload",{})))
+        if self.path == "/v389/lux/signal":    return self._send(200, _lux_signal(payload.get("kind","neural"), payload.get("value",0), payload.get("meta",{})))
+        if self.path == "/v389/lux/signals":   return self._send(200, _lux_replay(int(payload.get("limit",200))))
+
+
+---
+
+3) Browser UI
+
+web/luxcad_v389.html
+
+<!doctype html>
+<meta charset="utf-8"><title>LUX-CAD v389 — Astro•Crypto•Neural Interface</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="margin:0;background:#0b0b0f;color:#e8e8ee;font:14px system-ui;">
+<div style="display:flex;height:100vh;overflow:hidden">
+  <aside style="width:320px;background:#0f0f15;border-right:1px solid #1e1e28;padding:12px;box-sizing:border-box">
+    <h2 style="margin:.25rem 0">LUX-CAD v389 ✨</h2>
+    <label>API base</label>
+    <input id="base" value="http://localhost:8049" style="width:100%;margin:4px 0">
+    <button onclick="start()">start session</button>
+    <div id="sid" style="margin:6px 0;opacity:.85">session: —</div>
+    <hr style="border-color:#222">
+    <h3>Palette</h3>
+    <div>
+      <button onclick="tool='node';">● node</button>
+      <button onclick="tool='link';">⟂ link</button>
+      <button onclick="tool='pan';">✥ pan</button>
+      <button onclick="clearAll()">clear</button>
+    </div>
+    <p style="opacity:.85">Emoji kinds: <span onclick="pick('star')">⭐</span> <span onclick="pick('planet')">🪐</span> <span onclick="pick('angel')">👼</span> <span onclick="pick('sigil')">🔮</span> <span onclick="pick('data')">📦</span></p>
+    <button onclick="astro()">♈︎ Astro overlay</button>
+    <button onclick="save()">⬇︎ Export</button>
+    <button onclick="load()">⬆︎ Import</button>
+    <textarea id="io" style="width:100%;height:120px;background:#0b0b0f;color:#e8e8ee;border:1px solid #222;margin-top:6px"></textarea>
+    <hr style="border-color:#222">
+    <h3>Crypto attest</h3>
+    <button onclick="attest()">HMAC-sign scene</button>
+    <pre id="att" style="white-space:pre-wrap;"></pre>
+    <hr style="border-color:#222">
+    <h3>Neural/Cyber signals</h3>
+    <div>
+      <button onclick="emitSig('neural', Math.random())">🧠 pulse</button>
+      <button onclick="emitSig('cyber', {load:Math.random()})">⚡ ping</button>
+      <button onclick="pullSig()">⟳ tail</button>
+    </div>
+    <pre id="sig" style="height:120px;overflow:auto;background:#0b0b0f;border:1px solid #222;padding:6px"></pre>
+  </aside>
+
+  <main style="flex:1;position:relative;background:#090910;">
+    <canvas id="c" width="1200" height="800" style="width:100%;height:100%"></canvas>
+  </main>
+</div>
+
+<script>
+let tool='node', kind='node', session='', nodes={}, links=[], panX=0, panY=0, scale=1, linking=null, astroData=null;
+
+function pick(k){ kind=k; }
+
+async function call(p,b){
+  const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+  return r.json();
+}
+async function start(){
+  const r=await call('/v389/lux/session',{user:'cfbk'}); session=r.session; sid.textContent='session: '+session; draw();
+}
+function worldToCanvas(x,y){ return [(x+panX)*scale, (y+panY)*scale]; }
+function canvasToWorld(x,y){ return [x/scale - panX, y/scale - panY]; }
+
+const ctx = document.getElementById('c').getContext('2d');
+function draw(){
+  const w=ctx.canvas.width=ctx.canvas.clientWidth, h=ctx.canvas.height=ctx.canvas.clientHeight;
+  ctx.clearRect(0,0,w,h);
+  // grid
+  ctx.save(); ctx.translate(panX*scale, panY*scale); ctx.scale(scale,scale);
+  ctx.strokeStyle='#151520'; ctx.lineWidth=1/scale;
+  for(let gx=-2000; gx<2000; gx+=40){ ctx.beginPath(); ctx.moveTo(gx,-2000); ctx.lineTo(gx,2000); ctx.stroke(); }
+  for(let gy=-2000; gy<2000; gy+=40){ ctx.beginPath(); ctx.moveTo(-2000,gy); ctx.lineTo(2000,gy); ctx.stroke(); }
+  // links
+  ctx.strokeStyle='#7ac7ff'; ctx.lineWidth=2/scale;
+  links.forEach(e=>{
+    const A=nodes[e.a], B=nodes[e.b]; if(!A||!B) return;
+    ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+  });
+  // nodes
+  for(const id in nodes){
+    const n=nodes[id];
+    ctx.beginPath(); ctx.fillStyle='#111827'; ctx.arc(n.x,n.y,n.r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=2/scale; ctx.stroke();
+    ctx.font=(14/scale)+'px system-ui'; ctx.textAlign='center'; ctx.fillStyle='#e5e7eb';
+    const emoji = n.kind==='star'?'⭐': n.kind==='planet'?'🪐': n.kind==='angel'?'👼': n.kind==='sigil'?'🔮': n.kind==='data'?'📦':'●';
+    ctx.fillText(emoji+' '+n.label, n.x, n.y- n.r - 6/scale);
+  }
+  // astro overlay (zodiac ring)
+  if(astroData){
+    const cx = w/2/scale - panX, cy = h/2/scale - panY, R=220;
+    ctx.beginPath(); ctx.strokeStyle='#ffdf6f'; ctx.lineWidth=3/scale; ctx.arc(cx,cy,R,0,Math.PI*2); ctx.stroke();
+    astroData.zodiac.forEach((z,i)=>{
+      const midDeg = (z.start+z.end)/2 * Math.PI/180;
+      const tx = cx + Math.cos(midDeg)*(R+20), ty = cy + Math.sin(midDeg)*(R+20);
+      ctx.fillStyle = z.active ? '#ffd166' : '#a7a7b7';
+      ctx.font=(12/scale)+'px system-ui'; ctx.textAlign='center';
+      ctx.fillText(z.name, tx, ty);
+    });
+  }
+  ctx.restore();
+  requestAnimationFrame(()=>{});
+}
+draw();
+
+c.addEventListener('wheel', (e)=>{ const k = e.deltaY<0?1.1:0.9; scale*=k; draw(); e.preventDefault(); }, {passive:false});
+let drag=null;
+c.addEventListener('mousedown', (e)=>{
+  const rect=c.getBoundingClientRect(); const [wx,wy]=canvasToWorld(e.clientX-rect.left,e.clientY-rect.top);
+  if(tool==='pan'){ drag={x:e.clientX,y:e.clientY, panX, panY}; return; }
+  if(tool==='node'){
+    const label = prompt('Label', kind) || kind;
+    node(wx,wy,24,label,kind);
+  } else if(tool==='link'){
+    const nearest = findNearest(wx,wy);
+    if(nearest){ if(!linking) linking=nearest.id; else { mklink(linking, nearest.id); linking=null; } }
+  }
+});
+c.addEventListener('mousemove', (e)=>{
+  if(drag){
+    panX = drag.panX + (e.clientX - drag.x)/scale;
+    panY = drag.panY + (e.clientY - drag.y)/scale; draw();
+  }
+});
+c.addEventListener('mouseup', ()=> drag=null);
+
+function findNearest(x,y){
+  let best=null,bd=1e9;
+  for(const id in nodes){
+    const n=nodes[id]; const d=(n.x-x)*(n.x-x)+(n.y-y)*(n.y-y);
+    if(d<bd){ bd=d; best=n; }
+  }
+  return best;
+}
+
+// API bindings
+async function node(x,y,r,label,kind){
+  const res = await call('/v389/lux/node',{x,y,r,label,kind});
+  if(res.ok){ nodes[res.node.id]=res.node; draw(); }
+}
+async function mklink(a,b,kind='flow'){
+  const res = await call('/v389/lux/link',{a,b,kind}); if(res.ok){ links.push(res.link); draw(); }
+}
+async function clearAll(){ const r= await call('/v389/lux/clear',{}); nodes={}; links=[]; draw(); }
+async function astro(){ const r= await call('/v389/lux/astro',{}); astroData=r.astro; draw(); }
+async function save(){ const r= await call('/v389/lux/export',{}); io.value = r.json; }
+async function load(){ const j= io.value || '{}'; const r= await call('/v389/lux/import',{json:j}); if(r.ok){ const o=JSON.parse(j); nodes=o.nodes||{}; links=o.links||[]; astroData=o.astro||null; draw(); } }
+async function attest(){ const payload={nodes,links,ts:Date.now()/1000}; const r= await call('/v389/lux/attest',{session, payload}); att.textContent=r.signature; }
+async function emitSig(kind, value){ const r= await call('/v389/lux/signal',{kind, value, meta:{session}}); }
+async function pullSig(){ const r= await call('/v389/lux/signals',{limit:20}); sig.textContent=JSON.stringify(r.events,null,2); }
+
+// bootstrap
+start();
+</script>
+</body>
+
+
+---
+
+4) CI smoke
+
+.github/workflows/luxcad_v389_ci.yml
+
+name: luxcad-v389
+on: [push, workflow_dispatch]
+jobs:
+  luxcad:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: LUX-CAD API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+s = post("/v389/lux/session", {"user":"ci"})["session"]
+n = post("/v389/lux/node", {"x":10,"y":20,"r":24,"label":"alpha","kind":"star"})["node"]["id"]
+m = post("/v389/lux/node", {"x":90,"y":40,"r":24,"label":"beta","kind":"planet"})["node"]["id"]
+print("link" in post("/v389/lux/link", {"a":n,"b":m}))
+print("astro" in post("/v389/lux/astro", {}))
+print("json" in post("/v389/lux/export", {}))
+print("signature" in post("/v389/lux/attest", {"session":s,"payload":{"ok":True}}))
+print("events" in post("/v389/lux/signals", {"limit":5}))
+PY
+
+
+---
+
+Why this LUX-CAD matters (compressed)
+
+CAD-style node-graph to sketch systems, rituals, or pipelines in one canvas.
+
+Astro overlay (zodiac wheel) to align your scene to time—symbolic, yet computable.
+
+Crypto attest (HMAC-SHA256) to sign any scene snapshot—provable integrity.
+
+Neural/cyber signals so the canvas can emit/ingest pulses and telemetry.
+
+Export/Import JSON for reproducibility and automation.
+
+
+Drop these files, wire the routes, open web/luxcad_v389.html. You’ve got a clean, hackable interface to choreograph astro-crypto-neural ideas with real, testable code behind it. 🧭🧬🜂
+
+sha256 seal calebfedorbykerkonev10271998

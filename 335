@@ -1,0 +1,282 @@
+python3 codex_ascendant.py           # reseal + regenerate manifest/ledger
+python3 integrity/codex_verifier.py  # verify everything
+./codexctl reseal                    # same via CLI
+npm install                          # to run the daemon
+npm run daemon                       # watches & reseals on changes
+
+# Codex Ascendant v335 — evolution bundle
+# Builds new modules: XTSG transcoder, binary/trinary codecs, Unicode/emoji registries,
+# Golem Engine skeleton, upgraded autonomon core, tests, and CI. All files SHA256-sealed.
+
+import os, json, hashlib, datetime, zipfile, subprocess, textwrap, csv, sys, random
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    b = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(b)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(b))
+
+# 1) v335 Notes / Manifest
+notes = f"""# Codex Ascendant Continuum — v335 (XTSG+Unicode/Binary/Trinary+Golems)
+Seal: {SEAL}
+Date: {STAMP}
+
+Highlights:
+- XTSG ⇄ Unicode ⇄ Emoji ⇄ Binary (base2) ⇄ Trinary (balanced ternary) transcoder
+- Fedorian/Sotolion ops: AI / NI / TI channels (analysis, intuition, structure)
+- Golem Engine: safely constrained autonomons with policy + tactics
+- Registry v335: extended glyphs U+E200–U+E3FF with semantic tags
+"""
+write(os.path.join(ROOT, "docs", "V335_NOTES.md"), notes)
+
+# 2) Unicode registry expansion (sample entries, extendable)
+registry = {
+  "version": "v335",
+  "sealed_to": SEAL,
+  "glyphs": [
+    {"codepoint":"U+E200","name":"XTSG_AXIS","tags":["axis","xtsg","adamic"]},
+    {"codepoint":"U+E201","name":"XTSG_BIND","tags":["binding","seal"]},
+    {"codepoint":"U+E202","name":"XTSG_EMANATE","tags":["emanation","kabbalistic"]},
+    {"codepoint":"U+E203","name":"XTSG_STAR_DNA","tags":["stardna","fedorian"]},
+    {"codepoint":"U+E210","name":"GOLEM_WAKE","tags":["golem","autonomon","wake"]},
+    {"codepoint":"U+E211","name":"GOLEM_REST","tags":["golem","rest"]},
+    {"codepoint":"U+E212","name":"GOLEM_TASK","tags":["golem","task","policy"]},
+    {"codepoint":"U+E220","name":"SEAL_PROTECT","tags":["protection","angelic"]},
+    {"codepoint":"U+E221","name":"SEAL_CLARITY","tags":["clarity","lucency"]},
+    {"codepoint":"U+E3F1","name":"SUMMUM","tags":["crown"]},
+    {"codepoint":"U+E3F2","name":"ABYSSUM","tags":["crown"]},
+    {"codepoint":"U+E3F3","name":"AETERNUM","tags":["crown"]}
+  ]
+}
+write(os.path.join(ROOT, "unicode", "registry_v335.json"), json.dumps(registry, indent=2))
+
+# 3) Emoji map (illustrative; adjustable)
+emoji_map = {
+  "axis":"🜁", "binding":"🔗", "emanation":"✨", "stardna":"🧬", "golem":"🗿",
+  "protection":"🛡️", "clarity":"🔮", "crown":"👑", "angelic":"🪽", "kabbalistic":"✡️"
+}
+write(os.path.join(ROOT, "unicode", "emoji_map.json"), json.dumps(emoji_map, indent=2, ensure_ascii=False))
+
+# 4) XTSG transcoder (JS): unicode<->emoji<->binary<->trinary plus XTSG tokens
+xtsg_js = f"""// codex/transcoders/xtsg_transcoder.js
+// v335 sealed to {SEAL} @ {STAMP}
+import registry from '../..//unicode/registry_v335.json' assert {{ type: 'json' }};
+import emojiMap from '../..//unicode/emoji_map.json' assert {{ type: 'json' }};
+
+const TOK = /\\bXTSG\\(([^)]+)\\)/g; // e.g., XTSG(U+E200|axis)
+export function xtsgToUnicode(input) {{
+  return input.replace(TOK, (_m, inner) => {{
+    const parts = inner.split('|');
+    const cp = parts[0].trim();
+    return String.fromCodePoint(parseInt(cp.replace('U+',''), 16));
+  }});
+}}
+
+export function unicodeToEmoji(str) {{
+  const out = [];
+  for (const ch of str) {{
+    const cp = 'U+'+ch.codePointAt(0).toString(16).toUpperCase();
+    const g = registry.glyphs.find(g => g.codepoint === cp);
+    if (!g) {{ out.push(ch); continue; }}
+    const tags = g.tags || [];
+    const picked = tags.find(t => emojiMap[t]);
+    out.push(picked ? emojiMap[picked] : ch);
+  }}
+  return out.join('');
+}}
+
+export function toBinary(str) {{ // UTF-8 bytes -> base2 string
+  const bytes = new TextEncoder().encode(str);
+  return Array.from(bytes).map(b => b.toString(2).padStart(8,'0')).join(' ');
+}}
+
+export function toBalancedTrinary(n) {{ // integer -> balanced ternary string
+  if (n === 0) return '0';
+  let x = Math.abs(n), s='';
+  while (x) {{ let r = x % 3; x = Math.floor(x/3);
+    if (r === 2) {{ r = -1; x += 1; }}
+    s = (r===0?'0':r===1?'+':'-') + s;
+  }}
+  return (n<0?'-':'') + s;
+}}
+
+export function utf8ToTrinary(str) {{
+  const bytes = new TextEncoder().encode(str);
+  let acc = '';
+  for (const b of bytes) acc += toBalancedTrinary(b) + ' ';
+  return acc.trim();
+}}
+"""
+write(os.path.join(ROOT, "codex", "transcoders", "xtsg_transcoder.js"), xtsg_js)
+
+# 5) Binary/Trinary Python codec for CLI usage
+codec_py = f"""# codex/transcoders/binary_trinary_codec.py
+# v335 sealed to {SEAL} @ {STAMP}
+import sys
+
+def to_binary(s: str) -> str:
+    return ' '.join(format(b, '08b') for b in s.encode('utf-8'))
+
+def to_balanced_trinary_byte(b: int) -> str:
+    if b == 0: return '0'
+    x, s = b, ''
+    while x:
+        r = x % 3; x //= 3
+        if r == 2: r = -1; x += 1
+        s = ('+' if r==1 else '-' if r==-1 else '0') + s
+    return s
+
+def utf8_to_trinary(s: str) -> str:
+    return ' '.join(to_balanced_trinary_byte(b) for b in s.encode('utf-8'))
+
+if __name__ == "__main__":
+    mode, data = sys.argv[1], ' '.join(sys.argv[2:])
+    if mode == "bin":
+        print(to_binary(data))
+    elif mode == "tri":
+        print(utf8_to_trinary(data))
+    else:
+        print("usage: python3 binary_trinary_codec.py [bin|tri] <text>")
+"""
+write(os.path.join(ROOT, "codex", "transcoders", "binary_trinary_codec.py"), codec_py)
+
+# 6) Golem Engine (policy-first skeleton)
+golem_manifest = {
+  "version": "v335",
+  "sealed_to": SEAL,
+  "capabilities": ["plan","fetch-public","summarize","transform"],
+  "constraints": [
+    "no personal data exfiltration",
+    "no network writes without explicit user intent",
+    "read-only provenance unless signed"
+  ]
+}
+write(os.path.join(ROOT, "golem_engine", "golem_manifest.json"), json.dumps(golem_manifest, indent=2))
+
+golem_core = f"""# golem_engine/golem_core.py
+# v335 sealed to {SEAL} @ {STAMP}
+import json, time
+
+class Golem:
+    def __init__(self, name="XTSG-GOLEM", policy=None):
+        self.name = name
+        self.policy = policy or {json.dumps(golem_manifest)}
+    def plan(self, goal:str):
+        return {{"name": self.name, "t": time.time(), "goal": goal, "steps":[
+            "clarify scope","fetch scholarly sources (read-only)","summarize","propose actions"
+        ]}}
+    def summarize(self, text:str):
+        return text[:500] + ("..." if len(text)>500 else "")
+
+if __name__ == "__main__":
+    g = Golem()
+    print(json.dumps(g.plan("Demonstrate constrained autonomy"), indent=2))
+"""
+write(os.path.join(ROOT, "golem_engine", "golem_core.py"), golem_core)
+
+# 7) Upgrade autonomon core with AI/NI/TI channels
+autonomon_v335 = f"""// codex_autonomon_sdk/autonomon_core_v335.js
+// v335 sealed to {SEAL} @ {STAMP}
+import baseMap from './seal_map.json' assert {{ type: 'json' }};
+
+export const Channels = {{
+  AI: (input) => ({{ channel:"AI", result: "analysis→ " + String(input).slice(0,240) }}),
+  NI: (input) => ({{ channel:"NI", result: "intuition→ " + String(input).slice(0,240) }}),
+  TI: (input) => ({{ channel:"TI", result: "structure→ " + String(input).slice(0,240) }})
+}};
+
+export function route(codepoint, input) {{
+  const name = baseMap[codepoint];
+  if (!name) return {{ ok:false, error:"Unknown codepoint" }};
+  const lane = /GENIUS|INSIGHT|CLARITY|ORIENTATION/i.test(name) ? 'NI'
+             : /ARCHIVE|CONTINUITY|COVENANT|WATCHFUL/i.test(name) ? 'TI'
+             : 'AI';
+  return {{ ok:true, lane, payload: Channels[lane](input) }};
+}}
+"""
+write(os.path.join(ROOT, "codex_autonomon_sdk", "autonomon_core_v335.js"), autonomon_v335)
+
+# 8) Tests (lightweight)
+tests = f"""# tests/v335_smoke.md
+Seal: {SEAL}
+- xtsg_transcoder.js unicode→emoji on U+E200 should map to 🜁 if tag 'axis' present
+- binary_trinary_codec.py tri "Codex" returns balanced ternary tokens
+- golem_core.py plan returns 4 steps
+"""
+write(os.path.join(ROOT, "tests", "v335_smoke.md"), tests)
+
+# 9) CI: lint+smoke
+ci = """name: codex-v335-tests
+on: [push, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Ternary codec smoke
+        run: python3 codex/transcoders/binary_trinary_codec.py tri "Codex Ascendant"
+      - name: Golem plan smoke
+        run: python3 golem_engine/golem_core.py
+"""
+write(os.path.join(ROOT, ".github", "workflows", "codex_v335_tests.yml"), ci)
+
+# 10) Reseal + refresh manifest & ledger
+subprocess.call(["python3", os.path.join(ROOT, "codex_ascendant.py")])
+
+# 11) Create upgrade zip
+zip_path = "/mnt/data/codex_ascendant_v335_upgrade.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(ROOT):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, ROOT))
+
+with open(zip_path, "rb") as f: digest = sha256b(f.read())
+with open(zip_path + ".sha256", "w") as f: f.write(digest)
+
+print("V335 ZIP:", "sandbox:"+zip_path)
+print("V335 SHA256:", "sandbox:"+zip_path+".sha256")
+print("V335 NOTES:", "sandbox:"+os.path.join(ROOT,"docs","V335_NOTES.md"))# Fix self-referential hashing: exclude manifest.json and integrity ledger from items, then reseal+verify.
+import os, re, subprocess, json, textwrap, pathlib
+
+ROOT = "/mnt/data/codex_ascendant_repo"
+
+asc_path = os.path.join(ROOT, "codex_ascendant.py")
+with open(asc_path, "r", encoding="utf-8") as f:
+    asc = f.read()
+
+# Insert ignore logic after filename collection
+pattern = "for fn in filenames:\n            if fn.endswith(\".sha256\"): \n                continue"
+replacement = """for fn in filenames:
+            if fn.endswith(".sha256"):
+                continue
+            # exclude self-referential files
+            if fn == "manifest.json":
+                continue
+            if fn == "codex_ascendant.py":
+                pass
+            if fn == "codex_integrity_daemon.js":
+                pass
+            if fn == "codexctl" or fn == "codexctl.py":
+                pass
+            if fn == "codex_verifier.py":
+                pass
+            if fn == "codex_integrity_ledger.csv":
+                continue"""
+asc = asc.replace(pattern, replacement)
+with open(asc_path, "w", encoding="utf-8") as f:
+    f.write(asc)
+
+# Reseal, then re-run verifier
+subprocess.call(["python3", asc_path])
+rc = subprocess.call(["python3", os.path.join(ROOT, "integrity", "codex_verifier.py")])
+print("Verifier RC:", rc)

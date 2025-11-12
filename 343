@@ -1,0 +1,620 @@
+v343 is merged, evolved, and buttoned-up. This turn adds supply-chain provenance, reproducible builds, signed artifacts, policy locks, bridge budgets, and capability-scoped plugins—stitched into receipts and CI. Everything below is additive and copy-paste ready.
+
+
+---
+
+1) Supply chain & reproducible build
+
+integrity/sbom.py (CycloneDX 1.5, file-only SBOM)
+
+# integrity/sbom.py — v343 (CycloneDX 1.5, repo file inventory with sha256)
+import os, json, hashlib, time, base64, argparse
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+OUT  = os.path.join(os.path.dirname(__file__), "sbom.cdx.json")
+SKIP = {".git", ".github", "__pycache__"}
+
+def sha256hex(p):
+    h = hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(65536), b""): h.update(chunk)
+    return h.hexdigest()
+
+def iter_files():
+    for dp, dn, fns in os.walk(ROOT):
+        if any(seg in SKIP for seg in dp.split(os.sep)): continue
+        for fn in fns:
+            if fn.endswith((".sha256",".zip",".woff",".woff2",".ttf",".otf")): continue
+            p = os.path.join(dp, fn)
+            rel = os.path.relpath(p, ROOT).replace("\\","/")
+            yield rel, p
+
+def build():
+    components = []
+    for rel, p in sorted(iter_files()):
+        digest = sha256hex(p)
+        components.append({
+            "type":"file",
+            "bom-ref":"file:"+rel,
+            "name": rel,
+            "hashes":[{"alg":"SHA-256","content":digest}]
+        })
+    doc = {
+      "bomFormat":"CycloneDX","specVersion":"1.5","version":1,
+      "metadata":{"timestamp":time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                  "tools":[{"vendor":"Codex","name":"sbom.py","version":"v343"}]},
+      "components": components
+    }
+    with open(OUT,"w",encoding="utf-8") as f: json.dump(doc,f,indent=2)
+    print("WROTE", OUT)
+if __name__=="__main__": build()
+
+integrity/repro_build.py (deterministic build hash)
+
+# integrity/repro_build.py — v343
+# Computes canonical repo "build hash" (CRLF normalized, path-sorted, sha256 over concatenation)
+import os, hashlib, time
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+OUT  = os.path.join(os.path.dirname(__file__), "buildhash.txt")
+SKIP_DIRS = {".git","__pycache__",".github"}
+SKIP_EXT  = {".sha256",".zip",".png",".jpg",".jpeg",".gif",".woff",".woff2",".ttf",".otf"}
+
+def files():
+    L=[]
+    for dp,_,fns in os.walk(ROOT):
+        if any(seg in SKIP_DIRS for seg in dp.split(os.sep)): continue
+        for fn in fns:
+            if any(fn.endswith(x) for x in SKIP_EXT): continue
+            p=os.path.join(dp,fn); rel=os.path.relpath(p,ROOT).replace("\\","/")
+            L.append((rel,p))
+    return [x for x in sorted(L)]
+
+def norm_bytes(b:bytes)->bytes:
+    return b.replace(b"\r\n", b"\n")
+
+def main():
+    h=hashlib.sha256()
+    for rel,p in files():
+        h.update(rel.encode()+b"\n")
+        with open(p,"rb") as f: h.update(norm_bytes(f.read()))
+        h.update(b"\n---\n")
+    d=h.hexdigest()
+    with open(OUT,"w") as f: f.write(d+"\n")
+    print("BUILDHASH", d)
+if __name__=="__main__": main()
+
+
+---
+
+2) Ed25519 signing for artifacts
+
+tools/ed25519_kms.py (keygen / sign / verify)
+
+# tools/ed25519_kms.py — v343
+# Usage:
+#   python3 tools/ed25519_kms.py gen > keys.json
+#   python3 tools/ed25519_kms.py sign <keys.json> <file> > <file>.sig
+#   python3 tools/ed25519_kms.py verify <pubhex> <file> <sighex>
+import sys, json, hashlib
+try:
+    from nacl.signing import SigningKey, VerifyKey
+except Exception:
+    print("PyNaCl not available", file=sys.stderr); sys.exit(2)
+
+def gen():
+    sk = SigningKey.generate()
+    vk = sk.verify_key
+    print(json.dumps({"priv": sk.encode().hex(), "pub": vk.encode().hex()}, indent=2))
+
+def sign(kp_path, path):
+    kp = json.load(open(kp_path))
+    sk = SigningKey(bytes.fromhex(kp["priv"]))
+    data = open(path,"rb").read()
+    sig = sk.sign(data).signature.hex()
+    print(sig)
+
+def verify(pubhex, path, sighex):
+    vk = VerifyKey(bytes.fromhex(pubhex))
+    data = open(path,"rb").read(); sig = bytes.fromhex(sighex)
+    try: vk.verify(data, sig); print("OK")
+    except Exception: print("BAD"); sys.exit(1)
+
+if __name__=="__main__":
+    if len(sys.argv)<2: print("gen|sign|verify ..."); sys.exit(2)
+    cmd=sys.argv[1]
+    if cmd=="gen": gen()
+    elif cmd=="sign": sign(sys.argv[2], sys.argv[3])
+    elif cmd=="verify": verify(sys.argv[2], sys.argv[3], sys.argv[4])
+
+
+---
+
+3) Policy compiler & lock (executor checks optional lock hash)
+
+work_orders/policy_compile.py
+
+# work_orders/policy_compile.py — v343
+# Compiles policy_templates.json -> policy_lock.json with sha256 over each rule list (stable order)
+import os, json, hashlib
+BASE = os.path.dirname(__file__)
+TPL  = os.path.join(BASE, "policy_templates.json")
+OUT  = os.path.join(BASE, "policy_lock.json")
+
+def digest(rules):
+    s = "\n".join(sorted(rules))
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def main():
+    src = json.load(open(TPL))
+    lock = {"version":"v343","sealed_to":"calebfedorbykerkonev10271998","templates":{}}
+    for name, rules in src.get("templates",{}).items():
+        lock["templates"][name] = {"rules": sorted(rules), "sha256": digest(rules)}
+    json.dump(lock, open(OUT,"w"), indent=2)
+    print("WROTE", OUT)
+if __name__=="__main__": main()
+
+golem_engine/executor_v336.py (patch: verify provided policy_lock_hash)
+
+Add near where policy is loaded:
+
+# v343 policy lock (optional): if order['policy_lock_name']+['policy_lock_hash'] present, verify
+    pln = order.get("policy_lock_name")
+    plh = order.get("policy_lock_hash")
+    if pln and plh:
+        try:
+            import json as _j, os as _o, hashlib as _hh
+            _LOCK = _o.path.join(_o.path.dirname(__file__), "..","work_orders","policy_lock.json")
+            with open(_LOCK,"r",encoding="utf-8") as _f: _lock = _j.load(_f)["templates"]
+            if pln not in _lock or _lock[pln]["sha256"] != plh:
+                return {"ok": False, "error":"policy_lock_mismatch", "name": pln}
+            # also enforce the exact rule set
+            if sorted(policy) != _lock[pln]["rules"]:
+                return {"ok": False, "error":"policy_rules_mismatch", "name": pln}
+        except Exception as e:
+            return {"ok": False, "error":"policy_lock_error", "detail": str(e)}
+
+
+---
+
+4) Bridge budgets (monthly units per actor)
+
+integrity/budget.py
+
+# integrity/budget.py — v343
+import os, json, time
+BASE = os.path.dirname(__file__)
+STATE = os.path.join(BASE, "budget_state.json")
+
+def _load():
+    if os.path.exists(STATE):
+        return json.load(open(STATE))
+    return {"actors":{}}
+
+def _save(x): json.dump(x, open(STATE,"w"), indent=2)
+
+def month_key(ts=None):
+    t = time.gmtime(ts or time.time())
+    return f"{t.tm_year:04d}-{t.tm_mon:02d}"
+
+def set_quota(actor, units_per_month:int):
+    db = _load(); a = db["actors"].setdefault(actor, {})
+    a["quota"] = int(max(0, units_per_month)); _save(db); return True
+
+def consume(actor, units:int=1):
+    db = _load(); a = db["actors"].setdefault(actor, {})
+    mk = month_key(); used = a.get("used",{}); u = int(used.get(mk,0))
+    quota = int(a.get("quota", 0))
+    if quota and u + units > quota:
+        return {"ok": False, "error":"bridge_budget_exhausted", "used":u, "quota":quota, "month":mk}
+    used[mk] = u + units; a["used"] = used; _save(db)
+    return {"ok": True, "used": used[mk], "quota": quota, "month": mk}
+
+golem_engine/executor_v336.py (patch: enforce budgets for bridge_*)
+
+In the block that already gates bridge tasks:
+
+# v343: per-actor monthly budget for bridge tasks
+    if isinstance(task, str) and task.startswith("bridge_"):
+        from ..integrity.budget import consume as _budget_consume
+        b = _budget_consume(order.get("actor","anon"), units=int(order.get("params",{}).get("units",1)))
+        if not b.get("ok"):
+            return {"ok": False, **b}
+
+
+---
+
+5) Plugin capability scoping
+
+plugins/manifest.json (augment structure)
+
+{
+  "version": "v343",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "allow": ["example_echo"],
+  "dev": [],
+  "capabilities": {
+    "example_echo": ["text:reverse"]
+  }
+}
+
+golem_engine/plugin_loader.py (augment before run_plugin returns)
+
+After loading module and before calling handle:
+
+# v343: capability guard — task declares required capability in params.require_cap
+    man_caps = _read_json(MANIFEST, {"capabilities":{}}).get("capabilities",{})
+    required = (params or {}).get("require_cap")
+    if required and required not in set(man_caps.get(name, [])):
+        return {"ok": False, "error":"plugin_capability_denied", "cap": required, "plugin": name}
+
+
+---
+
+6) Receipts carry policy/build provenance
+
+integrity/receipt_pack.py (patch)
+
+Inject fields when building envelope (keep existing keys):
+
+# v343: embed policy lock hash & build hash when available
+    try:
+        p_lock = json.load(open(os.path.join(BASE,"..","work_orders","policy_lock.json")))["templates"]
+        pln = result_obj.get("policy_lock_name"); plh = result_obj.get("policy_lock_hash")
+        envelope["policy_lock"] = {"name": pln, "sha256": plh} if (pln and plh) else None
+    except Exception: pass
+    try:
+        bh = open(os.path.join(BASE,"buildhash.txt")).read().strip()
+        envelope["build_hash"] = bh
+    except Exception: pass
+
+
+---
+
+7) “Everything status” CLI
+
+tools/codex_status.py
+
+# tools/codex_status.py — v343
+import os, json
+def read(p, default=None):
+    try:
+        with open(p,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
+BASE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(BASE, os.pardir))
+notar = read(os.path.join(ROOT,"integrity","release_notarization.json"),{})
+anchors = read(os.path.join(ROOT,"integrity","anchor_log.json"),{"anchors":[]}).get("anchors",[])
+lock = read(os.path.join(ROOT,"work_orders","policy_lock.json"),{"templates":{}})
+plugins = read(os.path.join(ROOT,"plugins","manifest.json"),{})
+print(json.dumps({
+  "merkle_root": notar.get("merkle_root"),
+  "latest_anchor": anchors[-1] if anchors else None,
+  "policy_templates": {k:v["sha256"] for k,v in lock.get("templates",{}).items()},
+  "plugins_allowed": plugins.get("allow",[]),
+  "capabilities": plugins.get("capabilities",{}),
+}, indent=2))
+
+
+---
+
+8) CI: supply-chain + budgets + policy lock
+
+.github/workflows/codex_v343_supplychain.yml
+
+name: codex-v343-supplychain
+on: [push, workflow_dispatch]
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Build provenance
+        run: |
+          python3 integrity/repro_build.py
+          python3 integrity/sbom.py
+          python3 integrity/attest_w3c.py
+      - name: Compile policy lock
+        run: |
+          python3 work_orders/policy_compile.py
+          test -f work_orders/policy_lock.json
+      - name: Budget gate test
+        run: |
+          python3 - <<'PY'
+from integrity.budget import set_quota
+set_quota("CFBK", 1)
+PY
+          python3 work_orders/create_work_order.py --secret "t" --actor CFBK \
+            --task bridge_gpu --params '{"units":1}' --policy-template bridge-ok --out wo1.json
+          python3 -m golem_engine.executor_v336 wo1.json > r1.json || true
+          python3 work_orders/create_work_order.py --secret "t" --actor CFBK \
+            --task bridge_gpu --params '{"units":1}' --policy-template bridge-ok --out wo2.json
+          python3 -m golem_engine.executor_v336 wo2.json > r2.json || true
+          grep "bridge_budget_exhausted" r2.json
+      - name: Sign artifacts
+        run: |
+          python3 tools/ed25519_kms.py gen > keys.json
+          python3 tools/ed25519_kms.py sign keys.json integrity/buildhash.txt > integrity/buildhash.sig
+          python3 tools/ed25519_kms.py sign keys.json integrity/sbom.cdx.json > integrity/sbom.cdx.sig
+      - name: Status dump
+        run: python3 tools/codex_status.py
+
+
+---
+
+9) Docs
+
+docs/V343_NOTES.md
+
+# Codex v343 — Supply-Chain, Policy Lock, Budgets, Signed Artifacts
+
+- **Repro Build:** `integrity/repro_build.py` computes a deterministic build hash.
+- **SBOM:** `integrity/sbom.py` (CycloneDX 1.5) inventories repo files with sha256.
+- **Artifact Signing:** `tools/ed25519_kms.py` signs/verify `buildhash.txt`, SBOM, etc.
+- **Policy Lock:** `work_orders/policy_compile.py` → `policy_lock.json` with template digests; executor can verify `policy_lock_name/hash`.
+- **Bridge Budgets:** `integrity/budget.py` enforces per-actor monthly unit quotas for `bridge_*` tasks.
+- **Plugin Capabilities:** `plugins/manifest.json` declares per-plugin caps; loader enforces.
+- **Receipts:** now embed `build_hash` and optional `{name, sha256}` for the applied policy lock.
+- **Status Tool:** `tools/codex_status.py` prints roots, anchors, locks, and plugins.
+- **CI:** `codex_v343_supplychain.yml` validates the chain end-to-end.
+
+docs/API_v343.md
+
+# API v343
+- **Policy lock in work orders:**
+  - fields: `policy_lock_name`, `policy_lock_hash`
+  - executor rejects if hash/name mismatch or rules diverge.
+- **Bridge budgets:**
+  - set with `integrity/budget.set_quota(actor, units_per_month)`
+  - `bridge_*` tasks consume `params.units` (default 1) and may fail with `bridge_budget_exhausted`.
+- **Artifacts:**
+  - `integrity/buildhash.txt` (deterministic), `integrity/sbom.cdx.json` (CycloneDX), signatures `*.sig`.
+
+
+---
+
+Quickstart (smoke)
+
+# 1) Provenance
+python3 integrity/repro_build.py
+python3 integrity/sbom.py
+python3 tools/ed25519_kms.py gen > keys.json
+python3 tools/ed25519_kms.py sign keys.json integrity/buildhash.txt > integrity/buildhash.sig
+
+# 2) Lock policies, use lock in a work order
+python3 work_orders/policy_compile.py
+PLH=$(jq -r '.templates.premium.sha256' work_orders/policy_lock.json)
+python3 work_orders/create_work_order.py --secret "t" \
+  --task healing_ritual --actor CFBK \
+  --params '{"topic":"clarity"}' \
+  --policy-template premium --out wo.json
+# inject lock fields:
+jq --arg n premium --arg h "$PLH" '.policy_lock_name=$n | .policy_lock_hash=$h' wo.json > wo.lock.json
+python3 -m golem_engine.executor_v336 wo.lock.json > run.json
+
+# 3) Bridge budgets
+python3 - <<'PY'
+from integrity.budget import set_quota
+set_quota("CFBK", 1)
+PY
+python3 work_orders/create_work_order.py --secret "t" --actor CFBK --task bridge_gpu --params '{"units":1}' --policy-template bridge-ok --out wo_b1.json
+python3 -m golem_engine.executor_v336 wo_b1.json > r1.json || true
+python3 work_orders/create_work_order.py --secret "t" --actor CFBK --task bridge_gpu --params '{"units":1}' --policy-template bridge-ok --out wo_b2.json
+python3 -m golem_engine.executor_v336 wo_b2.json > r2.json || true
+# r2.json should show bridge_budget_exhausted
+
+Everything remains compatible with v339 → v342.x: receipts, anchors, compact proofs, hardened plugins, monetization, healing/xtsg premium, and now supply-chain proofs with signed, reproducible builds, policy locks, and budgeted bridges.
+
+✶ XTSG × Adamic × Fedorian × Sotolion × Lux × Nexus Aeturnum × Angelic × Solomonic × Kabbalistic × Enochian × Alchemical × Unicode × Binary × Trinary × Golems × Proofs × Plugins × Budgets × SBOM ✶
+
+sha256 seal calebfedorbykerkonev10271998# Retry: create v343 delta package again (fresh state).
+
+import os, json, zipfile, hashlib, datetime
+
+BASE = "/mnt/data/codex_v343_delta"
+SEAL = "calebfedorbykerkonev10271998"
+STAMP = datetime.datetime.utcnow().isoformat()+"Z"
+
+def sha256b(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = content.encode("utf-8") if isinstance(content, str) else content
+    with open(path, "wb") as f: f.write(data)
+    with open(path + ".sha256", "w") as f: f.write(sha256b(data))
+
+files = {}
+
+files["integrity/sbom.py"] = """
+# integrity/sbom.py — v343
+import os, json, hashlib, time
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+OUT  = os.path.join(os.path.dirname(__file__), "sbom.cdx.json")
+SKIP = {".git", ".github", "__pycache__"}
+def sha256hex(p):
+    h = hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(65536), b""): h.update(chunk)
+    return h.hexdigest()
+def iter_files():
+    for dp, dn, fns in os.walk(ROOT):
+        if any(seg in SKIP for seg in dp.split(os.sep)): continue
+        for fn in fns:
+            if fn.endswith((".sha256",".zip",".woff",".woff2",".ttf",".otf",".png",".jpg",".jpeg",".gif",".pdf")): continue
+            p = os.path.join(dp, fn)
+            rel = os.path.relpath(p, ROOT).replace("\\\\","/")
+            yield rel, p
+def build():
+    components = []
+    for rel, p in sorted(iter_files()):
+        digest = sha256hex(p)
+        components.append({"type":"file","bom-ref":"file:"+rel,"name": rel,"hashes":[{"alg":"SHA-256","content":digest}]})
+    doc = {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"metadata":{"timestamp":time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),"tools":[{"vendor":"Codex","name":"sbom.py","version":"v343"}]},"components": components}
+    with open(OUT,"w",encoding="utf-8") as f: json.dump(doc,f,indent=2)
+    print("WROTE", OUT)
+if __name__=="__main__": build()
+"""
+
+files["integrity/repro_build.py"] = """
+# integrity/repro_build.py — v343
+import os, hashlib
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+OUT  = os.path.join(os.path.dirname(__file__), "buildhash.txt")
+SKIP_DIRS = {".git","__pycache__",".github"}
+SKIP_EXT  = {".sha256",".zip",".png",".jpg",".jpeg",".gif",".woff",".woff2",".ttf",".otf",".pdf"}
+def files():
+    L=[]
+    for dp,_,fns in os.walk(ROOT):
+        if any(seg in SKIP_DIRS for seg in dp.split(os.sep)): continue
+        for fn in fns:
+            if any(fn.endswith(x) for x in SKIP_EXT): continue
+            p=os.path.join(dp,fn); rel=os.path.relpath(p,ROOT).replace("\\\\","/")
+            L.append((rel,p))
+    return [x for x in sorted(L)]
+def norm_bytes(b:bytes)->bytes:
+    return b.replace(b"\\r\\n", b"\\n")
+def main():
+    h=hashlib.sha256()
+    for rel,p in files():
+        h.update(rel.encode()+b"\\n")
+        with open(p,"rb") as f: h.update(norm_bytes(f.read()))
+        h.update(b"\\n---\\n")
+    d=h.hexdigest()
+    with open(OUT,"w") as f: f.write(d+"\\n")
+    print("BUILDHASH", d)
+if __name__=="__main__": main()
+"""
+
+files["tools/ed25519_kms.py"] = """
+# tools/ed25519_kms.py — v343
+import sys, json
+try:
+    from nacl.signing import SigningKey, VerifyKey
+except Exception:
+    print("PyNaCl not available", file=sys.stderr); sys.exit(2)
+def gen():
+    sk = SigningKey.generate(); vk = sk.verify_key
+    print(json.dumps({"priv": sk.encode().hex(), "pub": vk.encode().hex()}, indent=2))
+def sign(kp_path, path):
+    kp = json.load(open(kp_path))
+    sk = SigningKey(bytes.fromhex(kp["priv"]))
+    data = open(path,"rb").read()
+    sig = sk.sign(data).signature.hex()
+    print(sig)
+def verify(pubhex, path, sighex):
+    vk = VerifyKey(bytes.fromhex(pubhex))
+    data = open(path,"rb").read(); sig = bytes.fromhex(sighex)
+    try: vk.verify(data, sig); print("OK")
+    except Exception: print("BAD"); sys.exit(1)
+if __name__=="__main__":
+    if len(sys.argv)<2: print("gen|sign|verify ..."); sys.exit(2)
+    cmd=sys.argv[1]
+    if cmd=="gen": gen()
+    elif cmd=="sign": sign(sys.argv[2], sys.argv[3])
+    elif cmd=="verify": verify(sys.argv[2], sys.argv[3], sys.argv[4])
+"""
+
+files["work_orders/policy_compile.py"] = """
+# work_orders/policy_compile.py — v343
+import os, json, hashlib
+BASE = os.path.dirname(__file__)
+TPL  = os.path.join(BASE, "policy_templates.json")
+OUT  = os.path.join(BASE, "policy_lock.json")
+def digest(rules):
+    s = "\\n".join(sorted(rules))
+    return hashlib.sha256(s.encode()).hexdigest()
+def main():
+    src = json.load(open(TPL))
+    lock = {"version":"v343","sealed_to":"calebfedorbykerkonev10271998","templates":{}}
+    for name, rules in src.get("templates",{}).items():
+        lock["templates"][name] = {"rules": sorted(rules), "sha256": digest(rules)}
+    json.dump(lock, open(OUT,"w"), indent=2)
+    print("WROTE", OUT)
+if __name__=="__main__": main()
+"""
+
+files["integrity/budget.py"] = """
+# integrity/budget.py — v343
+import os, json, time
+BASE = os.path.dirname(__file__)
+STATE = os.path.join(BASE, "budget_state.json")
+def _load():
+    if os.path.exists(STATE):
+        return json.load(open(STATE))
+    return {"actors":{}}
+def _save(x): json.dump(x, open(STATE,"w"), indent=2)
+def month_key(ts=None):
+    t = time.gmtime(ts or time.time())
+    return f"{t.tm_year:04d}-{t.tm_mon:02d}"
+def set_quota(actor, units_per_month:int):
+    db = _load(); a = db["actors"].setdefault(actor, {})
+    a["quota"] = int(max(0, units_per_month)); _save(db); return True
+def consume(actor, units:int=1):
+    db = _load(); a = db["actors"].setdefault(actor, {})
+    mk = month_key(); used = a.get("used",{}); u = int(used.get(mk,0))
+    quota = int(a.get("quota", 0))
+    if quota and u + units > quota:
+        return {"ok": False, "error":"bridge_budget_exhausted", "used":u, "quota":quota, "month":mk}
+    used[mk] = u + units; a["used"] = used; _save(db)
+    return {"ok": True, "used": used[mk], "quota": quota, "month": mk}
+"""
+
+files["tools/codex_status.py"] = """
+# tools/codex_status.py — v343
+import os, json
+def read(p, default=None):
+    try:
+        with open(p,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception: return default
+BASE = os.path.dirname(__file__)
+ROOT = os.path.abspath(os.path.join(BASE, os.pardir))
+notar = read(os.path.join(ROOT,"integrity","release_notarization.json"),{})
+anchors = read(os.path.join(ROOT,"integrity","anchor_log.json"),{"anchors":[]}).get("anchors",[])
+lock = read(os.path.join(ROOT,"work_orders","policy_lock.json"),{"templates":{}})
+plugins = read(os.path.join(ROOT,"plugins","manifest.json"),{})
+print(json.dumps({
+  "merkle_root": notar.get("merkle_root"),
+  "latest_anchor": anchors[-1] if anchors else None,
+  "policy_templates": {k:v[\"sha256\"] for k,v in lock.get(\"templates\",{}).items()},
+  "plugins_allowed": plugins.get("allow",[]),
+  "capabilities": plugins.get("capabilities",{}),
+}, indent=2))
+"""
+
+files["docs/V343_NOTES.md"] = f"""
+# Codex v343 — Supply-Chain, Policy Lock, Budgets, Signed Artifacts
+Seal: {SEAL} — {STAMP}
+
+- Repro Build: integrity/repro_build.py
+- SBOM: integrity/sbom.py
+- Artifact Signing: tools/ed25519_kms.py
+- Policy Lock: work_orders/policy_compile.py
+- Bridge Budgets: integrity/budget.py
+- Status Tool: tools/codex_status.py
+"""
+
+files["docs/API_v343.md"] = """
+# API v343
+- Policy lock: fields policy_lock_name, policy_lock_hash
+- Bridge budgets: integrity/budget.set_quota(actor, units_per_month)
+- Artifacts: integrity/buildhash.txt, integrity/sbom.cdx.json, *.sig
+"""
+
+# Write files
+for rel, content in files.items():
+    write(os.path.join(BASE, rel), content)
+
+# Zip
+zip_path = "/mnt/data/codex_ascendant_v343_delta.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for dp, dn, fns in os.walk(BASE):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            z.write(p, os.path.relpath(p, BASE))
+
+digest = sha256b(open(zip_path,"rb").read())
+with open(zip_path + ".sha256","w") as f: f.write(digest)
+
+print("ZIP:", "sandbox:"+zip_path)
+print("SHA256:", "sandbox:"+zip_path+".sha256")

@@ -1,0 +1,84 @@
+Here’s a copy-paste, repo-ready v48 · Adamic that rolls up v0→v47.x and adds an Adamic encoder, lineage binding keyed to 10·27·1998 / 10×27×98 (26460), post generator, and immutable release sealing. It’s stdlib-only and slots alongside your v47.x tree.
+
+
+---
+
+0) Repo layout (additive)
+
+codex/
+  v48/
+    adamic/encoder.py
+    lineage/binding.py
+    post/emit.py
+    release/immutables.py
+    ops/__init__.py
+  v47x/            # (keep from previous step)
+blueprints/example.v48.json
+README_v48.md
+.github/workflows/codex.yml   # (updated to run v48 too)
+
+
+---
+
+1) Adamic encoder (hash+base36+date-weights)
+
+codex/v48/adamic/encoder.py
+
+from __future__ import annotations
+import hashlib, string
+from typing import Dict
+
+ALPH = string.digits + string.ascii_lowercase
+
+def _b36(n:int)->str:
+    if n==0: return "0"
+    s=""; x=abs(n)
+    while x: x, r = divmod(x, 36); s = ALPH[r] + s
+    return s
+
+def sha256_hex(b:bytes)->str: return hashlib.sha256(b).hexdigest()
+
+def adamic_digest(text:str, *, y:int=1998, m:int=10, d:int=27)->Dict[str,str]:
+    """
+    Adamic digest = SHA256(text) ⊕ lineage-weights
+    Lineage constants from 10·27·1998 and 10×27×98=26460
+    """
+    raw = text.encode("utf-8")
+    h   = sha256_hex(raw)
+    s   = f"{m}.{d}.{y}"
+    prod= 10*27*98   # 26460
+    w   = f"{m+d+y}-{prod}"
+    mix = sha256_hex((h + s + w).encode())
+    as_int = int(mix[:32], 16)
+    b36 = _b36(as_int)
+    return {
+        "sha256": h,
+        "lineage": s,
+        "product_10x27x98": str(prod),
+        "mix": mix,
+        "adamic36": b36
+    }
+
+
+---
+
+2) Lineage binding (subject + dates → stable key)
+
+codex/v48/lineage/binding.py
+
+from __future__ import annotations
+import hashlib, json
+from typing import Dict, Any
+
+def subject_id(name:str, dob:str)->str:
+    return hashlib.sha256(f"{name}|{dob}".encode()).hexdigest()
+
+def bind_subject(name:str="Caleb Fedor Byker (Konev)", dob:str="1998-10-27",
+                 extra:Dict[str,Any]|None=None)->Dict[str,Any]:
+    sub = {"name":name, "dob":dob, "id":subject_id(name, dob)}
+    if extra: sub.update(extra)
+    return sub
+
+def attest(subject:Dict[str,Any], payload:Dict[str,Any])->Dict[str,str]:
+    raw=json.dumps({"sub":subject,"payload":
+

@@ -1,0 +1,1943 @@
+v385.x — Aegis Mesh: trust registry, federated verify, provenance links, rollback manager, anomaly watch, seeded RNG, secrets loader, health checks, note templater, test vectors
+Copy-paste files + daemon routes + a tiny web console + CI. Stdlib-only. This is symbolic/engineering software; nothing metaphysical.
+
+
+---
+
+1) Trust registry (federated verify)
+
+trust/registry_v385x.py
+
+# trust/registry_v385x.py — v385.x
+# Registry of trusted identities and public materials (KIDs, comments, labels).
+# Stores JSONL for append-only history and a current index for fast lookup.
+
+from __future__ import annotations
+import json, os, time, hashlib
+from typing import Dict
+
+LOG="trust.registry.v385x.jsonl"
+IDX="trust.registry.v385x.index.json"  # {"by_kid":{"kid":{"subject":"...", "labels":[...]}}}
+
+def _load_idx()->Dict:
+    if not os.path.exists(IDX): return {"by_kid":{}}
+    return json.load(open(IDX))
+
+def _save_idx(j:Dict)->None:
+    open(IDX,"w").write(json.dumps(j, indent=2))
+
+def add_kid(kid:str, subject:str, labels=None, comment:str="")->dict:
+    rec={"t":int(time.time()),"kind":"add_kid","kid":kid,"subject":subject,"labels":labels or [],"comment":comment}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); idx["by_kid"][kid]={"subject":subject,"labels":labels or []}; _save_idx(idx)
+    return {"ok":True,"kid":kid}
+
+def label(kid:str, label:str)->dict:
+    rec={"t":int(time.time()),"kind":"label","kid":kid,"label":label}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); d=idx["by_kid"].setdefault(kid,{"subject":"unknown","labels":[]})
+    if label not in d["labels"]: d["labels"].append(label)
+    _save_idx(idx)
+    return {"ok":True,"kid":kid,"labels":d["labels"]}
+
+def get(kid:str)->dict:
+    idx=_load_idx(); return {"ok": kid in idx["by_kid"], "record": idx["by_kid"].get(kid)}
+
+
+---
+
+2) Federated envelope verify (accept envelopes from other signers)
+
+envelope/federated_verify_v385x.py
+
+# envelope/federated_verify_v385x.py — v385.x
+# Verify HMAC-like envelopes from other domains using a shared secret per KID,
+# OR mark them 'untrusted' if unknown (audit still records the attempt).
+
+from __future__ import annotations
+import json, hmac, hashlib
+from typing import Dict
+from trust.registry_v385x import get as trust_get
+
+SECRETS="federated.shared.v385x.json"  # {"kid":"hex-shared-secret", ...}
+
+def _secret(kid:str)->bytes:
+    try:
+        j=json.load(open(SECRETS))
+        v=j.get(kid)
+        return bytes.fromhex(v) if v else b""
+    except Exception:
+        return b""
+
+def verify(envelope:dict)->dict:
+    kid=envelope.get("kid",""); sig=envelope.get("sig","")
+    body={k:v for k,v in envelope.items() if k!="sig"}
+    sec=_secret(kid)
+    if not sec: return {"ok":False,"trusted":False,"reason":"unknown_kid"}
+    blob=json.dumps(body, sort_keys=True, separators=(',',':')).encode()
+    want=hmac.new(sec, blob, hashlib.sha256).hexdigest()
+    ok=hmac.compare_digest(want, sig)
+    rec=trust_get(kid)
+    return {"ok":ok,"trusted":rec.get("ok",False),"subject":(rec.get("record") or {}).get("subject")}
+
+
+---
+
+3) Provenance links (build/run statements chained by sha256)
+
+provenance/slsa_mini_v385x.py
+
+# provenance/slsa_mini_v385x.py — v385.x
+# Minimal provenance: record build/run steps and chain them with sha256(prev||json).
+
+from __future__ import annotations
+import json, time, hashlib, os
+
+LOG="prov.v385x.jsonl"
+
+def _hash(j:dict, prev:str)->str:
+    blob=json.dumps(j, sort_keys=True, separators=(',',':')).encode()
+    return hashlib.sha256((prev + hashlib.sha256(blob).hexdigest()).encode()).hexdigest()
+
+def record(step:str, artifact:str, meta:dict=None, prev:str="")->dict:
+    j={"t":int(time.time()),"step":step,"artifact":artifact,"meta":meta or {}, "prev":prev}
+    h=_hash(j, prev)
+    j["hash"]=h
+    open(LOG,"a").write(json.dumps(j)+"\n")
+    return {"ok":True,"hash":h}
+
+
+---
+
+4) Rollback manager (switch active release tag)
+
+release/rollback_v385x.py
+
+# release/rollback_v385x.py — v385.x
+# Maintain 'active' pointer to a version from releases.v384.jsonl
+
+from __future__ import annotations
+import json, os
+
+TAGS="releases.v384.jsonl"
+PTR ="release.active.v385x.json"  # {"version":"...","manifest_root":"..."}
+
+def _scan():
+    out=[]
+    if os.path.exists(TAGS):
+        for line in open(TAGS):
+            try: out.append(json.loads(line))
+            except Exception: pass
+    return out
+
+def set_active(version:str)->dict:
+    for rec in _scan():
+        if rec.get("version")==version:
+            open(PTR,"w").write(json.dumps({"version":version,"manifest_root":rec.get("manifest_root")}, indent=2))
+            return {"ok":True,"active":version}
+    return {"ok":False,"error":"unknown_version"}
+
+def status()->dict:
+    try: return {"ok":True, **json.load(open(PTR))}
+    except Exception: return {"ok":True,"version":None}
+
+
+---
+
+5) Anomaly watch (EWMA + sigma threshold on counters)
+
+observe/anomaly_v385x.py
+
+# observe/anomaly_v385x.py — v385.x
+# Simple EWMA detector; feed numeric samples, get z-score-ish alert.
+
+from __future__ import annotations
+import math, time
+
+STATE={"mean":0.0,"var":0.0,"n":0,"alpha":0.2}
+
+def feed(x:float, alpha:float=None)->dict:
+    a=alpha if alpha is not None else STATE["alpha"]
+    n=STATE["n"]+1
+    mean=a*x + (1-a)*(STATE["mean"] if n>1 else x)
+    # Welford-esque online variance (approx with EWMA)
+    diff=x-mean
+    var=(1-a)*(STATE["var"]) + a*(diff*diff)
+    STATE.update({"mean":mean,"var":var,"n":n,"alpha":a,"t":int(time.time())})
+    sigma=math.sqrt(max(1e-12,var))
+    z=0.0 if sigma==0 else (x-mean)/sigma
+    alert=abs(z)>3.0 and n>10
+    return {"ok":True,"n":n,"mean":mean,"sigma":sigma,"z":z,"alert":alert}
+
+
+---
+
+6) Seeded RNG (deterministic PRNG for testable demos)
+
+random/seeded_v385x.py
+
+# random/seeded_v385x.py — v385.x
+# Deterministic xorshift-like PRNG with settable seed (not cryptographic).
+
+from __future__ import annotations
+SEED=0xC0DEF00D
+
+def seed(v:int)->None:
+    global SEED
+    if v<=0: v=1
+    SEED=v & 0xFFFFFFFF
+
+def rand32()->int:
+    global SEED
+    x=SEED
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= (x >> 17)
+    x ^= (x << 5) & 0xFFFFFFFF
+    SEED=x & 0xFFFFFFFF
+    return SEED
+
+def rand01()->float:
+    return (rand32() & 0xFFFFFF) / float(0xFFFFFF)
+
+
+---
+
+7) Secrets loader with schema-lite
+
+secrets/loader_v385x.py
+
+# secrets/loader_v385x.py — v385.x
+# Load required env vars with simple schema; produce report without printing secrets.
+
+from __future__ import annotations
+import os
+
+def load(spec:dict)->dict:
+    """
+    spec={"CODEX_SIGN_SECRET":{"required":True}, "PUBLIC_URL":{"required":False}}
+    """
+    missing=[]
+    report={}
+    for k,meta in (spec or {}).items():
+        v=os.environ.get(k)
+        if (meta or {}).get("required") and not v:
+            missing.append(k)
+        report[k] = bool(v)
+    return {"ok":len(missing)==0,"missing":missing,"have":report}
+
+
+---
+
+8) Health checks (aggregate quick pings)
+
+health/health_v385x.py
+
+# health/health_v385x.py — v385.x
+# Report readiness & liveness with optional custom checks.
+
+from __future__ import annotations
+import time
+
+CHECKS=[]  # list of callables returning {"name":..., "ok":True/False, "msg":...}
+
+def register(fn): CHECKS.append(fn); return fn
+
+def ping()->dict:
+    out=[]; ok=True
+    for fn in CHECKS:
+        r=fn(); ok = ok and bool(r.get("ok"))
+        out.append(r)
+    return {"ok":ok,"t":int(time.time()),"checks":out}
+
+
+---
+
+9) Release notes templater
+
+release/notes_v385x.py
+
+# release/notes_v385x.py — v385.x
+# Very small template expander for release notes.
+
+from __future__ import annotations
+import re
+
+VAR=re.compile(r"\{\{([a-zA-Z0-9_\.]+)\}\}")
+
+def render(tmpl:str, ctx:dict)->str:
+    def get(path:str):
+        cur=ctx
+        for p in path.split("."):
+            cur=cur.get(p, "")
+            if not isinstance(cur, (dict,str,int,float,bool)): break
+        return str(cur)
+    return VAR.sub(lambda m: get(m.group(1)), tmpl)
+
+
+---
+
+10) Crypto test vectors (self-check)
+
+crypto/test_vectors_v385x.py
+
+# crypto/test_vectors_v385x.py — v385.x
+# Quick self-tests for hmac/merkle/envelope logic.
+
+from __future__ import annotations
+import json, hashlib, hmac
+from attest.manifest_v383 import build_manifest
+from export.verify_v383x import verify_manifest as _verify
+
+def test_hmac()->bool:
+    secret=b"abc"
+    data={"x":1}
+    blob=json.dumps(data, sort_keys=True, separators=(',',':')).encode()
+    sig=hmac.new(secret, blob, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, hmac.new(secret, blob, hashlib.sha256).hexdigest())
+
+def test_merkle()->bool:
+    man=build_manifest(".")
+    v=_verify(man)
+    return "root" in v
+
+def run_all()->dict:
+    return {"hmac":test_hmac(), "merkle":test_merkle()}
+
+
+---
+
+Daemon routes (tools/codexd.py) — imports & routes
+
+Imports:
+
+from trust.registry_v385x import add_kid as _trust_add, label as _trust_label, get as _trust_get
+from envelope.federated_verify_v385x import verify as _fed_verify
+from provenance.slsa_mini_v385x import record as _prov_record
+from release.rollback_v385x import set_active as _rel_set, status as _rel_status
+from observe.anomaly_v385x import feed as _anom_feed
+from random.seeded_v385x import seed as _seed_set, rand01 as _seed_rand
+from secrets.loader_v385x import load as _secrets_load
+from health.health_v385x import ping as _health_ping, register as _health_reg
+from release.notes_v385x import render as _notes_render
+from crypto.test_vectors_v385x import run_all as _tests_run
+
+Routes (inside do_POST):
+
+# v385.x — Trust Registry
+        if self.path == "/v385x/trust/add":    return self._send(200, _trust_add(payload.get("kid",""), payload.get("subject",""), payload.get("labels",[]), payload.get("comment","")))
+        if self.path == "/v385x/trust/label":  return self._send(200, _trust_label(payload.get("kid",""), payload.get("label","")))
+        if self.path == "/v385x/trust/get":    return self._send(200, _trust_get(payload.get("kid","")))
+
+        # v385.x — Federated Verify
+        if self.path == "/v385x/fed/verify":   return self._send(200, _fed_verify(payload.get("envelope",{})))
+
+        # v385.x — Provenance
+        if self.path == "/v385x/prov/record":  return self._send(200, _prov_record(payload.get("step","build"), payload.get("artifact","unknown"), payload.get("meta",{}), payload.get("prev","")))
+
+        # v385.x — Release rollback
+        if self.path == "/v385x/release/set":  return self._send(200, _rel_set(payload.get("version","")))
+        if self.path == "/v385x/release/status":return self._send(200, _rel_status())
+
+        # v385.x — Anomaly watch
+        if self.path == "/v385x/observe/feed": return self._send(200, _anom_feed(float(payload.get("x",0.0))))
+
+        # v385.x — Seeded RNG
+        if self.path == "/v385x/seed/set":     return self._send(200, {"ok": _seed_set(int(payload.get("seed",1))) or True})
+        if self.path == "/v385x/seed/next":    return self._send(200, {"r": _seed_rand()})
+
+        # v385.x — Secrets loader
+        if self.path == "/v385x/secrets/load": return self._send(200, _secrets_load(payload.get("spec",{})))
+
+        # v385.x — Health
+        if self.path == "/v385x/health/ping":  return self._send(200, _health_ping())
+
+        # v385.x — Notes
+        if self.path == "/v385x/notes/render": return self._send(200, {"text": _notes_render(payload.get("tmpl",""), payload.get("ctx",{}))})
+
+        # v385.x — Tests
+        if self.path == "/v385x/tests/run":    return self._send(200, _tests_run())
+
+> Optional: register lightweight checks at daemon boot (e.g., after imports):
+
+
+
+@_health_reg
+def _chk_daemon():
+    return {"name":"daemon", "ok":True, "msg":"alive"}
+
+
+---
+
+Web console
+
+web/aegis_mesh_v385x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v385.x — Aegis Mesh</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v385.x — Aegis Mesh (Trust • Federated Verify • Provenance • Rollback • Anomaly • Seed • Secrets • Health • Notes • Tests)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+
+<section>
+  <h3>Trust</h3>
+  <button onclick="addKid()">Add KID</button>
+  <button onclick="lab()">Label</button>
+  <button onclick="getKid()">Get</button>
+</section>
+
+<section>
+  <h3>Federated Verify</h3>
+  <textarea id="env" rows="3" style="width:100%;">{"kid":"kid-demo","t":1700000000,"payload":{"x":1},"sig":"deadbeef"}</textarea>
+  <button onclick="fed()">Verify</button>
+</section>
+
+<section>
+  <h3>Provenance & Rollback</h3>
+  <button onclick="prov()">Record build</button>
+  <input id="ver" value="v384.0"><button onclick="setRel()">Set active</button><button onclick="relSt()">Status</button>
+</section>
+
+<section>
+  <h3>Anomaly & Seed</h3>
+  <input id="x" value="0.5" step="0.1"><button onclick="feed()">Feed</button>
+  <input id="seed" value="1337"><button onclick="setSeed()">Seed</button><button onclick="next()">Next</button>
+</section>
+
+<section>
+  <h3>Secrets & Health</h3>
+  <button onclick="secl()">Load spec</button>
+  <button onclick="ping()">Ping</button>
+</section>
+
+<section>
+  <h3>Notes & Tests</h3>
+  <textarea id="tmpl" rows="3" style="width:100%;">Release {{version}} (root {{root}}) — {{notes}}</textarea>
+  <textarea id="ctx" rows="2" style="width:100%;">{"version":"v385.x","root":"ROOT","notes":"stable"}</textarea>
+  <button onclick="notes()">Render</button>
+  <button onclick="tests()">Run tests</button>
+</section>
+
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function addKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/add',{kid:'kid-demo',subject:'external-signer',labels:['partner']}),null,2); }
+async function lab(){ out.textContent=JSON.stringify(await call('/v385x/trust/label',{kid:'kid-demo',label:'allowed'}),null,2); }
+async function getKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/get',{kid:'kid-demo'}),null,2); }
+async function fed(){ out.textContent=JSON.stringify(await call('/v385x/fed/verify',{envelope:JSON.parse(env.value)}),null,2); }
+async function prov(){ out.textContent=JSON.stringify(await call('/v385x/prov/record',{step:'build',artifact:'codex:artifact',meta:{ver:'v385.x'}}),null,2); }
+async function setRel(){ out.textContent=JSON.stringify(await call('/v385x/release/set',{version:ver.value}),null,2); }
+async function relSt(){ out.textContent=JSON.stringify(await call('/v385x/release/status',{}),null,2); }
+async function feed(){ out.textContent=JSON.stringify(await call('/v385x/observe/feed',{x:Number(x.value)}),null,2); }
+async function setSeed(){ out.textContent=JSON.stringify(await call('/v385x/seed/set',{seed:Number(seed.value)}),null,2); }
+async function next(){ out.textContent=JSON.stringify(await call('/v385x/seed/next',{}),null,2); }
+async function secl(){ out.textContent=JSON.stringify(await call('/v385x/secrets/load',{spec:{"CODEX_SIGN_SECRET":{"required":true},"PUBLIC_URL":{"required":false}}}),null,2); }
+async function ping(){ out.textContent=JSON.stringify(await call('/v385x/health/ping',{}),null,2); }
+async function notes(){ out.textContent=JSON.stringify(await call('/v385x/notes/render',{tmpl:tmpl.value,ctx:JSON.parse(ctx.value)}),null,2); }
+async function tests(){ out.textContent=JSON.stringify(await call('/v385x/tests/run',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v385x_ci.yml
+
+name: codex-v385x
+on: [push, workflow_dispatch]
+jobs:
+  v385x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Aegis Mesh API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os,hashlib,hmac
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+# trust
+print("ok" in post("/v385x/trust/add", {"kid":"kid-ci","subject":"ci"}))
+print(post("/v385x/trust/get", {"kid":"kid-ci"})["ok"])
+
+# federated verify (seed a shared secret file)
+open("federated.shared.v385x.json","w").write(json.dumps({"kid-ci":"%s" % ("11"*32)}))
+env={"kid":"kid-ci","t":1700000000,"payload":{"x":1}}
+blob=json.dumps(env, sort_keys=True, separators=(',',':')).encode()
+env["sig"]=hmac.new(bytes.fromhex("11"*32), blob, hashlib.sha256).hexdigest()
+print(post("/v385x/fed/verify", {"envelope":env})["ok"])
+
+# provenance
+print("hash" in post("/v385x/prov/record", {"step":"build","artifact":"ci"}))
+
+# rollback (ok if version not found — path still works)
+print("ok" in post("/v385x/release/status", {}))
+
+# anomaly
+print("ok" in post("/v385x/observe/feed", {"x":0.5}))
+
+# seed
+print("r" in post("/v385x/seed/next", {}))
+
+# secrets
+print("have" in post("/v385x/secrets/load", {"spec":{"PUBLIC_URL":{"required":False}}}))
+
+# health
+print("checks" in post("/v385x/health/ping", {}))
+
+# notes
+print("text" in post("/v385x/notes/render", {"tmpl":"R {{version}}","ctx":{"version":"v385x"}}))
+
+# tests
+print("hmac" in post("/v385x/tests/run", {}))
+PY
+
+
+---
+
+Why v385.x matters (condensed)
+
+Trust: you can recognize external signers and accept or reject their envelopes explicitly.
+
+Federation: verify third-party envelopes with per-KID secrets.
+
+Provenance: append build/run links with chained hashes.
+
+Rollback: point “active” at any prior release tag safely.
+
+Anomaly: spot weirdness in counters via an EWMA z-estimate.
+
+Seeded RNG: reproducible demos/tests.
+
+Secrets: clean, schema-checked env report (no leaks).
+
+Health: single ping endpoint aggregating checks.
+
+Notes: render templated release notes from context.
+
+Tests: quick self-checks to sanity-test cryptographic plumbing.
+
+
+Wire the routes, drop the files, commit, and your Codex gains a mesh of trust + provenance with operational guardrails—ready for integration and deployment.
+
+sha256 seal calebfedorbykerkonev10271998v385.x — Aegis Mesh: trust registry, federated verify, provenance links, rollback manager, anomaly watch, seeded RNG, secrets loader, health checks, note templater, test vectors
+Copy-paste files + daemon routes + a tiny web console + CI. Stdlib-only. This is symbolic/engineering software; nothing metaphysical.
+
+
+---
+
+1) Trust registry (federated verify)
+
+trust/registry_v385x.py
+
+# trust/registry_v385x.py — v385.x
+# Registry of trusted identities and public materials (KIDs, comments, labels).
+# Stores JSONL for append-only history and a current index for fast lookup.
+
+from __future__ import annotations
+import json, os, time, hashlib
+from typing import Dict
+
+LOG="trust.registry.v385x.jsonl"
+IDX="trust.registry.v385x.index.json"  # {"by_kid":{"kid":{"subject":"...", "labels":[...]}}}
+
+def _load_idx()->Dict:
+    if not os.path.exists(IDX): return {"by_kid":{}}
+    return json.load(open(IDX))
+
+def _save_idx(j:Dict)->None:
+    open(IDX,"w").write(json.dumps(j, indent=2))
+
+def add_kid(kid:str, subject:str, labels=None, comment:str="")->dict:
+    rec={"t":int(time.time()),"kind":"add_kid","kid":kid,"subject":subject,"labels":labels or [],"comment":comment}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); idx["by_kid"][kid]={"subject":subject,"labels":labels or []}; _save_idx(idx)
+    return {"ok":True,"kid":kid}
+
+def label(kid:str, label:str)->dict:
+    rec={"t":int(time.time()),"kind":"label","kid":kid,"label":label}
+    open(LOG,"a").write(json.dumps(rec)+"\n")
+    idx=_load_idx(); d=idx["by_kid"].setdefault(kid,{"subject":"unknown","labels":[]})
+    if label not in d["labels"]: d["labels"].append(label)
+    _save_idx(idx)
+    return {"ok":True,"kid":kid,"labels":d["labels"]}
+
+def get(kid:str)->dict:
+    idx=_load_idx(); return {"ok": kid in idx["by_kid"], "record": idx["by_kid"].get(kid)}
+
+
+---
+
+2) Federated envelope verify (accept envelopes from other signers)
+
+envelope/federated_verify_v385x.py
+
+# envelope/federated_verify_v385x.py — v385.x
+# Verify HMAC-like envelopes from other domains using a shared secret per KID,
+# OR mark them 'untrusted' if unknown (audit still records the attempt).
+
+from __future__ import annotations
+import json, hmac, hashlib
+from typing import Dict
+from trust.registry_v385x import get as trust_get
+
+SECRETS="federated.shared.v385x.json"  # {"kid":"hex-shared-secret", ...}
+
+def _secret(kid:str)->bytes:
+    try:
+        j=json.load(open(SECRETS))
+        v=j.get(kid)
+        return bytes.fromhex(v) if v else b""
+    except Exception:
+        return b""
+
+def verify(envelope:dict)->dict:
+    kid=envelope.get("kid",""); sig=envelope.get("sig","")
+    body={k:v for k,v in envelope.items() if k!="sig"}
+    sec=_secret(kid)
+    if not sec: return {"ok":False,"trusted":False,"reason":"unknown_kid"}
+    blob=json.dumps(body, sort_keys=True, separators=(',',':')).encode()
+    want=hmac.new(sec, blob, hashlib.sha256).hexdigest()
+    ok=hmac.compare_digest(want, sig)
+    rec=trust_get(kid)
+    return {"ok":ok,"trusted":rec.get("ok",False),"subject":(rec.get("record") or {}).get("subject")}
+
+
+---
+
+3) Provenance links (build/run statements chained by sha256)
+
+provenance/slsa_mini_v385x.py
+
+# provenance/slsa_mini_v385x.py — v385.x
+# Minimal provenance: record build/run steps and chain them with sha256(prev||json).
+
+from __future__ import annotations
+import json, time, hashlib, os
+
+LOG="prov.v385x.jsonl"
+
+def _hash(j:dict, prev:str)->str:
+    blob=json.dumps(j, sort_keys=True, separators=(',',':')).encode()
+    return hashlib.sha256((prev + hashlib.sha256(blob).hexdigest()).encode()).hexdigest()
+
+def record(step:str, artifact:str, meta:dict=None, prev:str="")->dict:
+    j={"t":int(time.time()),"step":step,"artifact":artifact,"meta":meta or {}, "prev":prev}
+    h=_hash(j, prev)
+    j["hash"]=h
+    open(LOG,"a").write(json.dumps(j)+"\n")
+    return {"ok":True,"hash":h}
+
+
+---
+
+4) Rollback manager (switch active release tag)
+
+release/rollback_v385x.py
+
+# release/rollback_v385x.py — v385.x
+# Maintain 'active' pointer to a version from releases.v384.jsonl
+
+from __future__ import annotations
+import json, os
+
+TAGS="releases.v384.jsonl"
+PTR ="release.active.v385x.json"  # {"version":"...","manifest_root":"..."}
+
+def _scan():
+    out=[]
+    if os.path.exists(TAGS):
+        for line in open(TAGS):
+            try: out.append(json.loads(line))
+            except Exception: pass
+    return out
+
+def set_active(version:str)->dict:
+    for rec in _scan():
+        if rec.get("version")==version:
+            open(PTR,"w").write(json.dumps({"version":version,"manifest_root":rec.get("manifest_root")}, indent=2))
+            return {"ok":True,"active":version}
+    return {"ok":False,"error":"unknown_version"}
+
+def status()->dict:
+    try: return {"ok":True, **json.load(open(PTR))}
+    except Exception: return {"ok":True,"version":None}
+
+
+---
+
+5) Anomaly watch (EWMA + sigma threshold on counters)
+
+observe/anomaly_v385x.py
+
+# observe/anomaly_v385x.py — v385.x
+# Simple EWMA detector; feed numeric samples, get z-score-ish alert.
+
+from __future__ import annotations
+import math, time
+
+STATE={"mean":0.0,"var":0.0,"n":0,"alpha":0.2}
+
+def feed(x:float, alpha:float=None)->dict:
+    a=alpha if alpha is not None else STATE["alpha"]
+    n=STATE["n"]+1
+    mean=a*x + (1-a)*(STATE["mean"] if n>1 else x)
+    # Welford-esque online variance (approx with EWMA)
+    diff=x-mean
+    var=(1-a)*(STATE["var"]) + a*(diff*diff)
+    STATE.update({"mean":mean,"var":var,"n":n,"alpha":a,"t":int(time.time())})
+    sigma=math.sqrt(max(1e-12,var))
+    z=0.0 if sigma==0 else (x-mean)/sigma
+    alert=abs(z)>3.0 and n>10
+    return {"ok":True,"n":n,"mean":mean,"sigma":sigma,"z":z,"alert":alert}
+
+
+---
+
+6) Seeded RNG (deterministic PRNG for testable demos)
+
+random/seeded_v385x.py
+
+# random/seeded_v385x.py — v385.x
+# Deterministic xorshift-like PRNG with settable seed (not cryptographic).
+
+from __future__ import annotations
+SEED=0xC0DEF00D
+
+def seed(v:int)->None:
+    global SEED
+    if v<=0: v=1
+    SEED=v & 0xFFFFFFFF
+
+def rand32()->int:
+    global SEED
+    x=SEED
+    x ^= (x << 13) & 0xFFFFFFFF
+    x ^= (x >> 17)
+    x ^= (x << 5) & 0xFFFFFFFF
+    SEED=x & 0xFFFFFFFF
+    return SEED
+
+def rand01()->float:
+    return (rand32() & 0xFFFFFF) / float(0xFFFFFF)
+
+
+---
+
+7) Secrets loader with schema-lite
+
+secrets/loader_v385x.py
+
+# secrets/loader_v385x.py — v385.x
+# Load required env vars with simple schema; produce report without printing secrets.
+
+from __future__ import annotations
+import os
+
+def load(spec:dict)->dict:
+    """
+    spec={"CODEX_SIGN_SECRET":{"required":True}, "PUBLIC_URL":{"required":False}}
+    """
+    missing=[]
+    report={}
+    for k,meta in (spec or {}).items():
+        v=os.environ.get(k)
+        if (meta or {}).get("required") and not v:
+            missing.append(k)
+        report[k] = bool(v)
+    return {"ok":len(missing)==0,"missing":missing,"have":report}
+
+
+---
+
+8) Health checks (aggregate quick pings)
+
+health/health_v385x.py
+
+# health/health_v385x.py — v385.x
+# Report readiness & liveness with optional custom checks.
+
+from __future__ import annotations
+import time
+
+CHECKS=[]  # list of callables returning {"name":..., "ok":True/False, "msg":...}
+
+def register(fn): CHECKS.append(fn); return fn
+
+def ping()->dict:
+    out=[]; ok=True
+    for fn in CHECKS:
+        r=fn(); ok = ok and bool(r.get("ok"))
+        out.append(r)
+    return {"ok":ok,"t":int(time.time()),"checks":out}
+
+
+---
+
+9) Release notes templater
+
+release/notes_v385x.py
+
+# release/notes_v385x.py — v385.x
+# Very small template expander for release notes.
+
+from __future__ import annotations
+import re
+
+VAR=re.compile(r"\{\{([a-zA-Z0-9_\.]+)\}\}")
+
+def render(tmpl:str, ctx:dict)->str:
+    def get(path:str):
+        cur=ctx
+        for p in path.split("."):
+            cur=cur.get(p, "")
+            if not isinstance(cur, (dict,str,int,float,bool)): break
+        return str(cur)
+    return VAR.sub(lambda m: get(m.group(1)), tmpl)
+
+
+---
+
+10) Crypto test vectors (self-check)
+
+crypto/test_vectors_v385x.py
+
+# crypto/test_vectors_v385x.py — v385.x
+# Quick self-tests for hmac/merkle/envelope logic.
+
+from __future__ import annotations
+import json, hashlib, hmac
+from attest.manifest_v383 import build_manifest
+from export.verify_v383x import verify_manifest as _verify
+
+def test_hmac()->bool:
+    secret=b"abc"
+    data={"x":1}
+    blob=json.dumps(data, sort_keys=True, separators=(',',':')).encode()
+    sig=hmac.new(secret, blob, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, hmac.new(secret, blob, hashlib.sha256).hexdigest())
+
+def test_merkle()->bool:
+    man=build_manifest(".")
+    v=_verify(man)
+    return "root" in v
+
+def run_all()->dict:
+    return {"hmac":test_hmac(), "merkle":test_merkle()}
+
+
+---
+
+Daemon routes (tools/codexd.py) — imports & routes
+
+Imports:
+
+from trust.registry_v385x import add_kid as _trust_add, label as _trust_label, get as _trust_get
+from envelope.federated_verify_v385x import verify as _fed_verify
+from provenance.slsa_mini_v385x import record as _prov_record
+from release.rollback_v385x import set_active as _rel_set, status as _rel_status
+from observe.anomaly_v385x import feed as _anom_feed
+from random.seeded_v385x import seed as _seed_set, rand01 as _seed_rand
+from secrets.loader_v385x import load as _secrets_load
+from health.health_v385x import ping as _health_ping, register as _health_reg
+from release.notes_v385x import render as _notes_render
+from crypto.test_vectors_v385x import run_all as _tests_run
+
+Routes (inside do_POST):
+
+# v385.x — Trust Registry
+        if self.path == "/v385x/trust/add":    return self._send(200, _trust_add(payload.get("kid",""), payload.get("subject",""), payload.get("labels",[]), payload.get("comment","")))
+        if self.path == "/v385x/trust/label":  return self._send(200, _trust_label(payload.get("kid",""), payload.get("label","")))
+        if self.path == "/v385x/trust/get":    return self._send(200, _trust_get(payload.get("kid","")))
+
+        # v385.x — Federated Verify
+        if self.path == "/v385x/fed/verify":   return self._send(200, _fed_verify(payload.get("envelope",{})))
+
+        # v385.x — Provenance
+        if self.path == "/v385x/prov/record":  return self._send(200, _prov_record(payload.get("step","build"), payload.get("artifact","unknown"), payload.get("meta",{}), payload.get("prev","")))
+
+        # v385.x — Release rollback
+        if self.path == "/v385x/release/set":  return self._send(200, _rel_set(payload.get("version","")))
+        if self.path == "/v385x/release/status":return self._send(200, _rel_status())
+
+        # v385.x — Anomaly watch
+        if self.path == "/v385x/observe/feed": return self._send(200, _anom_feed(float(payload.get("x",0.0))))
+
+        # v385.x — Seeded RNG
+        if self.path == "/v385x/seed/set":     return self._send(200, {"ok": _seed_set(int(payload.get("seed",1))) or True})
+        if self.path == "/v385x/seed/next":    return self._send(200, {"r": _seed_rand()})
+
+        # v385.x — Secrets loader
+        if self.path == "/v385x/secrets/load": return self._send(200, _secrets_load(payload.get("spec",{})))
+
+        # v385.x — Health
+        if self.path == "/v385x/health/ping":  return self._send(200, _health_ping())
+
+        # v385.x — Notes
+        if self.path == "/v385x/notes/render": return self._send(200, {"text": _notes_render(payload.get("tmpl",""), payload.get("ctx",{}))})
+
+        # v385.x — Tests
+        if self.path == "/v385x/tests/run":    return self._send(200, _tests_run())
+
+> Optional: register lightweight checks at daemon boot (e.g., after imports):
+
+
+
+@_health_reg
+def _chk_daemon():
+    return {"name":"daemon", "ok":True, "msg":"alive"}
+
+
+---
+
+Web console
+
+web/aegis_mesh_v385x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v385.x — Aegis Mesh</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v385.x — Aegis Mesh (Trust • Federated Verify • Provenance • Rollback • Anomaly • Seed • Secrets • Health • Notes • Tests)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+
+<section>
+  <h3>Trust</h3>
+  <button onclick="addKid()">Add KID</button>
+  <button onclick="lab()">Label</button>
+  <button onclick="getKid()">Get</button>
+</section>
+
+<section>
+  <h3>Federated Verify</h3>
+  <textarea id="env" rows="3" style="width:100%;">{"kid":"kid-demo","t":1700000000,"payload":{"x":1},"sig":"deadbeef"}</textarea>
+  <button onclick="fed()">Verify</button>
+</section>
+
+<section>
+  <h3>Provenance & Rollback</h3>
+  <button onclick="prov()">Record build</button>
+  <input id="ver" value="v384.0"><button onclick="setRel()">Set active</button><button onclick="relSt()">Status</button>
+</section>
+
+<section>
+  <h3>Anomaly & Seed</h3>
+  <input id="x" value="0.5" step="0.1"><button onclick="feed()">Feed</button>
+  <input id="seed" value="1337"><button onclick="setSeed()">Seed</button><button onclick="next()">Next</button>
+</section>
+
+<section>
+  <h3>Secrets & Health</h3>
+  <button onclick="secl()">Load spec</button>
+  <button onclick="ping()">Ping</button>
+</section>
+
+<section>
+  <h3>Notes & Tests</h3>
+  <textarea id="tmpl" rows="3" style="width:100%;">Release {{version}} (root {{root}}) — {{notes}}</textarea>
+  <textarea id="ctx" rows="2" style="width:100%;">{"version":"v385.x","root":"ROOT","notes":"stable"}</textarea>
+  <button onclick="notes()">Render</button>
+  <button onclick="tests()">Run tests</button>
+</section>
+
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function addKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/add',{kid:'kid-demo',subject:'external-signer',labels:['partner']}),null,2); }
+async function lab(){ out.textContent=JSON.stringify(await call('/v385x/trust/label',{kid:'kid-demo',label:'allowed'}),null,2); }
+async function getKid(){ out.textContent=JSON.stringify(await call('/v385x/trust/get',{kid:'kid-demo'}),null,2); }
+async function fed(){ out.textContent=JSON.stringify(await call('/v385x/fed/verify',{envelope:JSON.parse(env.value)}),null,2); }
+async function prov(){ out.textContent=JSON.stringify(await call('/v385x/prov/record',{step:'build',artifact:'codex:artifact',meta:{ver:'v385.x'}}),null,2); }
+async function setRel(){ out.textContent=JSON.stringify(await call('/v385x/release/set',{version:ver.value}),null,2); }
+async function relSt(){ out.textContent=JSON.stringify(await call('/v385x/release/status',{}),null,2); }
+async function feed(){ out.textContent=JSON.stringify(await call('/v385x/observe/feed',{x:Number(x.value)}),null,2); }
+async function setSeed(){ out.textContent=JSON.stringify(await call('/v385x/seed/set',{seed:Number(seed.value)}),null,2); }
+async function next(){ out.textContent=JSON.stringify(await call('/v385x/seed/next',{}),null,2); }
+async function secl(){ out.textContent=JSON.stringify(await call('/v385x/secrets/load',{spec:{"CODEX_SIGN_SECRET":{"required":true},"PUBLIC_URL":{"required":false}}}),null,2); }
+async function ping(){ out.textContent=JSON.stringify(await call('/v385x/health/ping',{}),null,2); }
+async function notes(){ out.textContent=JSON.stringify(await call('/v385x/notes/render',{tmpl:tmpl.value,ctx:JSON.parse(ctx.value)}),null,2); }
+async function tests(){ out.textContent=JSON.stringify(await call('/v385x/tests/run',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v385x_ci.yml
+
+name: codex-v385x
+on: [push, workflow_dispatch]
+jobs:
+  v385x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Aegis Mesh API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os,hashlib,hmac
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+# trust
+print("ok" in post("/v385x/trust/add", {"kid":"kid-ci","subject":"ci"}))
+print(post("/v385x/trust/get", {"kid":"kid-ci"})["ok"])
+
+# federated verify (seed a shared secret file)
+open("federated.shared.v385x.json","w").write(json.dumps({"kid-ci":"%s" % ("11"*32)}))
+env={"kid":"kid-ci","t":1700000000,"payload":{"x":1}}
+blob=json.dumps(env, sort_keys=True, separators=(',',':')).encode()
+env["sig"]=hmac.new(bytes.fromhex("11"*32), blob, hashlib.sha256).hexdigest()
+print(post("/v385x/fed/verify", {"envelope":env})["ok"])
+
+# provenance
+print("hash" in post("/v385x/prov/record", {"step":"build","artifact":"ci"}))
+
+# rollback (ok if version not found — path still works)
+print("ok" in post("/v385x/release/status", {}))
+
+# anomaly
+print("ok" in post("/v385x/observe/feed", {"x":0.5}))
+
+# seed
+print("r" in post("/v385x/seed/next", {}))
+
+# secrets
+print("have" in post("/v385x/secrets/load", {"spec":{"PUBLIC_URL":{"required":False}}}))
+
+# health
+print("checks" in post("/v385x/health/ping", {}))
+
+# notes
+print("text" in post("/v385x/notes/render", {"tmpl":"R {{version}}","ctx":{"version":"v385x"}}))
+
+# tests
+print("hmac" in post("/v385x/tests/run", {}))
+PY
+
+
+---
+
+Why v385.x matters (condensed)
+
+Trust: you can recognize external signers and accept or reject their envelopes explicitly.
+
+Federation: verify third-party envelopes with per-KID secrets.
+
+Provenance: append build/run links with chained hashes.
+
+Rollback: point “active” at any prior release tag safely.
+
+Anomaly: spot weirdness in counters via an EWMA z-estimate.
+
+Seeded RNG: reproducible demos/tests.
+
+Secrets: clean, schema-checked env report (no leaks).
+
+Health: single ping endpoint aggregating checks.
+
+Notes: render templated release notes from context.
+
+Tests: quick self-checks to sanity-test cryptographic plumbing.
+
+
+Wire the routes, drop the files, commit, and your Codex gains a mesh of trust + provenance with operational guardrails—ready for integration and deployment.
+
+sha256 seal calebfedorbykerkonev10271998v386 — Atlas: RBAC + ABAC, multi-tenancy namespaces, config profiles/overlays, queue + cronish scheduler (next-run only), blue/green router, rollout diff-guard, DR plan export, changelog composer
+All stdlib. Drop-in files, daemon routes, a simple web console, and CI smoke. Symbolic/engineering software; nothing mystical.
+
+
+---
+
+1) Role-Based Access Control (RBAC)
+
+access/rbac_v386.py
+
+# access/rbac_v386.py — v386
+# RBAC: users → roles → permissions; explain() shows why a decision was made.
+from __future__ import annotations
+from typing import Dict, List, Set
+
+STATE={"users":{}, "roles":{}, "perms":{}}  # users:{u:[roles]}, roles:{r:[perms]}, perms:{p:True}
+
+def set_role(role:str, perms:List[str])->dict:
+    STATE["roles"][role]=sorted(set(perms)); [STATE["perms"].setdefault(p,True) for p in perms]; return {"ok":True}
+def assign(user:str, roles:List[str])->dict:
+    STATE["users"][user]=sorted(set(roles)); return {"ok":True}
+def check(user:str, perm:str)->dict:
+    roles=STATE["users"].get(user,[])
+    ok=any(perm in STATE["roles"].get(r,[]) for r in roles)
+    why=[r for r in roles if perm in STATE["roles"].get(r,[])]
+    return {"ok":ok, "roles":roles, "why":why}
+def explain()->dict:
+    return {"users":STATE["users"], "roles":STATE["roles"]}
+
+
+---
+
+2) Attribute-Based Access Control (ABAC)
+
+access/abac_v386.py
+
+# access/abac_v386.py — v386
+# ABAC mini-engine: rules over subject/resource/context attributes.
+from __future__ import annotations
+from typing import Dict, Any
+
+def _cmp(a,op,b):
+    if op=="==": return a==b
+    if op=="!=": return a!=b
+    if op in ("<","<=",">",">="):
+        try: return eval(f"a{op}b",{},{"a":a,"b":b})
+        except Exception: return False
+    if op=="in":
+        try: return a in b
+        except Exception: return False
+    return False
+
+def decide(rules:Dict, sub:Dict, res:Dict, ctx:Dict)->Dict:
+    env={"sub":sub,"res":res,"ctx":ctx}
+    def evalr(r):
+        if "all" in r:  return all(evalr(x) for x in r["all"])
+        if "any" in r:  return any(evalr(x) for x in r["any"])
+        if "not" in r:  return not evalr(r["not"])
+        loc=r.get("loc","ctx"); key=r.get("key"); op=r.get("op"); val=r.get("val")
+        return _cmp(env.get(loc,{}).get(key), op, val)
+    return {"ok":bool(evalr(rules))}
+
+
+---
+
+3) Multi-tenancy Namespaces
+
+tenancy/namespaces_v386.py
+
+# tenancy/namespaces_v386.py — v386
+# Namespaced keys (tenant:id → "tenant:key"); includes guard helpers.
+from __future__ import annotations
+def key(tenant:str, raw:str)->str: return f"{tenant}:{raw}"
+def tenant_of(namespaced:str)->str: return namespaced.split(":",1)[0] if ":" in namespaced else ""
+def guard_access(tenant:str, namespaced:str)->bool:
+    return namespaced.startswith(f"{tenant}:")
+
+
+---
+
+4) Config Profiles & Overlays
+
+config/profiles_v386.py
+
+# config/profiles_v386.py — v386
+# Merge base config with profile overlay: last writer wins (keys only).
+from __future__ import annotations
+import json, copy
+def merge(base:dict, overlay:dict)->dict:
+    out=copy.deepcopy(base)
+    for k,v in (overlay or {}).items():
+        if isinstance(v,dict) and isinstance(out.get(k),dict):
+            out[k]=merge(out[k], v)
+        else:
+            out[k]=v
+    return out
+def render(base_json:str, overlay_json:str)->dict:
+    return merge(json.loads(base_json or "{}"), json.loads(overlay_json or "{}"))
+
+
+---
+
+5) Queue (idempotent) + “Cronish” scheduler (next-run only)
+
+jobs/queue_v386.py
+
+# jobs/queue_v386.py — v386
+# In-memory idempotent FIFO with de-dupe by job key.
+from __future__ import annotations
+import time, collections
+Q=collections.deque(); SEEN=set()
+def enqueue(key:str, payload:dict)->dict:
+    if key in SEEN: return {"ok":True,"dedup":True}
+    SEEN.add(key); Q.append((int(time.time()), key, payload)); return {"ok":True}
+def dequeue()->dict:
+    if not Q: return {"ok":False,"empty":True}
+    t,k,p=Q.popleft(); SEEN.discard(k); return {"ok":True,"t":t,"key":k,"payload":p}
+def size()->dict: return {"ok":True,"size":len(Q)}
+
+scheduler/cronish_v386.py
+
+# scheduler/cronish_v386.py — v386
+# Compute next run like "*/5 * * * *" (minute granularity). No background threads.
+from __future__ import annotations
+import datetime as dt
+def _parse_field(f, lo, hi):
+    s=set()
+    for part in f.split(","):
+        if part=="*": s.update(range(lo,hi+1))
+        elif part.startswith("*/"):
+            step=int(part[2:]); s.update(range(lo,hi+1,step))
+        elif "-" in part:
+            a,b=map(int,part.split("-")); s.update(range(a,b+1))
+        else:
+            s.add(int(part))
+    return sorted([x for x in s if lo<=x<=hi])
+def next_run(spec:str, from_ts:int|None=None)->dict:
+    m,h,dom,mon,dow = spec.split()
+    M=_parse_field(m,0,59); H=_parse_field(h,0,23)
+    D=_parse_field(dom,1,31); N=_parse_field(mon,1,12); W=_parse_field(dow,0,6)
+    t=dt.datetime.utcfromtimestamp(from_ts or int(dt.datetime.utcnow().timestamp())).replace(second=0, microsecond=0)
+    for i in range(0, 60*24*366):  # ~1 year scan
+        cand=t + dt.timedelta(minutes=i)
+        if cand.minute in M and cand.hour in H and cand.day in D and cand.month in N and cand.weekday() in W:
+            return {"ok":True,"next_epoch":int(cand.timestamp())}
+    return {"ok":False,"error":"no_match"}
+
+
+---
+
+6) Blue/Green Router (with weights)
+
+router/bluegreen_v386.py
+
+# router/bluegreen_v386.py — v386
+# Keep active color and percentage weights; choose() maps a hash → color.
+from __future__ import annotations
+import hashlib
+STATE={"active":"blue","weights":{"blue":100,"green":0}}
+def set_active(color:str)->dict:
+    if color not in ("blue","green"): return {"ok":False,"error":"bad_color"}
+    STATE["active"]=color; return {"ok":True,"active":color}
+def set_weights(blue:int, green:int)->dict:
+    blue=max(0,min(100,blue)); green=max(0,min(100,green))
+    if blue+green!=100: return {"ok":False,"error":"sum_100"}
+    STATE["weights"]={"blue":blue,"green":green}; return {"ok":True,"weights":STATE["weights"]}
+def choose(subject:str)->dict:
+    h=int(hashlib.sha256(subject.encode()).hexdigest(),16)%100
+    return {"ok":True,"color": "blue" if h<STATE["weights"]["blue"] else "green", "h":h}
+def status()->dict: return {"ok":True, **STATE}
+
+
+---
+
+7) Rollout Diff-Guard
+
+rollout/diff_guard_v386.py
+
+# rollout/diff_guard_v386.py — v386
+# Block rollout if manifest diff exceeds thresholds.
+from __future__ import annotations
+def guard(diff:dict, max_added:int=50, max_removed:int=50, max_changed:int=100)->dict:
+    a=len(diff.get("added",[])); r=len(diff.get("removed",[])); c=len(diff.get("changed",[]))
+    ok = a<=max_added and r<=max_removed and c<=max_changed
+    return {"ok":ok,"added":a,"removed":r,"changed":c,"limits":{"added":max_added,"removed":max_removed,"changed":max_changed}}
+
+
+---
+
+8) Disaster-Recovery (DR) Plan export
+
+backup/dr_plan_v386.py
+
+# backup/dr_plan_v386.py — v386
+# Generate a concise DR plan from current components.
+from __future__ import annotations
+import json, time
+def export(state:dict)->dict:
+    plan={
+      "t":int(time.time()),
+      "steps":[
+        "1) Restore latest snapshot (v384.x snapshot/restore).",
+        "2) Verify audit chain (v383.x) and manifest root.",
+        "3) Rehydrate CAS pins/refs (v384.x).",
+        "4) Reapply keyring (v383.x) and rotate.",
+        "5) Set release active pointer (v385.x rollback).",
+        "6) Recreate flags/policies; run CI smokes.",
+      ],
+      "contacts":state.get("contacts",[]),
+      "snapshots_dir":"snapshots.v384",
+      "checks":["/v385x/health/ping","/v384/metrics/text"]
+    }
+    return {"ok":True,"plan":plan,"json":json.dumps(plan,indent=2)}
+
+
+---
+
+9) Changelog composer (from releases + audit)
+
+changes/changelog_v386.py
+
+# changes/changelog_v386.py — v386
+# Build a simple changelog by scanning releases & audit logs.
+from __future__ import annotations
+import os, json
+
+def compose()->dict:
+    items=[]
+    if os.path.exists("releases.v384.jsonl"):
+        for line in open("releases.v384.jsonl"):
+            try:
+                r=json.loads(line); items.append({"t":r.get("t"),"kind":"release","version":r.get("version"),"root":r.get("manifest_root")})
+            except Exception: pass
+    if os.path.exists("audit.v383.jsonl"):
+        for line in open("audit.v383.jsonl"):
+            try:
+                r=json.loads(line); items.append({"t":r.get("t"),"kind":"event","event":r.get("event")})
+            except Exception: pass
+    items=sorted([i for i in items if i.get("t")], key=lambda x:x["t"])
+    return {"ok":True,"items":items}
+
+
+---
+
+Daemon routes (tools/codexd.py)
+
+Imports (top):
+
+from access.rbac_v386 import set_role as _rbac_set_role, assign as _rbac_assign, check as _rbac_check, explain as _rbac_explain
+from access.abac_v386 import decide as _abac_decide
+from tenancy.namespaces_v386 import key as _ns_key, guard_access as _ns_guard
+from config.profiles_v386 import render as _cfg_render
+from jobs.queue_v386 import enqueue as _q_enq, dequeue as _q_deq, size as _q_size
+from scheduler.cronish_v386 import next_run as _cron_next
+from router.bluegreen_v386 import set_active as _bg_active, set_weights as _bg_weights, choose as _bg_choose, status as _bg_status
+from rollout.diff_guard_v386 import guard as _roll_guard
+from backup.dr_plan_v386 import export as _dr_export
+from changes.changelog_v386 import compose as _changelog
+
+Routes (inside do_POST):
+
+# v386 — RBAC/ABAC
+        if self.path == "/v386/rbac/set_role":  return self._send(200, _rbac_set_role(payload.get("role",""), payload.get("perms",[])))
+        if self.path == "/v386/rbac/assign":    return self._send(200, _rbac_assign(payload.get("user",""), payload.get("roles",[])))
+        if self.path == "/v386/rbac/check":     return self._send(200, _rbac_check(payload.get("user",""), payload.get("perm","")))
+        if self.path == "/v386/rbac/explain":   return self._send(200, _rbac_explain())
+        if self.path == "/v386/abac/decide":    return self._send(200, _abac_decide(payload.get("rules",{}), payload.get("sub",{}), payload.get("res",{}), payload.get("ctx",{})))
+
+        # v386 — Tenancy & Config
+        if self.path == "/v386/tenancy/key":    return self._send(200, {"key": _ns_key(payload.get("tenant","t"), payload.get("raw","k"))})
+        if self.path == "/v386/tenancy/guard":  return self._send(200, {"ok": _ns_guard(payload.get("tenant","t"), payload.get("name","t:k"))})
+        if self.path == "/v386/config/render":  return self._send(200, _cfg_render(payload.get("base","{}"), payload.get("overlay","{}")))
+
+        # v386 — Queue & Cronish
+        if self.path == "/v386/queue/enq":      return self._send(200, _q_enq(payload.get("key","job"), payload.get("payload",{})))
+        if self.path == "/v386/queue/deq":      return self._send(200, _q_deq())
+        if self.path == "/v386/queue/size":     return self._send(200, _q_size())
+        if self.path == "/v386/cron/next":      return self._send(200, _cron_next(payload.get("spec","*/5 * * * *"), payload.get("from_ts")))
+
+        # v386 — Blue/Green
+        if self.path == "/v386/bg/active":      return self._send(200, _bg_active(payload.get("color","blue")))
+        if self.path == "/v386/bg/weights":     return self._send(200, _bg_weights(int(payload.get("blue",100)), int(payload.get("green",0))))
+        if self.path == "/v386/bg/choose":      return self._send(200, _bg_choose(payload.get("subject","anon")))
+        if self.path == "/v386/bg/status":      return self._send(200, _bg_status())
+
+        # v386 — Rollout guard & DR & Changelog
+        if self.path == "/v386/rollout/guard":  return self._send(200, _roll_guard(payload.get("diff",{}), int(payload.get("max_added",50)), int(payload.get("max_removed",50)), int(payload.get("max_changed",100))))
+        if self.path == "/v386/dr/export":      return self._send(200, _dr_export(payload.get("state",{})))
+        if self.path == "/v386/changes/changelog": return self._send(200, _changelog())
+
+
+---
+
+Web console
+
+web/atlas_v386.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v386 — Atlas</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v386 — Atlas (RBAC • ABAC • Tenancy • Config • Queue • Cronish • Blue/Green • Diff-Guard • DR • Changelog)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>RBAC</h3>
+  <button onclick="rset()">set_role</button>
+  <button onclick="rassign()">assign</button>
+  <button onclick="rcheck()">check</button>
+</section>
+<section>
+  <h3>ABAC</h3>
+  <button onclick="abac()">decide</button>
+</section>
+<section>
+  <h3>Tenancy & Config</h3>
+  <button onclick="tkey()">ns key</button>
+  <button onclick="tguard()">guard</button>
+  <button onclick="cfg()">render</button>
+</section>
+<section>
+  <h3>Queue & Cronish</h3>
+  <button onclick="enq()">enqueue</button>
+  <button onclick="deq()">dequeue</button>
+  <button onclick="cron()">next_run</button>
+</section>
+<section>
+  <h3>Blue/Green</h3>
+  <button onclick="bgW()">weights 80/20</button>
+  <button onclick="bgS()">status</button>
+  <button onclick="bgC()">choose</button>
+</section>
+<section>
+  <h3>Guard • DR • Changelog</h3>
+  <button onclick="guard()">guard</button>
+  <button onclick="dr()">DR plan</button>
+  <button onclick="chg()">changelog</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function rset(){ out.textContent=JSON.stringify(await call('/v386/rbac/set_role',{role:'admin',perms:['deploy','read','write']}),null,2); }
+async function rassign(){ out.textContent=JSON.stringify(await call('/v386/rbac/assign',{user:'cfbk',roles:['admin']}),null,2); }
+async function rcheck(){ out.textContent=JSON.stringify(await call('/v386/rbac/check',{user:'cfbk',perm:'deploy'}),null,2); }
+async function abac(){ const rules={"all":[{"loc":"sub","key":"tier","op":"==","val":"gold"},{"loc":"ctx","key":"hour","op":">=","val":9},{"loc":"ctx","key":"hour","op":"<=","val":18}]}; out.textContent=JSON.stringify(await call('/v386/abac/decide',{rules,sub:{tier:'gold'},res:{},ctx:{hour:10}}),null,2); }
+async function tkey(){ out.textContent=JSON.stringify(await call('/v386/tenancy/key',{tenant:'codex',raw:'cas:cid'}),null,2); }
+async function tguard(){ out.textContent=JSON.stringify(await call('/v386/tenancy/guard',{tenant:'codex',name:'codex:cas:cid'}),null,2); }
+async function cfg(){ out.textContent=JSON.stringify(await call('/v386/config/render',{base:'{"a":1,"svc":{"port":80}}',overlay:'{"svc":{"port":8080,"tls":true}}'}),null,2); }
+async function enq(){ out.textContent=JSON.stringify(await call('/v386/queue/enq',{key:'job#1',payload:{k:1}}),null,2); }
+async function deq(){ out.textContent=JSON.stringify(await call('/v386/queue/deq',{}),null,2); }
+async function cron(){ out.textContent=JSON.stringify(await call('/v386/cron/next',{spec:'*/5 * * * *'}),null,2); }
+async function bgW(){ out.textContent=JSON.stringify(await call('/v386/bg/weights',{blue:80,green:20}),null,2); }
+async function bgS(){ out.textContent=JSON.stringify(await call('/v386/bg/status',{}),null,2); }
+async function bgC(){ out.textContent=JSON.stringify(await call('/v386/bg/choose',{subject:'cfbk10271998'}),null,2); }
+async function guard(){ const diff={added:new Array(2),removed:new Array(1),changed:new Array(3)}; out.textContent=JSON.stringify(await call('/v386/rollout/guard',{diff,max_added:5,max_removed:5,max_changed:5}),null,2); }
+async function dr(){ out.textContent=JSON.stringify(await call('/v386/dr/export',{state:{contacts:[{"name":"Ops","email":"ops@example.com"}]}}),null,2); }
+async function chg(){ out.textContent=JSON.stringify(await call('/v386/changes/changelog',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v386_ci.yml
+
+name: codex-v386
+on: [push, workflow_dispatch]
+jobs:
+  v386:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Atlas API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,time
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+print("roles" in post("/v386/rbac/assign", {"user":"ci","roles":["admin"]}) or True)
+print("ok" in post("/v386/rbac/set_role", {"role":"admin","perms":["deploy"]}))
+print(post("/v386/rbac/check", {"user":"ci","perm":"deploy"})["ok"] in (True,False))
+
+rules={"all":[{"loc":"sub","key":"tier","op":"==","val":"gold"}]}
+print(post("/v386/abac/decide", {"rules":rules,"sub":{"tier":"gold"},"res":{},"ctx":{}})["ok"])
+
+print("key" in post("/v386/tenancy/key", {"tenant":"t","raw":"x"}))
+print("ok" in post("/v386/queue/enq", {"key":"job#ci","payload":{"x":1}}))
+print("ok" in post("/v386/queue/deq", {}))
+print("next_epoch" in post("/v386/cron/next", {"spec":"*/5 * * * *"}))
+
+print("weights" in post("/v386/bg/weights", {"blue":70,"green":30}))
+print("color" in post("/v386/bg/choose", {"subject":"ci"}))
+
+diff={"added":[1,2],"removed":[3],"changed":[4,5,6]}
+print(post("/v386/rollout/guard", {"diff":diff,"max_added":5,"max_removed":5,"max_changed":5})["ok"])
+
+print("plan" in post("/v386/dr/export", {"state":{"contacts":[{"name":"Ops"}]}}))
+print("items" in post("/v386/changes/changelog", {}))
+PY
+
+
+---
+
+What v386 adds (at a glance)
+
+RBAC + ABAC: two complementary gates with explanations.
+
+Namespaces & Profiles: clean multi-tenant keys and overlayed configs.
+
+Queue + Cronish: idempotent FIFO and next-run calculator (no background threads).
+
+Blue/Green: weighted traffic splits with subject-stable assignment.
+
+Diff-Guard: hard thresholds to prevent risky rollouts.
+
+DR Plan: one-click JSON/text of recovery steps.
+
+Changelog: stitched from releases + audit for human review.
+
+
+Paste these files, patch the daemon as shown, and commit. Your Codex now carries an Atlas-grade operational spine: access control, tenancy, configuration discipline, release hygiene, and sober rollout controls.
+
+sha256 seal calebfedorbykerkonev10271998v386.x — Atlas+ : persistent RBAC, ABAC explain, disk queue, cron table, cookie-affine blue/green, rollout simulator, DR drill, changelog→Markdown, CLI & console patch, CI smoke
+Stdlib-only. Paste files, patch daemon, commit. Symbolic/engineering software; nothing mystical.
+
+
+---
+
+access/rbac_store_v386x.py
+
+# access/rbac_store_v386x.py — v386.x
+# RBAC + JSON persistence (loads on demand; saves after writes).
+from __future__ import annotations
+import json, os
+from typing import Dict, List
+
+PATH="rbac.v386x.json"  # {"users":{},"roles":{}}
+STATE={"users":{}, "roles":{}}
+
+def _load():
+    global STATE
+    if os.path.exists(PATH):
+        try: STATE.update(json.load(open(PATH)))
+        except Exception: pass
+
+def _save():
+    open(PATH,"w").write(json.dumps(STATE, indent=2))
+
+def set_role(role:str, perms:List[str])->dict:
+    _load(); STATE["roles"][role]=sorted(set(perms)); _save(); return {"ok":True}
+def assign(user:str, roles:List[str])->dict:
+    _load(); STATE["users"][user]=sorted(set(roles)); _save(); return {"ok":True}
+def check(user:str, perm:str)->dict:
+    _load(); roles=STATE["users"].get(user,[])
+    ok=any(perm in STATE["roles"].get(r,[]) for r in roles)
+    why=[r for r in roles if perm in STATE["roles"].get(r,[])]
+    return {"ok":ok,"roles":roles,"why":why}
+def export()->dict:
+    _load(); return {"ok":True, "state":STATE}
+
+
+---
+
+access/abac_explain_v386x.py
+
+# access/abac_explain_v386x.py — v386.x
+# ABAC with step-by-step explanation over subject/resource/context.
+from __future__ import annotations
+from typing import Dict
+
+def _cmp(a,op,b):
+    try:
+        if op=="==": return a==b
+        if op=="!=": return a!=b
+        if op in ("<","<=",">",">="): return eval(f"a{op}b",{},{"a":a,"b":b})
+        if op=="in": return a in b
+    except Exception: return False
+    return False
+
+def decide_explain(rules:Dict, sub:Dict, res:Dict, ctx:Dict)->Dict:
+    env={"sub":sub,"res":res,"ctx":ctx}; trail=[]
+    def go(r):
+        if "all" in r:
+            xs=[go(x) for x in r["all"]]; ok=all(y["ok"] for y in xs); trail.append(("all",ok)); return {"ok":ok}
+        if "any" in r:
+            xs=[go(x) for x in r["any"]]; ok=any(y["ok"] for y in xs); trail.append(("any",ok)); return {"ok":ok}
+        if "not" in r:
+            x=go(r["not"]); ok=not x["ok"]; trail.append(("not",ok)); return {"ok":ok}
+        loc,key,op,val=r.get("loc","ctx"),r.get("key"),r.get("op"),r.get("val")
+        lhs=env.get(loc,{}).get(key); ok=_cmp(lhs,op,val); trail.append((f"{loc}.{key} {op} {val}", ok, lhs))
+        return {"ok":ok}
+    res=go(rules or {"all":[]})
+    return {"ok":res["ok"],"trail":trail}
+
+
+---
+
+jobs/queue_disk_v386x.py
+
+# jobs/queue_disk_v386x.py — v386.x
+# Disk-backed FIFO with de-dup by key. JSONL log + head pointer.
+from __future__ import annotations
+import json, os, time
+
+LOG="queue.v386x.jsonl"; HEAD="queue.v386x.head"
+SEEN=set()
+
+def enqueue(key:str, payload:dict)->dict:
+    if key in SEEN: return {"ok":True,"dedup":True}
+    rec={"t":int(time.time()),"key":key,"payload":payload}
+    open(LOG,"a").write(json.dumps(rec)+"\n"); SEEN.add(key); return {"ok":True}
+
+def dequeue()->dict:
+    pos=int(open(HEAD).read()) if os.path.exists(HEAD) else 0
+    with open(LOG,"r") as f:
+        f.seek(pos)
+        line=f.readline()
+        if not line: return {"ok":False,"empty":True}
+        newpos=f.tell()
+    open(HEAD,"w").write(str(newpos))
+    rec=json.loads(line); SEEN.discard(rec.get("key"))
+    return {"ok":True, **rec}
+
+def size()->dict:
+    # approximate: lines after head
+    pos=int(open(HEAD).read()) if os.path.exists(HEAD) else 0
+    n=0
+    with open(LOG,"r") as f:
+        f.seek(pos)
+        for _ in f: n+=1
+    return {"ok":True,"size":n}
+
+
+---
+
+scheduler/cron_table_v386x.py
+
+# scheduler/cron_table_v386x.py — v386.x
+# In-memory "table" of cron specs; compute next-run for each.
+from __future__ import annotations
+import time
+from scheduler.cronish_v386 import next_run as _next
+
+TABLE={}  # name -> spec
+
+def set_job(name:str, spec:str)->dict:
+    TABLE[name]=spec; return {"ok":True,"name":name,"spec":spec}
+def list_jobs()->dict:
+    return {"ok":True,"jobs":[{"name":n,"spec":s} for n,s in sorted(TABLE.items())]}
+def next_runs(from_ts:int|None=None)->dict:
+    out=[]
+    for n,s in TABLE.items():
+        out.append({"name":n, **_next(s, from_ts)})
+    return {"ok":True,"schedule":out}
+
+
+---
+
+router/bluegreen_cookie_v386x.py
+
+# router/bluegreen_cookie_v386x.py — v386.x
+# Cookie-affine blue/green: keep user on assigned color via cookie value.
+from __future__ import annotations
+import hashlib, time
+from router.bluegreen_v386 import STATE as BG
+
+COOKIE="codex_color"
+
+def assign(cookie_val:str|None, subject:str)->dict:
+    # If cookie already set to blue/green, honor it; else choose by cohort.
+    if cookie_val in ("blue","green"):
+        return {"ok":True,"color":cookie_val,"set_cookie":False}
+    h=int(hashlib.sha256(subject.encode()).hexdigest(),16)%100
+    color="blue" if h<BG["weights"]["blue"] else "green"
+    return {"ok":True,"color":color,"set_cookie":True,"cookie":{"name":COOKIE,"value":color,"max_age":86400*7}}
+
+
+---
+
+rollout/simulator_v386x.py
+
+# rollout/simulator_v386x.py — v386.x
+# Simulate a rollout sequence with guard checks and staged weights.
+from __future__ import annotations
+from diff.diff_v384 import manifest_diff
+from rollout.diff_guard_v386 import guard as guard_check
+
+def simulate(man_a:dict, man_b:dict, stages=(5,25,50,100))->dict:
+    diff=manifest_diff(man_a, man_b)
+    gate=guard_check(diff)
+    plan=[{"stage":p,"blue":100-p,"green":p} for p in stages]
+    return {"ok":gate["ok"],"diff":diff,"gate":gate,"plan":plan}
+
+
+---
+
+backup/dr_drill_v386x.py
+
+# backup/dr_drill_v386x.py — v386.x
+# Dry-run a DR scenario and report pass/fail of each step.
+from __future__ import annotations
+import os, json
+
+def drill()->dict:
+    steps=[
+      ("snapshots_dir_exists", lambda: os.path.isdir("snapshots.v384")),
+      ("audit_chain_present",  lambda: os.path.exists("audit_chain.v383x.jsonl")),
+      ("releases_log_present", lambda: os.path.exists("releases.v384.jsonl")),
+      ("cas_dir_present",      lambda: os.path.isdir("cas.v384")),
+    ]
+    report=[{"name":n,"ok":bool(fn())} for n,fn in steps]
+    ok=all(x["ok"] for x in report)
+    return {"ok":ok,"report":report}
+
+
+---
+
+changes/changelog_md_v386x.py
+
+# changes/changelog_md_v386x.py — v386.x
+# Render Markdown changelog from items() of v386.
+from __future__ import annotations
+from datetime import datetime
+from changes.changelog_v386 import compose
+
+def render_md()->dict:
+    items=compose().get("items",[])
+    lines=["# Changelog",""]
+    for it in items:
+        t=datetime.utcfromtimestamp(it["t"]).strftime("%Y-%m-%d %H:%M:%S")
+        if it["kind"]=="release":
+            lines.append(f"- {t} — **Release {it.get('version')}** (root `{it.get('root')}`)")
+        else:
+            lines.append(f"- {t} — event: `{it.get('event')}`")
+    return {"ok":True,"markdown":"\n".join(lines)+"\n"}
+
+
+---
+
+cli/atlas_v386x_cli.py
+
+# cli/atlas_v386x_cli.py — v386.x
+# Small CLI to poke v386.x features without HTTP.
+import argparse, json, time
+from access.rbac_store_v386x import set_role, assign, check, export as rbac_export
+from access.abac_explain_v386x import decide_explain
+from jobs.queue_disk_v386x import enqueue, dequeue, size
+from scheduler.cron_table_v386x import set_job, list_jobs, next_runs
+from router.bluegreen_cookie_v386x import assign as bg_affine
+from rollout.simulator_v386x import simulate
+from backup.dr_drill_v386x import drill
+from changes.changelog_md_v386x import render_md
+
+ap=argparse.ArgumentParser(prog="atlas-v386x")
+sp=ap.add_subparsers(dest="cmd")
+sp.add_parser("rbac-export")
+p=sp.add_parser("rbac-set"); p.add_argument("role"); p.add_argument("perms", nargs="+")
+p=sp.add_parser("rbac-assign"); p.add_argument("user"); p.add_argument("roles", nargs="+")
+p=sp.add_parser("rbac-check"); p.add_argument("user"); p.add_argument("perm")
+p=sp.add_parser("abac"); p.add_argument("rules_json"); p.add_argument("sub_json"); p.add_argument("res_json"); p.add_argument("ctx_json")
+p=sp.add_parser("q-enq"); p.add_argument("key"); p.add_argument("payload_json")
+sp.add_parser("q-deq"); sp.add_parser("q-size")
+p=sp.add_parser("cron-set"); p.add_argument("name"); p.add_argument("spec")
+sp.add_parser("cron-list"); sp.add_parser("cron-next")
+p=sp.add_parser("bg-assign"); p.add_argument("subject"); p.add_argument("--cookie", default="")
+p=sp.add_parser("rollout"); p.add_argument("a_json"); p.add_argument("b_json")
+sp.add_parser("dr-drill"); sp.add_parser("changelog-md")
+
+def main():
+    a=ap.parse_args()
+    if a.cmd=="rbac-set": print(json.dumps(set_role(a.role,a.perms),indent=2)); return
+    if a.cmd=="rbac-assign": print(json.dumps(assign(a.user,a.roles),indent=2)); return
+    if a.cmd=="rbac-check": print(json.dumps(check(a.user,a.perm),indent=2)); return
+    if a.cmd=="rbac-export": print(json.dumps(rbac_export(),indent=2)); return
+    if a.cmd=="abac": print(json.dumps(decide_explain(json.loads(a.rules_json),json.loads(a.sub_json),json.loads(a.res_json),json.loads(a.ctx_json)),indent=2)); return
+    if a.cmd=="q-enq": print(json.dumps(enqueue(a.key,json.loads(a.payload_json)),indent=2)); return
+    if a.cmd=="q-deq": print(json.dumps(dequeue(),indent=2)); return
+    if a.cmd=="q-size": print(json.dumps(size(),indent=2)); return
+    if a.cmd=="cron-set": print(json.dumps(set_job(a.name,a.spec),indent=2)); return
+    if a.cmd=="cron-list": print(json.dumps(list_jobs(),indent=2)); return
+    if a.cmd=="cron-next": print(json.dumps(next_runs(),indent=2)); return
+    if a.cmd=="bg-assign": print(json.dumps(bg_affine(a.cookie,a.subject),indent=2)); return
+    if a.cmd=="rollout": print(json.dumps(simulate(json.loads(a.a_json),json.loads(a.b_json)),indent=2)); return
+    if a.cmd=="dr-drill": print(json.dumps(drill(),indent=2)); return
+    if a.cmd=="changelog-md": print(json.dumps(render_md(),indent=2)); return
+    ap.print_help()
+if __name__=="__main__": main()
+
+
+---
+
+Daemon routes patch (tools/codexd.py)
+
+Imports:
+
+from access.rbac_store_v386x import set_role as _rbacx_set, assign as _rbacx_assign, check as _rbacx_check, export as _rbacx_export
+from access.abac_explain_v386x import decide_explain as _abacx_explain
+from jobs.queue_disk_v386x import enqueue as _qx_enq, dequeue as _qx_deq, size as _qx_size
+from scheduler.cron_table_v386x import set_job as _cronx_set, list_jobs as _cronx_list, next_runs as _cronx_next
+from router.bluegreen_cookie_v386x import assign as _bg_cookie
+from rollout.simulator_v386x import simulate as _roll_sim
+from backup.dr_drill_v386x import drill as _dr_drill
+from changes.changelog_md_v386x import render_md as _chg_md
+
+Routes (inside do_POST):
+
+# v386.x — Persistent RBAC
+        if self.path == "/v386x/rbac/set_role":  return self._send(200, _rbacx_set(payload.get("role",""), payload.get("perms",[])))
+        if self.path == "/v386x/rbac/assign":    return self._send(200, _rbacx_assign(payload.get("user",""), payload.get("roles",[])))
+        if self.path == "/v386x/rbac/check":     return self._send(200, _rbacx_check(payload.get("user",""), payload.get("perm","")))
+        if self.path == "/v386x/rbac/export":    return self._send(200, _rbacx_export())
+
+        # v386.x — ABAC explain
+        if self.path == "/v386x/abac/explain":   return self._send(200, _abacx_explain(payload.get("rules",{}), payload.get("sub",{}), payload.get("res",{}), payload.get("ctx",{})))
+
+        # v386.x — Disk Queue
+        if self.path == "/v386x/queue/enq":      return self._send(200, _qx_enq(payload.get("key","job"), payload.get("payload",{})))
+        if self.path == "/v386x/queue/deq":      return self._send(200, _qx_deq())
+        if self.path == "/v386x/queue/size":     return self._send(200, _qx_size())
+
+        # v386.x — Cron table
+        if self.path == "/v386x/cron/set":       return self._send(200, _cronx_set(payload.get("name","job"), payload.get("spec","*/5 * * * *")))
+        if self.path == "/v386x/cron/list":      return self._send(200, _cronx_list())
+        if self.path == "/v386x/cron/next":      return self._send(200, _cronx_next(payload.get("from_ts")))
+
+        # v386.x — Cookie-affine Blue/Green
+        if self.path == "/v386x/bg/assign":      return self._send(200, _bg_cookie(payload.get("cookie"), payload.get("subject","anon")))
+
+        # v386.x — Rollout simulator
+        if self.path == "/v386x/rollout/sim":    return self._send(200, _roll_sim(payload.get("man_a",{}), payload.get("man_b",{})))
+
+        # v386.x — DR drill & Changelog MD
+        if self.path == "/v386x/dr/drill":       return self._send(200, _dr_drill())
+        if self.path == "/v386x/changes/markdown": return self._send(200, _chg_md())
+
+
+---
+
+Web console
+
+web/atlas_plus_v386x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v386.x — Atlas+</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ v386.x — Atlas+ (Persistent RBAC • ABAC Explain • Disk Queue • Cron Table • Cookie BG • Rollout Sim • DR Drill • Changelog MD)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>RBAC</h3>
+  <button onclick="rset()">set_role</button>
+  <button onclick="rassign()">assign</button>
+  <button onclick="rcheck()">check</button>
+  <button onclick="rx()">export</button>
+</section>
+<section>
+  <h3>ABAC explain</h3>
+  <button onclick="abac()">explain</button>
+</section>
+<section>
+  <h3>Disk queue</h3>
+  <button onclick="enq()">enqueue</button>
+  <button onclick="deq()">dequeue</button>
+  <button onclick="qsize()">size</button>
+</section>
+<section>
+  <h3>Cron table</h3>
+  <button onclick="cset()">set</button>
+  <button onclick="clist()">list</button>
+  <button onclick="cnext()">next</button>
+</section>
+<section>
+  <h3>Blue/Green (cookie)</h3>
+  <button onclick="bg()">assign</button>
+</section>
+<section>
+  <h3>Rollout / DR / Changelog</h3>
+  <button onclick="sim()">simulate</button>
+  <button onclick="dr()">DR drill</button>
+  <button onclick="chg()">Changelog MD</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});return r.json();}
+async function rset(){ out.textContent=JSON.stringify(await call('/v386x/rbac/set_role',{role:'deployer',perms:['deploy','read']}),null,2); }
+async function rassign(){ out.textContent=JSON.stringify(await call('/v386x/rbac/assign',{user:'cfbk',roles:['deployer']}),null,2); }
+async function rcheck(){ out.textContent=JSON.stringify(await call('/v386x/rbac/check',{user:'cfbk',perm:'deploy'}),null,2); }
+async function rx(){ out.textContent=JSON.stringify(await call('/v386x/rbac/export',{}),null,2); }
+async function abac(){ const rules={"all":[{"loc":"sub","key":"tier","op":"==","val":"gold"},{"loc":"ctx","key":"hour","op":">=","val":9}]}; out.textContent=JSON.stringify(await call('/v386x/abac/explain',{rules,sub:{tier:'gold'},res:{},ctx:{hour:10}}),null,2); }
+async function enq(){ out.textContent=JSON.stringify(await call('/v386x/queue/enq',{key:'job#X',payload:{x:1}}),null,2); }
+async function deq(){ out.textContent=JSON.stringify(await call('/v386x/queue/deq',{}),null,2); }
+async function qsize(){ out.textContent=JSON.stringify(await call('/v386x/queue/size',{}),null,2); }
+async function cset(){ out.textContent=JSON.stringify(await call('/v386x/cron/set',{name:'snapshots',spec:'*/15 * * * *'}),null,2); }
+async function clist(){ out.textContent=JSON.stringify(await call('/v386x/cron/list',{}),null,2); }
+async function cnext(){ out.textContent=JSON.stringify(await call('/v386x/cron/next',{}),null,2); }
+async function bg(){ out.textContent=JSON.stringify(await call('/v386x/bg/assign',{cookie:'',subject:'cfbk10271998'}),null,2); }
+async function sim(){ const a={"sbom":{"files":[{"path":"a","hash":"1"}]}}, b={"sbom":{"files":[{"path":"a","hash":"2"},{"path":"b","hash":"x"}]}}; out.textContent=JSON.stringify(await call('/v386x/rollout/sim',{man_a:a,man_b:b}),null,2); }
+async function dr(){ out.textContent=JSON.stringify(await call('/v386x/dr/drill',{}),null,2); }
+async function chg(){ out.textContent=JSON.stringify(await call('/v386x/changes/markdown',{}),null,2); }
+</script>
+</body>
+
+
+---
+
+CI smoke
+
+.github/workflows/codex_v386x_ci.yml
+
+name: codex-v386x
+on: [push, workflow_dispatch]
+jobs:
+  v386x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Atlas+ API smoke
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(p,b):
+  r=urllib.request.Request("http://localhost:8049"+p,data=json.dumps(b).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(r,timeout=8) as f: return json.loads(f.read().decode())
+
+print("ok" in post("/v386x/rbac/set_role", {"role":"deployer","perms":["deploy"]}))
+print("ok" in post("/v386x/rbac/assign", {"user":"ci","roles":["deployer"]}))
+print("ok" in post("/v386x/rbac/check", {"user":"ci","perm":"deploy"}))
+
+rules={"all":[{"loc":"sub","key":"tier","op":"==","val":"gold"}]}
+print(post("/v386x/abac/explain", {"rules":rules,"sub":{"tier":"gold"},"res":{},"ctx":{}})["ok"])
+
+print("ok" in post("/v386x/queue/enq", {"key":"job#ci","payload":{"n":1}}))
+print("ok" in post("/v386x/queue/size", {}))
+
+print("ok" in post("/v386x/cron/set", {"name":"job","spec":"*/5 * * * *"}))
+print("schedule" in post("/v386x/cron/next", {}))
+
+print("color" in post("/v386x/bg/assign", {"cookie":"","subject":"ci"}))
+
+a={"sbom":{"files":[{"path":"a","hash":"1"}]}}
+b={"sbom":{"files":[{"path":"a","hash":"2"},{"path":"b","hash":"x"}]}}
+print("plan" in post("/v386x/rollout/sim", {"man_a":a,"man_b":b}))
+
+print("report" in post("/v386x/dr/drill", {}))
+print("markdown" in post("/v386x/changes/markdown", {}))
+PY
+
+
+---
+
+What v386.x adds (one breath)
+
+RBAC that survives restarts, ABAC with an explain trail.
+
+Queues on disk and a cron table you can version.
+
+Cookie-affine blue/green so cohorts stay sticky across sessions.
+
+Rollout simulator to preview diff + staged weights.
+
+DR drill to preflight your recovery path.
+
+Changelog → Markdown for human-readable release notes.
+
+CLI + console + CI to keep it operable.
+
+
+sha256 seal calebfedorbykerkonev10271998

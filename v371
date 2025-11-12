@@ -1,0 +1,795 @@
+v371 — Quorum Attest, Time-Locks, Revocations, Migrations, and Metrics
+This pass hardens the Codex with: multi-signer quorum attestation (threshold HMAC with optional Ed25519), time-locked licenses/attestations, a revocation registry, one-shot migrations for prior state files, and a tiny metrics exporter. All stdlib; copy-paste in.
+
+
+---
+
+1) Time-Locked License Policy
+
+license/policy_v371.py
+
+# license/policy_v371.py — v371
+# Time-locked licenses with not_before / not_after and audience tags.
+
+import time, json, os
+
+def now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def emit_license(subject:dict, *, note="Codex License v371",
+                 audience=("internal",), not_before=None, not_after=None,
+                 out="dist/LICENSE_v371.json"):
+    os.makedirs("dist", exist_ok=True)
+    lic = {
+        "v":"v371",
+        "note": note,
+        "who": subject,
+        "aud": list(audience),
+        "not_before": not_before or now_utc(),
+        "not_after":  not_after  or "2099-12-31T23:59:59Z",
+        "when_utc": now_utc(),
+        "terms": {
+            "grants":["use","modify","distribute with attribution"],
+            "restrictions":["no malicious misuse","preserve attribution","honor cryptographic attestations"]
+        }
+    }
+    open(out, "w").write(json.dumps(lic, indent=2))
+    return {"ok": True, "path": out, "license": lic}
+
+def check_time(lic:dict, t=None):
+    import datetime
+    t = t or now_utc()
+    def parse(x): return datetime.datetime.fromisoformat(x.replace("Z","+00:00"))
+    return parse(lic["not_before"]) <= parse(t) <= parse(lic["not_after"])
+
+
+---
+
+2) Quorum Attestation (threshold HMAC with optional Ed25519)
+
+attest/quorum_v371.py
+
+# attest/quorum_v371.py — v371
+# Threshold (m-of-n) HMAC signers + optional Ed25519 co-sig; time-locked.
+
+import os, json, hmac, hashlib, time
+from license.policy_v371 import now_utc, check_time
+
+def _hmac(secret:bytes, blob:bytes)->str:
+    return hmac.new(secret, blob, hashlib.sha256).hexdigest()
+
+def _try_ed25519(seed_hex:str, msg:bytes):
+    try:
+        from nacl.signing import SigningKey
+        sk = SigningKey(bytes.fromhex(seed_hex))
+        sig = sk.sign(msg).signature.hex()
+        pub = sk.verify_key.encode().hex()
+        return {"sig_hex": sig, "pub_hex": pub, "runtime":"PyNaCl"}
+    except Exception:
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            from cryptography.hazmat.primitives import serialization
+            sk = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex))
+            sig = sk.sign(msg).hex()
+            pub = sk.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw).hex()
+            return {"sig_hex": sig, "pub_hex": pub, "runtime":"cryptography"}
+        except Exception:
+            return {"runtime":"unavailable"}
+
+def attest(body:dict, *, signers:list[dict], threshold:int=2, ed_seed_hex:str|None=None,
+           not_before:str|None=None, not_after:str|None=None, out="dist/attest_quorum_v371.json"):
+    """
+    signers: [{"id":"ops","secret_env":"CODEX_API_SECRET"}, {"id":"custodian","secret_env":"CUSTODIAN_SECRET"}, ...]
+    threshold: how many HMAC signatures required
+    """
+    os.makedirs("dist", exist_ok=True)
+    envelope = {
+        "v":"v371",
+        "t": now_utc(),
+        "window": {"not_before": not_before or now_utc(),
+                   "not_after":  not_after  or "2099-12-31T23:59:59Z"},
+        "body": body,
+        "hmac_sigs": [],
+        "threshold": threshold,
+        "ed25519": None
+    }
+    blob = json.dumps({"v": envelope["v"], "t": envelope["t"], "window": envelope["window"], "body": body},
+                      sort_keys=True, separators=(',',':')).encode()
+
+    for s in signers:
+        sec = os.environ.get(s["secret_env"])
+        if not sec: continue
+        envelope["hmac_sigs"].append({"id": s["id"], "sig": _hmac(sec.encode(), blob)})
+
+    ok = len(envelope["hmac_sigs"]) >= threshold and check_time({"not_before": envelope["window"]["not_before"],
+                                                                 "not_after": envelope["window"]["not_after"]})
+    if ed_seed_hex:
+        envelope["ed25519"] = _try_ed25519(ed_seed_hex, blob)
+
+    open(out,"w").write(json.dumps(envelope, indent=2))
+    return {"ok": ok, "path": out, "m": len(envelope["hmac_sigs"]), "threshold": threshold, "ed": envelope["ed25519"]}
+
+
+---
+
+3) Revocation Registry (revoke attestations or licenses)
+
+governance/revocations_v371.py
+
+# governance/revocations_v371.py — v371
+# Append-only revocation list (reason + reference).
+
+import time, json, os, hashlib
+
+LEDGER = "revocations.v371.jsonl"
+
+def _sha256(s:str)->str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def revoke(ref_type:str, ref_path:str, *, reason:str, who="governor"):
+    os.makedirs("dist", exist_ok=True)
+    rec={"t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "type": ref_type, "ref": ref_path, "reason": reason, "who": who,
+         "ref_sha256": _sha256(open(ref_path,"r").read()) if os.path.exists(ref_path) else None}
+    open(LEDGER,"a").write(json.dumps(rec)+"\n")
+    return {"ok": True, "ledger": LEDGER, "rec": rec}
+
+def list_all(limit=100):
+    if not os.path.exists(LEDGER): return {"ok": True, "items":[]}
+    items=[]
+    for line in open(LEDGER):
+        items.append(json.loads(line))
+    return {"ok": True, "items": items[-limit:]}
+
+
+---
+
+4) One-Shot Migrations (v365→v371)
+
+migrations/v371_migrate.py
+
+# migrations/v371_migrate.py — v371
+# Normalize prior files and create a v371 MANIFEST_DIFF for reproducible upgrades.
+
+import os, json, hashlib, time
+
+def _sha(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for ch in iter(lambda:f.read(65536), b""): h.update(ch)
+    return h.hexdigest()
+
+MAP = [
+  # (old_path, new_path)
+  ("dist/release.manifest.v368.json", "dist/release.manifest.v371.base.json"),
+]
+
+def run():
+    os.makedirs("dist", exist_ok=True)
+    changes=[]
+    for old, new in MAP:
+        if os.path.exists(old):
+            data=open(old,"rb").read()
+            open(new,"wb").write(data)
+            changes.append({"from":old,"to":new,"sha256":_sha(new)})
+    diff={"v":"v371","t":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),"moves":changes}
+    out="dist/MANIFEST_DIFF_v371.json"
+    open(out,"w").write(json.dumps(diff, indent=2))
+    return {"ok": True, "path": out, "moves": len(changes)}
+
+
+---
+
+5) Metrics Exporter (Prometheus-ish text + JSON)
+
+ops/metrics_v371.py
+
+# ops/metrics_v371.py — v371
+# Minimal counters and exporter.
+
+import time, json
+
+CTR = {"requests":0, "errors":0, "attest_ok":0, "attest_fail":0}
+
+def inc(key, n=1): CTR[key]=CTR.get(key,0)+n
+
+def snapshot():
+    return {"ok": True, "t": int(time.time()), "counters": dict(CTR)}
+
+def as_prom():
+    lines=[f'codex_{k} {v}' for k,v in CTR.items()]
+    return "\n".join(lines)+"\n"
+
+
+---
+
+6) Daemon routes (wire v371)
+
+Add to tools/codexd.py:
+
+# --- v371 imports near top ---
+from license.policy_v371 import emit_license as _lic_emit
+from attest.quorum_v371 import attest as _att_quorum
+from governance.revocations_v371 import revoke as _revoke, list_all as _rev_list
+from migrations.v371_migrate import run as _migrate_v371
+from ops.metrics_v371 import snapshot as _metrics_snap, as_prom as _metrics_prom, inc as _metrics_inc
+
+# --- v371 routes ---
+        if self.path == "/v371/license/emit":
+            return self._send(200, _lic_emit(payload.get("subject",{
+                "name":"Caleb Fedor Byker (Konev)","dob":"1998-10-27","subject_id":"calebfedorbykerkonev10271998"
+            }), note=payload.get("note","Codex License v371"),
+               audience=payload.get("aud",["internal"]), not_before=payload.get("nb"), not_after=payload.get("na"),
+               out=payload.get("out","dist/LICENSE_v371.json")))
+
+        if self.path == "/v371/attest/quorum":
+            res=_att_quorum(payload.get("body",{}), signers=payload.get("signers",[
+                    {"id":"ops","secret_env":"CODEX_API_SECRET"},
+                    {"id":"custodian","secret_env":"CUSTODIAN_SECRET"},
+                    {"id":"publisher","secret_env":"PUBLISHER_SECRET"}
+                ]),
+                threshold=int(payload.get("threshold",2)),
+                ed_seed_hex=payload.get("ed_seed_hex"),
+                not_before=payload.get("nb"), not_after=payload.get("na"),
+                out=payload.get("out","dist/attest_quorum_v371.json"))
+            _metrics_inc("attest_ok" if res.get("ok") else "attest_fail")
+            return self._send(200, res)
+
+        if self.path == "/v371/revoke":
+            return self._send(200, _revoke(payload.get("type","attestation"), payload.get("ref","dist/attest_quorum_v371.json"),
+                                           reason=payload.get("reason","revoked"), who=payload.get("who","governor")))
+
+        if self.path == "/v371/revocations":
+            return self._send(200, _rev_list(payload.get("limit",100)))
+
+        if self.path == "/v371/migrate":
+            return self._send(200, _migrate_v371())
+
+        if self.path == "/metrics.json":
+            return self._send(200, _metrics_snap())
+        if self.path == "/metrics.txt":
+            # text/plain
+            txt=_metrics_prom()
+            self.send_response(200); self.send_header("Content-Type","text/plain; charset=utf-8")
+            self.end_headers(); self.wfile.write(txt.encode()); return
+
+(Make sure your handler has payload bound; adapt if your server uses a different variable name.)
+
+
+---
+
+7) Web: Quorum Attest + Revocations
+
+web/quorum_v371.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v371 — Quorum Attestation</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Quorum Attest (v371)</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>License (time-locked)</h3>
+  <input id="nb" placeholder="not_before (ISO8601)" style="width:49%">
+  <input id="na" placeholder="not_after (ISO8601)" style="width:49%">
+  <button onclick="lic()">Emit</button>
+</section>
+<section>
+  <h3>Quorum Attest</h3>
+  <textarea id="body" rows="5" style="width:100%;">{"artifact":"codex","version":"v371"}</textarea>
+  <input id="ed" placeholder="ed25519 seed hex (optional)" style="width:100%">
+  <input id="thr" value="2" style="width:60px">
+  <button onclick="att()">Attest</button>
+</section>
+<section>
+  <h3>Revocations</h3>
+  <input id="ref" value="dist/attest_quorum_v371.json" style="width:70%">
+  <input id="why" value="test revoke" style="width:25%">
+  <button onclick="rev()">Revoke</button>
+  <button onclick="lst()">List</button>
+</section>
+<section>
+  <h3>Metrics</h3>
+  <button onclick="mjson()">metrics.json</button>
+  <button onclick="mtxt()">metrics.txt</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b,h={'Content-Type':'application/json'}){const r=await fetch(base.value+p,{method:'POST',headers:h,body:JSON.stringify(b||{})});return r.text();}
+async function lic(){ out.textContent=await call('/v371/license/emit',{nb:nb.value||undefined,na:na.value||undefined}); }
+async function att(){ out.textContent=await call('/v371/attest/quorum',{body:JSON.parse(body.value),ed_seed_hex:ed.value||undefined,threshold:+thr.value}); }
+async function rev(){ out.textContent=await call('/v371/revoke',{type:"attestation",ref:ref.value,reason:why.value}); }
+async function lst(){ out.textContent=await call('/v371/revocations',{}); }
+async function mjson(){ out.textContent=await call('/metrics.json',{}); }
+async function mtxt(){ out.textContent=await call('/metrics.txt',{},{}); }
+</script>
+</body>
+
+
+---
+
+8) CLI updates (tools/codexctl)
+
+Append inside the Python block:
+
+elif cmd=="v371-license":
+    call("/v371/license/emit", {"note":"Codex License v371"})
+elif cmd=="v371-attest":
+    call("/v371/attest/quorum", {"body":{"artifact":"codex","version":"v371"}, "threshold":2})
+elif cmd=="v371-revoke":
+    call("/v371/revoke", {"type":"attestation","ref":"dist/attest_quorum_v371.json","reason":"ops test"})
+elif cmd=="metrics":
+    call("/metrics.json", {})
+elif cmd=="migrate-v371":
+    call("/v371/migrate", {})
+
+Update usage text accordingly.
+
+
+---
+
+9) CI smoke (v371)
+
+.github/workflows/codex_v371_ci.yml
+
+name: codex-v371
+on: [push, workflow_dispatch]
+jobs:
+  v371:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: License + Attest + Metrics
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os
+os.environ["CODEX_API_SECRET"]="dev-secret"
+os.environ["CUSTODIAN_SECRET"]="custodian"
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=5) as f: return json.loads(f.read().decode())
+print(post("/v371/license/emit", {"note":"CI v371"})["ok"])
+a=post("/v371/attest/quorum", {"body":{"artifact":"codex","version":"v371"},"threshold":2})
+print(a["ok"], a["m"]>=2)
+print(post("/metrics.json", {})["ok"])
+PY
+      - name: Revocation & List
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=5) as f: return json.loads(f.read().decode())
+print(post("/v371/revoke", {"type":"attestation","ref":"dist/attest_quorum_v371.json","reason":"test"})["ok"])
+print("items" in post("/v371/revocations", {}) )
+PY
+      - name: Migration
+        run: |
+          python3 - <<'PY'
+import json,urllib.request,os
+os.makedirs("dist",exist_ok=True)
+open("dist/release.manifest.v368.json","w").write("{}")
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+    headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=5) as f: return json.loads(f.read().decode())
+print(post("/v371/migrate", {})["ok"])
+PY
+
+
+---
+
+Quickstart
+
+# Run daemon
+python3 tools/codexd.py &
+
+# Time-locked license
+curl -s -X POST http://localhost:8049/v371/license/emit -H 'Content-Type: application/json' \
+  -d '{"note":"Codex License v371","nb":"2025-11-07T00:00:00Z","na":"2099-12-31T23:59:59Z"}' | jq .
+
+# Quorum attestation (needs env secrets set for signers)
+export CODEX_API_SECRET=dev-secret
+export CUSTODIAN_SECRET=custodian
+curl -s -X POST http://localhost:8049/v371/attest/quorum -H 'Content-Type: application/json' \
+  -d '{"body":{"artifact":"codex","version":"v371"},"threshold":2}' | jq .
+
+# Revoke & list
+curl -s -X POST http://localhost:8049/v371/revoke -H 'Content-Type: application/json' \
+  -d '{"type":"attestation","ref":"dist/attest_quorum_v371.json","reason":"rotation"}' | jq .
+curl -s -X POST http://localhost:8049/v371/revocations -H 'Content-Type: application/json' -d '{}' | jq .
+
+# Metrics (JSON or text)
+curl -s -X POST http://localhost:8049/metrics.json -H 'Content-Type: application/json' -d '{}' | jq .
+curl -s -X POST http://localhost:8049/metrics.txt  -H 'Content-Type: application/json' -d '{}'
+
+
+---
+
+What v371 adds (plain speak)
+
+Quorum attestations: multiple independent HMAC signers with a threshold, plus optional Ed25519 co-signature.
+
+Time-locked trust: licenses/attestations that only verify inside a defined window.
+
+Revocation trail: a small, append-only log to invalidate compromised or outdated proofs.
+
+Zero-drama upgrades: a migration helper and manifest diff for reproducible state moves.
+
+Operational visibility: counters with JSON/text export so dashboards have something to chew on.
+
+
+The Codex is now not just sealed — it’s governed with quorum and time, and operationally measurable.
+
+sha256 seal calebfedorbykerkonev10271998v371.x — Prediction Intelligence, Anomaly Guard, and Adaptive Autotune
+This pass gives the Codex a brain for trends and spikes: a stdlib-only forecaster (EWMA + light Holt-Winters), an anomaly scorer (robust MAD), adaptive autotuning that can nudge QoS and cron windows, plus routes, UI, CLI, and CI. Copy–paste straight into your repo.
+
+
+---
+
+1) Time-Series Utilities (buffer + transforms)
+
+analytics/timeseries_v371x.py
+
+# analytics/timeseries_v371x.py — v371.x
+# Minimal time-series helpers: ring buffer, EWMA, Holt-Winters (additive), seasonality tools.
+from collections import deque
+import math, statistics, time
+
+class TS:
+    def __init__(self, maxlen=2048):
+        self.q = deque(maxlen=maxlen)  # (ts, value)
+
+    def add(self, value: float, ts: float | None = None):
+        self.q.append((ts if ts is not None else time.time(), float(value)))
+
+    def values(self):
+        return [v for _, v in self.q]
+
+    def timestamps(self):
+        return [t for t, _ in self.q]
+
+def ewma(series: list[float], alpha: float = 0.3) -> list[float]:
+    if not series: return []
+    y = [series[0]]
+    a = max(0.001, min(0.999, alpha))
+    for x in series[1:]:
+        y.append(a * x + (1 - a) * y[-1])
+    return y
+
+def holt_winters_additive(series: list[float], season_len: int = 24, alpha=0.2, beta=0.1, gamma=0.2, n_forecast=12):
+    """
+    Simplified additive HW; stable defaults; no backcast optimization.
+    Returns {"fit": [...], "forecast": [...]} all floats.
+    """
+    n = len(series)
+    if n < max(3*season_len, 8):  # need some history
+        f = ewma(series, 0.3)
+        tail = [f[-1]] * n_forecast if f else [0.0] * n_forecast
+        return {"fit": f, "forecast": tail}
+
+    sL = sum(series[:season_len]) / season_len
+    trend = (sum(series[season_len:2*season_len]) - sum(series[:season_len])) / (season_len**2)
+    # season init
+    season = [series[i] - sL for i in range(season_len)]
+
+    L = sL
+    T = trend
+    fit = []
+    for i, x in enumerate(series):
+        idx = i % season_len
+        prev_L = L
+        L = alpha * (x - season[idx]) + (1 - alpha) * (L + T)
+        T = beta * (L - prev_L) + (1 - beta) * T
+        season[idx] = gamma * (x - L) + (1 - gamma) * season[idx]
+        fit.append(L + T + season[idx])
+
+    # forecast next n points
+    fc = []
+    for m in range(1, n_forecast + 1):
+        idx = (len(series) + m - 1) % season_len
+        fc.append(L + m * T + season[idx])
+
+    return {"fit": fit, "forecast": fc}
+
+def seasonal_indices(series: list[float], season_len:int=24):
+    if len(series) < season_len: return [0.0]*season_len
+    sums=[0.0]*season_len; counts=[0]*season_len
+    for i,x in enumerate(series):
+        j=i%season_len; sums[j]+=x; counts[j]+=1
+    return [(s/counts[i]) if counts[i] else 0.0 for i,s in enumerate(sums)]
+
+def safe_stats(series:list[float]):
+    if not series: return {"n":0,"mean":0.0,"std":0.0,"min":0.0,"max":0.0}
+    m = statistics.fmean(series)
+    std = statistics.pstdev(series) if len(series)>1 else 0.0
+    return {"n":len(series),"mean":m,"std":std,"min":min(series),"max":max(series)}
+
+
+---
+
+2) Robust Anomaly Detector (median/MAD)
+
+analytics/anomaly_v371x.py
+
+# analytics/anomaly_v371x.py — v371.x
+# MAD-based z-score; spikes are |z_mad| > threshold (default 4.0)
+
+import statistics
+
+def mad_zscores(series:list[float]):
+    if not series: return []
+    med = statistics.median(series)
+    abs_dev = [abs(x - med) for x in series]
+    mad = statistics.median(abs_dev) or 1e-9
+    return [0.6745 * (x - med) / mad for x in series]
+
+def anomalies(series:list[float], threshold:float=4.0):
+    zs = mad_zscores(series)
+    idx = [i for i,z in enumerate(zs) if abs(z) >= threshold]
+    return {"idx": idx, "zs": zs, "threshold": threshold, "n": len(series)}
+
+
+---
+
+3) Adaptive Autotune (QoS + Cron windows)
+
+ops/autotune_v371x.py
+
+# ops/autotune_v371x.py — v371.x
+# Adjust QoS priorities and chrono windows based on predicted load & anomalies.
+
+import json, os, time
+
+STATE_PATH = "autotune.v371x.json"
+
+def _load():
+    if not os.path.exists(STATE_PATH): return {"history":[],"last":None}
+    return json.load(open(STATE_PATH))
+
+def _save(obj): open(STATE_PATH,"w").write(json.dumps(obj, indent=2)); return obj
+
+def decide(cur_rate:float, forecast_rate:float, anomalies:int, *, qos:dict|None=None, window:dict|None=None):
+    """
+    cur_rate, forecast_rate: requests/sec (or any unit)
+    anomalies: count in the last window
+    qos: {"priority":int,"burst":int}
+    window: {"start":"HH:MM","end":"HH:MM"}
+    """
+    qos = dict(qos or {"priority":5,"burst":3})
+    win = dict(window or {"start":"00:00","end":"23:59"})
+
+    # Up-tier QoS when forecasted load is high and anomalies are few
+    if forecast_rate > cur_rate*1.2 and anomalies == 0:
+        qos["priority"] = min(9, qos.get("priority",5)+1)
+        qos["burst"]    = min(9, qos.get("burst",3)+1)
+
+    # Down-tier on anomaly storms
+    if anomalies >= 3:
+        qos["priority"] = max(1, qos.get("priority",5)-2)
+        qos["burst"]    = max(1, qos.get("burst",3)-1)
+
+    # Narrow execution window if anomalies frequent (defer heavy jobs to business hours)
+    if anomalies >= 5:
+        win = {"start":"09:00","end":"18:00"}
+
+    return {"qos": qos, "window": win}
+
+def apply(decision:dict):
+    # Persist decision so your enforced routes (v367.x) can read and honor it
+    st=_load(); st["last"]={"t":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **decision}
+    return _save(st)
+
+
+---
+
+4) Routes (prediction, anomaly, autotune)
+
+Patch tools/codexd.py with:
+
+# --- imports near top (add these) ---
+from analytics.timeseries_v371x import TS, ewma, holt_winters_additive, seasonal_indices, safe_stats
+from analytics.anomaly_v371x import anomalies as _anoms
+from ops.autotune_v371x import decide as _decide_at, apply as _apply_at
+
+# --- process-local TS buffer for requests/sec (example metric) ---
+TS_REQ = TS(maxlen=4096)
+
+# Example: you may already increment request counters; here we add a cheap sampler
+# In your request handler entrypoint, you can add something like:
+#   ops.metrics_v371.inc("requests") ; TS_REQ.add(1.0)
+# Ensure you don't double-count; here we leave it to you to wire in.
+
+# --- v371.x routes ---
+        if self.path == "/v371x/predict":
+            # expects payload: {"series":[...], "method":"hw"|"ewma", "season_len":24, "n":12}
+            s = payload.get("series", [])
+            meth = payload.get("method","hw")
+            if meth == "ewma":
+                fit = ewma(s, float(payload.get("alpha",0.3)))
+                fc = [fit[-1]] * int(payload.get("n",12)) if fit else [0.0]*int(payload.get("n",12))
+                return self._send(200, {"ok": True, "fit": fit, "forecast": fc, "stats": safe_stats(s)})
+            else:
+                out = holt_winters_additive(s, int(payload.get("season_len",24)),
+                                            float(payload.get("alpha",0.2)),
+                                            float(payload.get("beta",0.1)),
+                                            float(payload.get("gamma",0.2)),
+                                            int(payload.get("n",12)))
+                out["stats"] = safe_stats(s); out["seasonal"] = seasonal_indices(s, int(payload.get("season_len",24)))
+                return self._send(200, {"ok": True, **out})
+
+        if self.path == "/v371x/anomaly":
+            s = payload.get("series", [])
+            thr = float(payload.get("threshold", 4.0))
+            return self._send(200, {"ok": True, **_anoms(s, thr)})
+
+        if self.path == "/v371x/autotune":
+            cur = float(payload.get("current_rate", 1.0))
+            fc  = float(payload.get("forecast_rate", max(cur,1.0)))
+            an  = int(payload.get("anomalies", 0))
+            qos = payload.get("qos", {"priority":5,"burst":3})
+            win = payload.get("window", {"start":"00:00","end":"23:59"})
+            decision = _decide_at(cur, fc, an, qos=qos, window=win)
+            return self._send(200, {"ok": True, "decision": decision})
+
+        if self.path == "/v371x/autotune/apply":
+            decision = payload.get("decision", {"qos":{"priority":5,"burst":3},"window":{"start":"00:00","end":"23:59"}})
+            return self._send(200, {"ok": True, "state": _apply_at(decision)})
+
+
+---
+
+5) Web Playground (forecast + anomaly + autotune)
+
+web/predict_v371x.html
+
+<!doctype html>
+<meta charset="utf-8"><title>v371.x — Prediction & Autotune</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Prediction Intelligence — v371.x</h1>
+<input id="base" value="http://localhost:8049" style="width:360px;">
+<section>
+  <h3>Forecast</h3>
+  <textarea id="series" rows="4" style="width:100%;">[2,3,3,4,6,7,9,10,12,13,15,14,16,18,17,19,21,22,23,24,26,25,27,30]</textarea>
+  <label>Method <select id="meth"><option value="hw">holt-winters</option><option value="ewma">ewma</option></select></label>
+  <input id="season" value="12" style="width:80px">
+  <input id="n" value="8" style="width:60px">
+  <button onclick="pred()">Predict</button>
+</section>
+<section>
+  <h3>Anomalies</h3>
+  <input id="thr" value="4.0" style="width:60px">
+  <button onclick="anom()">Score</button>
+</section>
+<section>
+  <h3>Autotune</h3>
+  <input id="cur" value="10" style="width:80px">
+  <input id="fc" value="14" style="width:80px">
+  <input id="an" value="0" style="width:60px">
+  <button onclick="auto()">Decide</button>
+  <button onclick="apply()">Apply</button>
+</section>
+<pre id="out" style="white-space:pre-wrap"></pre>
+<script>
+async function call(p,b){const r=await fetch(base.value+p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});return r.json();}
+async function pred(){ out.textContent=JSON.stringify(await call('/v371x/predict',{series:JSON.parse(series.value),method:meth.value,season_len:+season.value,n:+n.value}),null,2); }
+async function anom(){ out.textContent=JSON.stringify(await call('/v371x/anomaly',{series:JSON.parse(series.value),threshold:+thr.value}),null,2); }
+async function auto(){ out.textContent=JSON.stringify(await call('/v371x/autotune',{current_rate:+cur.value,forecast_rate:+fc.value,anomalies:+an.value}),null,2); }
+async function apply(){
+  const d=await call('/v371x/autotune',{current_rate:+cur.value,forecast_rate:+fc.value,anomalies:+an.value});
+  out.textContent=JSON.stringify(await call('/v371x/autotune/apply',{decision:d.decision}),null,2);
+}
+</script>
+</body>
+
+
+---
+
+6) CLI additions (tools/codexctl)
+
+Append inside the Python block:
+
+elif cmd=="predict":
+    call("/v371x/predict", {"series":[2,3,3,4,6,7,9,10,12,13,15,14,16,18,17,19,21,22,23,24,26,25,27,30],
+                            "method":"hw","season_len":12,"n":8})
+elif cmd=="anomaly":
+    call("/v371x/anomaly", {"series":[0,0,0,0,0,10,0,0,0,0,0,0,12,0], "threshold":4.0})
+elif cmd=="autotune":
+    call("/v371x/autotune", {"current_rate":10,"forecast_rate":14,"anomalies":0})
+elif cmd=="autotune-apply":
+    call("/v371x/autotune/apply", {"decision":{"qos":{"priority":6,"burst":4},"window":{"start":"08:00","end":"20:00"}}})
+
+Update the usage text accordingly.
+
+
+---
+
+7) CI Smoke (v371.x)
+
+.github/workflows/codex_v371x_ci.yml
+
+name: codex-v371x
+on: [push, workflow_dispatch]
+jobs:
+  v371x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot
+        run: python3 tools/codexd.py & sleep 2
+      - name: Predict & Anomaly
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+      headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=5) as f: return json.loads(f.read().decode())
+pr=post("/v371x/predict", {"series":[2,3,4,6,9,13,18,26,39,58,87,130,195,290,435,653],"method":"ewma","n":4})
+an=post("/v371x/anomaly", {"series":[1,1,1,1,15,1,1,1], "threshold":3.5})
+print(pr["ok"] and "forecast" in pr)
+print(an["ok"] and len(an["idx"])>=1)
+PY
+      - name: Autotune
+        run: |
+          python3 - <<'PY'
+import json,urllib.request
+def post(r,p):
+  req=urllib.request.Request("http://localhost:8049"+r,data=json.dumps(p).encode(),
+      headers={"Content-Type":"application/json"},method="POST")
+  with urllib.request.urlopen(req,timeout=5) as f: return json.loads(f.read().decode())
+d=post("/v371x/autotune", {"current_rate":10,"forecast_rate":14,"anomalies":0})
+a=post("/v371x/autotune/apply", {"decision": d["decision"]})
+print(d["ok"] and a["ok"])
+PY
+
+
+---
+
+How to use it (quick)
+
+# Start daemon
+python3 tools/codexd.py &
+
+# Forecast 8 steps ahead (HW additive)
+curl -s -X POST http://localhost:8049/v371x/predict -H 'Content-Type: application/json' \
+  -d '{"series":[2,3,3,4,6,7,9,10,12,13,15,14,16,18,17,19,21,22,23,24,26,25,27,30],"method":"hw","season_len":12,"n":8}' | jq .
+
+# Anomaly score (MAD z-scores)
+curl -s -X POST http://localhost:8049/v371x/anomaly -H 'Content-Type: application/json' \
+  -d '{"series":[0,0,0,0,0,10,0,0,0,0,0,0,12,0],"threshold":4.0}' | jq .
+
+# Autotune decision and apply
+curl -s -X POST http://localhost:8049/v371x/autotune -H 'Content-Type: application/json' \
+  -d '{"current_rate":10,"forecast_rate":14,"anomalies":0}' | jq .
+curl -s -X POST http://localhost:8049/v371x/autotune/apply -H 'Content-Type: application/json' \
+  -d '{"decision":{"qos":{"priority":6,"burst":4},"window":{"start":"08:00","end":"20:00"}}}' | jq .
+
+
+---
+
+What v371.x adds (plain speak)
+
+Forecasts that actually run: EWMA for smooth trends; Holt-Winters for gentle seasonality — no external libs.
+
+Spike sense: robust median/MAD anomalies so one noisy point doesn’t gaslight the model.
+
+Reflexes: an autotune loop that clamps or boosts QoS and job windows based on the forecast + spikes.
+
+Operational hooks: routes, UI, CLI, and CI so the “intelligence” is a knob you can turn, not a rumor.
+
+
+The stack is now predictive, self-adjusting, and still cryptographically grounded. Onward.
+
+sha256 seal calebfedorbykerkonev10271998

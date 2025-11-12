@@ -1,0 +1,1024 @@
+# Build v210.x — "Codex Logos Χ·X (Chi-Extended): Subscriptions • Coupons • Payouts • Aggregation • Webhooks"
+# Repo: codex_v210x_chi_plus
+# Port: 8891
+# Adds to v210: subscriptions, coupons, revenue-share payouts, daily aggregation, CSV exports,
+# webhooks for invoice/purchase events, simple fraud guard, and rate limiting.
+# Includes OpenAPI, Docker/Compose, CI tests, manifest, and a tiny HTML console.
+
+import os, json, zipfile, hashlib, datetime, shutil, time, csv
+
+BASE="/mnt/data/codex_v210x_chi_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v210.x-chi-extended",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8891,
+  "currency": "USD",
+  "btc_address": "bc1qcodexextendedxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "lightning_invoice_prefix": "lnbc1codexx",
+  "plans": {
+    "free": {"monthly_fee": 0, "overage_per_unit": 0.00, "quota": 1000},
+    "pro": {"monthly_fee": 29, "overage_per_unit": 0.005, "quota": 100000},
+    "enterprise": {"monthly_fee": 499, "overage_per_unit": 0.003, "quota": 5000000}
+  },
+  "revenue_share_default": {"creator": 0.7, "platform": 0.3},
+  "webhooks": [],
+  "rate_limit_per_minute": 180
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/clock.py","""import time\nnow=lambda:int(time.time())\n""")
+W("codex/utils/crypto.py","""import hashlib, json\nsha256_json=lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()\n""")
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0,'invoices':0,'orders':0,'subs':0,'payouts':0,'webhooks':0,'csv_exports':0,'rate_drops':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n\
+    up=int(time.time()-START)\n\
+    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- Data stores ----------------
+W("codex/data/accounts.json", json.dumps({"users":{"owner@codex":{"plan":"enterprise","credits":100000,"wallet_usd":0.0},"reader@codex":{"plan":"free","credits":500,"wallet_usd":0.0}}}, indent=2))
+W("codex/data/coupons.json", json.dumps({"coupons":{"WELCOME10":{"percent":10},"VIP25":{"percent":25}}}, indent=2))
+W("codex/data/subscriptions.json", json.dumps({"subs":{}}, indent=2))
+W("codex/data/payouts.json", json.dumps({"payouts":[]}, indent=2))
+
+# ---------------- Rate limit & fraud guard ----------------
+W("codex/guard/rate.py","""from codex.utils.clock import now\nWINDOW=60\nHITS={}\ndef allow(key:str, limit:int)->bool:\n    t=now(); b=t//WINDOW\n    k=(key,b)\n    HITS[k]=HITS.get(k,0)+1\n    return HITS[k]<=limit\n""")
+W("codex/guard/fraud.py","""def risky(order)->bool:\n    # toy heuristic: very high price without creator share looks odd\n    return order.get('price',0)>9999 and order.get('rev_share',{}).get('creator',0)==0\n""")
+
+# ---------------- Usage & pricing extensions ----------------
+W("codex/economics/usage.py","""import json, os, time\nDB='codex/data/usage.jsonl'\n\
+def record(user:str, units:int, kind:str='generic')->dict:\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    evt={'ts':time.time(),'user':user,'units':int(units),'kind':kind}\n\
+    with open(DB,'a',encoding='utf-8') as f: f.write(json.dumps(evt, sort_keys=True)+'\\n')\n\
+    return {'ok':True, 'event':evt}\n\
+def export()->list:\n\
+    if not os.path.exists(DB): return []\n\
+    return [json.loads(l) for l in open(DB,encoding='utf-8')]\n\
+def daily_aggregate()->dict:\n\
+    out={}\n\
+    for e in export():\n\
+        day=int(e['ts'])//86400\n\
+        out.setdefault(day,0); out[day]+=e['units']\n\
+    return {'days':out}\n""")
+
+W("codex/economics/pricing.py","""import json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nPLANS=CFG['plans']\n\
+def quote(plan:str, units:int, coupon=None)->dict:\n\
+    p=PLANS[plan]\n\
+    over=max(0, units - p['quota'])\n\
+    base=p['monthly_fee'] + over * p['overage_per_unit']\n\
+    discount=0\n\
+    if coupon and isinstance(coupon, dict) and coupon.get('percent'):\n\
+        discount=base * (coupon['percent']/100)\n\
+    total=round(max(0, base-discount), 4)\n\
+    return {'plan': plan, 'units': units, 'quota': p['quota'], 'overage_units': over, 'amount': total, 'currency': CFG['currency'], 'discount': round(discount,4)}\n""")
+
+W("codex/economics/invoice.py","""import json, time, os, random\nfrom codex.utils.crypto import sha256_json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\n\
+def issue(user:str, line_items:list, coupon=None)->dict:\n\
+    total=sum(li['amount'] for li in line_items)\n\
+    if coupon and coupon.get('percent'): total = round(total*(1.0 - coupon['percent']/100),2)\n\
+    inv={'id': f'INV-{int(time.time())}-{random.randint(1000,9999)}','user':user,'lines':line_items,'total':round(total,2),'currency':CFG['currency'],'btc_address':CFG['btc_address'],'ln_invoice':CFG['lightning_invoice_prefix']+'-'+str(int(time.time()))}\n\
+    inv['hash']=sha256_json(inv)\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    with open(f"codex/data/{inv['id']}.json",'w',encoding='utf-8') as f: json.dump(inv,f,indent=2)\n\
+    return inv\n""")
+
+# ---------------- Subscriptions, coupons, payouts ----------------
+W("codex/economics/subs.py","""import json, time\nSUBS=json.load(open('codex/data/subscriptions.json',encoding='utf-8'))\n\
+def create(user:str, plan:str)->dict:\n\
+    sub={'user':user,'plan':plan,'since':time.time(),'active':True}\n\
+    SUBS['subs'][user]=sub; _save(); return {'ok':True,'sub':sub}\n\
+def cancel(user:str)->dict:\n\
+    s=SUBS['subs'].get(user); \n\
+    if not s: return {'ok':False,'error':'not_found'}\n\
+    s['active']=False; _save(); return {'ok':True,'sub':s}\n\
+def get(user:str)->dict: return SUBS['subs'].get(user)\n\
+def _save():\n\
+    with open('codex/data/subscriptions.json','w',encoding='utf-8') as f: json.dump(SUBS,f,indent=2)\n""")
+
+W("codex/economics/coupons.py","""import json\nCOUP=json.load(open('codex/data/coupons.json',encoding='utf-8'))\n\
+def get(code:str): return COUP['coupons'].get(code)\n""")
+
+W("codex/economics/payouts.py","""import json, time\nDB=json.load(open('codex/data/payouts.json',encoding='utf-8'))\n\
+def schedule(order)->dict:\n\
+    share=order.get('rev_share',{'creator':0.7,'platform':0.3})\n\
+    creator_due=round(order['price']*share.get('creator',0),2)\n\
+    rec={'ts':time.time(),'order':order,'creator_due':creator_due,'status':'scheduled'}\n\
+    DB['payouts'].append(rec); _save(); return {'ok':True,'payout':rec}\n\
+def list_all(): return DB['payouts']\n\
+def _save():\n\
+    with open('codex/data/payouts.json','w',encoding='utf-8') as f: json.dump(DB,f,indent=2)\n""")
+
+# ---------------- Marketplace (extended) ----------------
+W("codex/market/skus.json", json.dumps({
+  "skus": {
+    "seal.codex.pro": {"title":"Pro Seal Pack","price":19.0,"units":1,"creator":"cfbk","rev_share":{"creator":0.7,"platform":0.3}},
+    "gpu.batch.1h": {"title":"GPU Batch (1 hour)","price":4.0,"units":3600,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}},
+    "token.100k": {"title":"100k API Tokens","price":3.0,"units":100000,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}}
+  }
+}, indent=2))
+
+W("codex/market/market.py","""import json, time\nfrom codex.economics.payouts import schedule\nfrom codex.guard.fraud import risky\nSKUS=json.load(open('codex/market/skus.json',encoding='utf-8'))['skus']\n\
+def list_skus(): return SKUS\n\
+def buy(user:str, sku_id:str)->dict:\n\
+    sku=SKUS.get(sku_id)\n\
+    if not sku: return {'ok':False,'error':'unknown_sku'}\n\
+    order={'id': f'ORD-{int(time.time())}', 'user':user, 'sku':sku_id, 'price':sku['price'], 'units':sku['units'], 'creator': sku['creator'], 'rev_share': sku['rev_share']}\n\
+    if risky(order): return {'ok':False,'error':'risk_detected'}\n\
+    schedule(order)\n\
+    return {'ok':True,'order':order}\n""")
+
+# ---------------- Webhooks ----------------
+W("codex/hooks/webhooks.py","""import json, urllib.request, ssl\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nssl_ctx=ssl.create_default_context()\n\
+def broadcast(event:str, payload:dict)->dict:\n\
+    ok,fail=0,0\n\
+    for t in CFG.get('webhooks',[]):\n\
+        try:\n\
+            req=urllib.request.Request(t, data=json.dumps({'event':event,'payload':payload}).encode(), headers={'Content-Type':'application/json'})\n\
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r: ok+=1\n\
+        except Exception:\n\
+            fail+=1\n\
+    return {'ok':True,'sent':ok,'failed':fail}\n""")
+
+# ---------------- CSV exporter ----------------
+W("codex/export/csv.py","""import csv, io, json, os\n\
+def to_csv(rows, fields):\n\
+    buf=io.StringIO()\n\
+    w=csv.DictWriter(buf, fieldnames=fields)\n\
+    w.writeheader()\n\
+    for r in rows: w.writerow({k:r.get(k) for k in fields})\n\
+    return buf.getvalue()\n""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Χ·X (Chi Extended) API","version":"v210.x"},
+  "paths":{
+    "/api/usage/record":{"post":{"summary":"Record usage"}},
+    "/api/usage/export":{"get":{"summary":"Export usage JSON"}},
+    "/api/usage/export_csv":{"get":{"summary":"Export usage CSV"}},
+    "/api/usage/daily":{"get":{"summary":"Daily aggregates"}},
+    "/api/price/quote":{"post":{"summary":"Quote with coupon"}},
+    "/api/invoice/issue":{"post":{"summary":"Issue invoice (+coupon)"}},
+    "/api/subs/create":{"post":{"summary":"Create subscription"}},
+    "/api/subs/cancel":{"post":{"summary":"Cancel subscription"}},
+    "/api/subs/get":{"post":{"summary":"Get subscription"}},
+    "/api/coupons/get":{"post":{"summary":"Get coupon"}},
+    "/api/market/list":{"get":{"summary":"List SKUs"}},
+    "/api/market/buy":{"post":{"summary":"Buy SKU → payout schedule"}},
+    "/api/payouts/list":{"get":{"summary":"List scheduled payouts"}},
+    "/api/hooks/broadcast":{"post":{"summary":"Broadcast webhook"}},
+    "/metrics":{"get":{"summary":"Metrics"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}}
+  }
+}, indent=2))
+
+# ---------------- API Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse, parse_qs
+from codex.metrics.collector import bump, render as metrics_render, C
+from codex.guard.rate import allow as rl_allow
+from codex.economics.usage import record as u_record, export as u_export, daily_aggregate
+from codex.economics.pricing import quote
+from codex.economics.invoice import issue
+from codex.economics.subs import create as s_create, cancel as s_cancel, get as s_get
+from codex.economics.coupons import get as c_get
+from codex.market.market import list_skus, buy
+from codex.economics.payouts import list_all as payouts_list
+from codex.export.csv import to_csv
+from codex.hooks.webhooks import broadcast
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def _ratekey(self): return self.client_address[0]
+
+    def do_POST(self):
+        body=self._json(); p=urlparse(self.path).path
+        bump('requests_total')
+        if not rl_allow(self._ratekey(), CFG['rate_limit_per_minute']):
+            bump('rate_drops'); return self._ok({'ok':False,'error':'rate_limited'})
+
+        if p=='/api/usage/record': return self._ok(u_record(body.get('user','reader@codex'), int(body.get('units',1)), body.get('kind','generic')))
+        if p=='/api/price/quote': return self._ok(quote(body.get('plan','free'), int(body.get('units',0)), c_get(body.get('coupon')) if body.get('coupon') else None))
+        if p=='/api/invoice/issue':
+            inv=issue(body.get('user','reader@codex'), body.get('line_items',[]), c_get(body.get('coupon')) if body.get('coupon') else None)
+            bump('invoices'); broadcast('invoice.issued', inv); return self._ok(inv)
+        if p=='/api/subs/create': bump('subs'); return self._ok(s_create(body.get('user','reader@codex'), body.get('plan','pro')))
+        if p=='/api/subs/cancel': return self._ok(s_cancel(body.get('user','reader@codex')))
+        if p=='/api/subs/get': return self._ok({'sub': s_get(body.get('user','reader@codex'))})
+        if p=='/api/coupons/get': return self._ok({'coupon': c_get(body.get('code',''))})
+        if p=='/api/market/buy':
+            res=buy(body.get('user','reader@codex'), body.get('sku','token.100k')); 
+            if res.get('ok'): bump('orders'); broadcast('market.order', res['order'])
+            return self._ok(res)
+        if p=='/api/hooks/broadcast':
+            r=broadcast(body.get('event','codex.event'), body.get('payload',{})); bump('webhooks'); return self._ok(r)
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/usage/export': return self._ok(u_export())
+        if p=='/api/usage/daily': return self._ok(daily_aggregate())
+        if p=='/api/usage/export_csv':
+            rows=u_export(); csv_data=to_csv(rows, ['ts','user','units','kind'])
+            self.send_response(200); self.send_header('Content-Type','text/csv'); self.end_headers(); self.wfile.write(csv_data.encode()); return
+        if p=='/api/market/list': return self._ok(list_skus())
+        if p=='/api/payouts/list': return self._ok(payouts_list())
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8891)
+""")
+
+# ---------------- Tiny HTML console ----------------
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Χ·X (8891)</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Χ·X — Economics Extended</h1>
+<div>
+  <button onclick="listSkus()">List SKUs</button>
+  <button onclick="buy()">Buy token.100k</button>
+  <button onclick="quote()">Quote PRO 120k + VIP25</button>
+  <button onclick="sub()">Create SUB</button>
+  <button onclick="inv()">Issue invoice</button>
+  <a href="/openapi.json" target="_blank">OpenAPI</a>
+  <a href="/metrics" target="_blank">Metrics</a>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function listSkus(){get('/api/market/list')}
+function buy(){post('/api/market/buy',{user:'reader@codex',sku:'token.100k'})}
+function quote(){post('/api/price/quote',{plan:'pro',units:120000,coupon:'VIP25'})}
+function sub(){post('/api/subs/create',{user:'reader@codex',plan:'pro'})}
+function inv(){post('/api/invoice/issue',{user:'reader@codex',line_items:[{desc:'overage',amount:12.34}],coupon:'WELCOME10'})}
+</script>
+</body></html>
+""")
+
+# ---------------- Docker / Compose / CI / Tests ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8891
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-chi-x:
+    build: ./deploy
+    ports:
+      - "8891:8891"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Χ·X (v210.x) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Quote + CSV + Sub + Buy
+        run: python3 - <<'PY'\nfrom codex.economics.pricing import quote\nfrom codex.economics.subs import create, get\nfrom codex.economics.coupons import get as cget\nfrom codex.export.csv import to_csv\nprint(quote('pro',120000,cget('VIP25'))['discount']>0)\ncreate('ci@codex','pro')\nprint(get('ci@codex')['plan']=='pro')\nprint(len(to_csv([{'ts':1,'user':'u','units':2,'kind':'x'}],['ts','user','units','kind']))>0)\nPY
+""")
+W("tests/test_chi_x.py","""from codex.economics.pricing import quote\nfrom codex.economics.coupons import get\nq=quote('pro',120000,get('VIP25'))\nassert q['amount']>=0 and q['discount']>0\nprint('chi-x ok')\n""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v210x_chi_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v210.x — "Codex Logos Χ·X (Chi-Extended): Subscriptions • Coupons • Payouts • Aggregation • Webhooks"
+# Repo: codex_v210x_chi_plus
+# Port: 8891
+# Adds to v210: subscriptions, coupons, revenue-share payouts, daily aggregation, CSV exports,
+# webhooks for invoice/purchase events, simple fraud guard, and rate limiting.
+# Includes OpenAPI, Docker/Compose, CI tests, manifest, and a tiny HTML console.
+
+import os, json, zipfile, hashlib, datetime, shutil, time, csv
+
+BASE="/mnt/data/codex_v210x_chi_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v210.x-chi-extended",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8891,
+  "currency": "USD",
+  "btc_address": "bc1qcodexextendedxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "lightning_invoice_prefix": "lnbc1codexx",
+  "plans": {
+    "free": {"monthly_fee": 0, "overage_per_unit": 0.00, "quota": 1000},
+    "pro": {"monthly_fee": 29, "overage_per_unit": 0.005, "quota": 100000},
+    "enterprise": {"monthly_fee": 499, "overage_per_unit": 0.003, "quota": 5000000}
+  },
+  "revenue_share_default": {"creator": 0.7, "platform": 0.3},
+  "webhooks": [],
+  "rate_limit_per_minute": 180
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/clock.py","""import time\nnow=lambda:int(time.time())\n""")
+W("codex/utils/crypto.py","""import hashlib, json\nsha256_json=lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()\n""")
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0,'invoices':0,'orders':0,'subs':0,'payouts':0,'webhooks':0,'csv_exports':0,'rate_drops':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n\
+    up=int(time.time()-START)\n\
+    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- Data stores ----------------
+W("codex/data/accounts.json", json.dumps({"users":{"owner@codex":{"plan":"enterprise","credits":100000,"wallet_usd":0.0},"reader@codex":{"plan":"free","credits":500,"wallet_usd":0.0}}}, indent=2))
+W("codex/data/coupons.json", json.dumps({"coupons":{"WELCOME10":{"percent":10},"VIP25":{"percent":25}}}, indent=2))
+W("codex/data/subscriptions.json", json.dumps({"subs":{}}, indent=2))
+W("codex/data/payouts.json", json.dumps({"payouts":[]}, indent=2))
+
+# ---------------- Rate limit & fraud guard ----------------
+W("codex/guard/rate.py","""from codex.utils.clock import now\nWINDOW=60\nHITS={}\ndef allow(key:str, limit:int)->bool:\n    t=now(); b=t//WINDOW\n    k=(key,b)\n    HITS[k]=HITS.get(k,0)+1\n    return HITS[k]<=limit\n""")
+W("codex/guard/fraud.py","""def risky(order)->bool:\n    # toy heuristic: very high price without creator share looks odd\n    return order.get('price',0)>9999 and order.get('rev_share',{}).get('creator',0)==0\n""")
+
+# ---------------- Usage & pricing extensions ----------------
+W("codex/economics/usage.py","""import json, os, time\nDB='codex/data/usage.jsonl'\n\
+def record(user:str, units:int, kind:str='generic')->dict:\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    evt={'ts':time.time(),'user':user,'units':int(units),'kind':kind}\n\
+    with open(DB,'a',encoding='utf-8') as f: f.write(json.dumps(evt, sort_keys=True)+'\\n')\n\
+    return {'ok':True, 'event':evt}\n\
+def export()->list:\n\
+    if not os.path.exists(DB): return []\n\
+    return [json.loads(l) for l in open(DB,encoding='utf-8')]\n\
+def daily_aggregate()->dict:\n\
+    out={}\n\
+    for e in export():\n\
+        day=int(e['ts'])//86400\n\
+        out.setdefault(day,0); out[day]+=e['units']\n\
+    return {'days':out}\n""")
+
+W("codex/economics/pricing.py","""import json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nPLANS=CFG['plans']\n\
+def quote(plan:str, units:int, coupon=None)->dict:\n\
+    p=PLANS[plan]\n\
+    over=max(0, units - p['quota'])\n\
+    base=p['monthly_fee'] + over * p['overage_per_unit']\n\
+    discount=0\n\
+    if coupon and isinstance(coupon, dict) and coupon.get('percent'):\n\
+        discount=base * (coupon['percent']/100)\n\
+    total=round(max(0, base-discount), 4)\n\
+    return {'plan': plan, 'units': units, 'quota': p['quota'], 'overage_units': over, 'amount': total, 'currency': CFG['currency'], 'discount': round(discount,4)}\n""")
+
+W("codex/economics/invoice.py","""import json, time, os, random\nfrom codex.utils.crypto import sha256_json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\n\
+def issue(user:str, line_items:list, coupon=None)->dict:\n\
+    total=sum(li['amount'] for li in line_items)\n\
+    if coupon and coupon.get('percent'): total = round(total*(1.0 - coupon['percent']/100),2)\n\
+    inv={'id': f'INV-{int(time.time())}-{random.randint(1000,9999)}','user':user,'lines':line_items,'total':round(total,2),'currency':CFG['currency'],'btc_address':CFG['btc_address'],'ln_invoice':CFG['lightning_invoice_prefix']+'-'+str(int(time.time()))}\n\
+    inv['hash']=sha256_json(inv)\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    with open(f"codex/data/{inv['id']}.json",'w',encoding='utf-8') as f: json.dump(inv,f,indent=2)\n\
+    return inv\n""")
+
+# ---------------- Subscriptions, coupons, payouts ----------------
+W("codex/economics/subs.py","""import json, time\nSUBS=json.load(open('codex/data/subscriptions.json',encoding='utf-8'))\n\
+def create(user:str, plan:str)->dict:\n\
+    sub={'user':user,'plan':plan,'since':time.time(),'active':True}\n\
+    SUBS['subs'][user]=sub; _save(); return {'ok':True,'sub':sub}\n\
+def cancel(user:str)->dict:\n\
+    s=SUBS['subs'].get(user); \n\
+    if not s: return {'ok':False,'error':'not_found'}\n\
+    s['active']=False; _save(); return {'ok':True,'sub':s}\n\
+def get(user:str)->dict: return SUBS['subs'].get(user)\n\
+def _save():\n\
+    with open('codex/data/subscriptions.json','w',encoding='utf-8') as f: json.dump(SUBS,f,indent=2)\n""")
+
+W("codex/economics/coupons.py","""import json\nCOUP=json.load(open('codex/data/coupons.json',encoding='utf-8'))\n\
+def get(code:str): return COUP['coupons'].get(code)\n""")
+
+W("codex/economics/payouts.py","""import json, time\nDB=json.load(open('codex/data/payouts.json',encoding='utf-8'))\n\
+def schedule(order)->dict:\n\
+    share=order.get('rev_share',{'creator':0.7,'platform':0.3})\n\
+    creator_due=round(order['price']*share.get('creator',0),2)\n\
+    rec={'ts':time.time(),'order':order,'creator_due':creator_due,'status':'scheduled'}\n\
+    DB['payouts'].append(rec); _save(); return {'ok':True,'payout':rec}\n\
+def list_all(): return DB['payouts']\n\
+def _save():\n\
+    with open('codex/data/payouts.json','w',encoding='utf-8') as f: json.dump(DB,f,indent=2)\n""")
+
+# ---------------- Marketplace (extended) ----------------
+W("codex/market/skus.json", json.dumps({
+  "skus": {
+    "seal.codex.pro": {"title":"Pro Seal Pack","price":19.0,"units":1,"creator":"cfbk","rev_share":{"creator":0.7,"platform":0.3}},
+    "gpu.batch.1h": {"title":"GPU Batch (1 hour)","price":4.0,"units":3600,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}},
+    "token.100k": {"title":"100k API Tokens","price":3.0,"units":100000,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}}
+  }
+}, indent=2))
+
+W("codex/market/market.py","""import json, time\nfrom codex.economics.payouts import schedule\nfrom codex.guard.fraud import risky\nSKUS=json.load(open('codex/market/skus.json',encoding='utf-8'))['skus']\n\
+def list_skus(): return SKUS\n\
+def buy(user:str, sku_id:str)->dict:\n\
+    sku=SKUS.get(sku_id)\n\
+    if not sku: return {'ok':False,'error':'unknown_sku'}\n\
+    order={'id': f'ORD-{int(time.time())}', 'user':user, 'sku':sku_id, 'price':sku['price'], 'units':sku['units'], 'creator': sku['creator'], 'rev_share': sku['rev_share']}\n\
+    if risky(order): return {'ok':False,'error':'risk_detected'}\n\
+    schedule(order)\n\
+    return {'ok':True,'order':order}\n""")
+
+# ---------------- Webhooks ----------------
+W("codex/hooks/webhooks.py","""import json, urllib.request, ssl\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nssl_ctx=ssl.create_default_context()\n\
+def broadcast(event:str, payload:dict)->dict:\n\
+    ok,fail=0,0\n\
+    for t in CFG.get('webhooks',[]):\n\
+        try:\n\
+            req=urllib.request.Request(t, data=json.dumps({'event':event,'payload':payload}).encode(), headers={'Content-Type':'application/json'})\n\
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r: ok+=1\n\
+        except Exception:\n\
+            fail+=1\n\
+    return {'ok':True,'sent':ok,'failed':fail}\n""")
+
+# ---------------- CSV exporter ----------------
+W("codex/export/csv.py","""import csv, io, json, os\n\
+def to_csv(rows, fields):\n\
+    buf=io.StringIO()\n\
+    w=csv.DictWriter(buf, fieldnames=fields)\n\
+    w.writeheader()\n\
+    for r in rows: w.writerow({k:r.get(k) for k in fields})\n\
+    return buf.getvalue()\n""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Χ·X (Chi Extended) API","version":"v210.x"},
+  "paths":{
+    "/api/usage/record":{"post":{"summary":"Record usage"}},
+    "/api/usage/export":{"get":{"summary":"Export usage JSON"}},
+    "/api/usage/export_csv":{"get":{"summary":"Export usage CSV"}},
+    "/api/usage/daily":{"get":{"summary":"Daily aggregates"}},
+    "/api/price/quote":{"post":{"summary":"Quote with coupon"}},
+    "/api/invoice/issue":{"post":{"summary":"Issue invoice (+coupon)"}},
+    "/api/subs/create":{"post":{"summary":"Create subscription"}},
+    "/api/subs/cancel":{"post":{"summary":"Cancel subscription"}},
+    "/api/subs/get":{"post":{"summary":"Get subscription"}},
+    "/api/coupons/get":{"post":{"summary":"Get coupon"}},
+    "/api/market/list":{"get":{"summary":"List SKUs"}},
+    "/api/market/buy":{"post":{"summary":"Buy SKU → payout schedule"}},
+    "/api/payouts/list":{"get":{"summary":"List scheduled payouts"}},
+    "/api/hooks/broadcast":{"post":{"summary":"Broadcast webhook"}},
+    "/metrics":{"get":{"summary":"Metrics"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}}
+  }
+}, indent=2))
+
+# ---------------- API Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse, parse_qs
+from codex.metrics.collector import bump, render as metrics_render, C
+from codex.guard.rate import allow as rl_allow
+from codex.economics.usage import record as u_record, export as u_export, daily_aggregate
+from codex.economics.pricing import quote
+from codex.economics.invoice import issue
+from codex.economics.subs import create as s_create, cancel as s_cancel, get as s_get
+from codex.economics.coupons import get as c_get
+from codex.market.market import list_skus, buy
+from codex.economics.payouts import list_all as payouts_list
+from codex.export.csv import to_csv
+from codex.hooks.webhooks import broadcast
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def _ratekey(self): return self.client_address[0]
+
+    def do_POST(self):
+        body=self._json(); p=urlparse(self.path).path
+        bump('requests_total')
+        if not rl_allow(self._ratekey(), CFG['rate_limit_per_minute']):
+            bump('rate_drops'); return self._ok({'ok':False,'error':'rate_limited'})
+
+        if p=='/api/usage/record': return self._ok(u_record(body.get('user','reader@codex'), int(body.get('units',1)), body.get('kind','generic')))
+        if p=='/api/price/quote': return self._ok(quote(body.get('plan','free'), int(body.get('units',0)), c_get(body.get('coupon')) if body.get('coupon') else None))
+        if p=='/api/invoice/issue':
+            inv=issue(body.get('user','reader@codex'), body.get('line_items',[]), c_get(body.get('coupon')) if body.get('coupon') else None)
+            bump('invoices'); broadcast('invoice.issued', inv); return self._ok(inv)
+        if p=='/api/subs/create': bump('subs'); return self._ok(s_create(body.get('user','reader@codex'), body.get('plan','pro')))
+        if p=='/api/subs/cancel': return self._ok(s_cancel(body.get('user','reader@codex')))
+        if p=='/api/subs/get': return self._ok({'sub': s_get(body.get('user','reader@codex'))})
+        if p=='/api/coupons/get': return self._ok({'coupon': c_get(body.get('code',''))})
+        if p=='/api/market/buy':
+            res=buy(body.get('user','reader@codex'), body.get('sku','token.100k')); 
+            if res.get('ok'): bump('orders'); broadcast('market.order', res['order'])
+            return self._ok(res)
+        if p=='/api/hooks/broadcast':
+            r=broadcast(body.get('event','codex.event'), body.get('payload',{})); bump('webhooks'); return self._ok(r)
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/usage/export': return self._ok(u_export())
+        if p=='/api/usage/daily': return self._ok(daily_aggregate())
+        if p=='/api/usage/export_csv':
+            rows=u_export(); csv_data=to_csv(rows, ['ts','user','units','kind'])
+            self.send_response(200); self.send_header('Content-Type','text/csv'); self.end_headers(); self.wfile.write(csv_data.encode()); return
+        if p=='/api/market/list': return self._ok(list_skus())
+        if p=='/api/payouts/list': return self._ok(payouts_list())
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8891)
+""")
+
+# ---------------- Tiny HTML console ----------------
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Χ·X (8891)</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Χ·X — Economics Extended</h1>
+<div>
+  <button onclick="listSkus()">List SKUs</button>
+  <button onclick="buy()">Buy token.100k</button>
+  <button onclick="quote()">Quote PRO 120k + VIP25</button>
+  <button onclick="sub()">Create SUB</button>
+  <button onclick="inv()">Issue invoice</button>
+  <a href="/openapi.json" target="_blank">OpenAPI</a>
+  <a href="/metrics" target="_blank">Metrics</a>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function listSkus(){get('/api/market/list')}
+function buy(){post('/api/market/buy',{user:'reader@codex',sku:'token.100k'})}
+function quote(){post('/api/price/quote',{plan:'pro',units:120000,coupon:'VIP25'})}
+function sub(){post('/api/subs/create',{user:'reader@codex',plan:'pro'})}
+function inv(){post('/api/invoice/issue',{user:'reader@codex',line_items:[{desc:'overage',amount:12.34}],coupon:'WELCOME10'})}
+</script>
+</body></html>
+""")
+
+# ---------------- Docker / Compose / CI / Tests ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8891
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-chi-x:
+    build: ./deploy
+    ports:
+      - "8891:8891"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Χ·X (v210.x) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Quote + CSV + Sub + Buy
+        run: python3 - <<'PY'\nfrom codex.economics.pricing import quote\nfrom codex.economics.subs import create, get\nfrom codex.economics.coupons import get as cget\nfrom codex.export.csv import to_csv\nprint(quote('pro',120000,cget('VIP25'))['discount']>0)\ncreate('ci@codex','pro')\nprint(get('ci@codex')['plan']=='pro')\nprint(len(to_csv([{'ts':1,'user':'u','units':2,'kind':'x'}],['ts','user','units','kind']))>0)\nPY
+""")
+W("tests/test_chi_x.py","""from codex.economics.pricing import quote\nfrom codex.economics.coupons import get\nq=quote('pro',120000,get('VIP25'))\nassert q['amount']>=0 and q['discount']>0\nprint('chi-x ok')\n""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v210x_chi_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)# Build v210.x — "Codex Logos Χ·X (Chi-Extended): Subscriptions • Coupons • Payouts • Aggregation • Webhooks"
+# Repo: codex_v210x_chi_plus
+# Port: 8891
+# Adds to v210: subscriptions, coupons, revenue-share payouts, daily aggregation, CSV exports,
+# webhooks for invoice/purchase events, simple fraud guard, and rate limiting.
+# Includes OpenAPI, Docker/Compose, CI tests, manifest, and a tiny HTML console.
+
+import os, json, zipfile, hashlib, datetime, shutil, time, csv
+
+BASE="/mnt/data/codex_v210x_chi_plus"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content):
+    p=os.path.join(BASE, rel)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p,"w",encoding="utf-8") as f: f.write(content)
+    return p
+
+def sha256_file(p):
+    h=hashlib.sha256()
+    with open(p,"rb") as f:
+        for chunk in iter(lambda:f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now = datetime.datetime.utcnow().isoformat()+"Z"
+
+# ---------------- Config ----------------
+W("codex/config.json", json.dumps({
+  "version": "v210.x-chi-extended",
+  "generated_utc": now,
+  "seal_id": "calebfedorbykerkonev10271998",
+  "subject": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "port": 8891,
+  "currency": "USD",
+  "btc_address": "bc1qcodexextendedxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "lightning_invoice_prefix": "lnbc1codexx",
+  "plans": {
+    "free": {"monthly_fee": 0, "overage_per_unit": 0.00, "quota": 1000},
+    "pro": {"monthly_fee": 29, "overage_per_unit": 0.005, "quota": 100000},
+    "enterprise": {"monthly_fee": 499, "overage_per_unit": 0.003, "quota": 5000000}
+  },
+  "revenue_share_default": {"creator": 0.7, "platform": 0.3},
+  "webhooks": [],
+  "rate_limit_per_minute": 180
+}, indent=2))
+
+# ---------------- Utils ----------------
+W("codex/utils/clock.py","""import time\nnow=lambda:int(time.time())\n""")
+W("codex/utils/crypto.py","""import hashlib, json\nsha256_json=lambda o: hashlib.sha256(json.dumps(o, sort_keys=True).encode()).hexdigest()\n""")
+
+# ---------------- Metrics ----------------
+W("codex/metrics/collector.py","""import time\nSTART=time.time()\nC={'requests_total':0,'invoices':0,'orders':0,'subs':0,'payouts':0,'webhooks':0,'csv_exports':0,'rate_drops':0}\n\
+def bump(k,inc=1): C[k]=C.get(k,0)+inc\n\
+def render()->str:\n\
+    up=int(time.time()-START)\n\
+    return "\\n".join([*(f"codex_{k} {v}" for k,v in C.items()), f"codex_uptime_seconds {up}"])+"\\n"\n""")
+
+# ---------------- Data stores ----------------
+W("codex/data/accounts.json", json.dumps({"users":{"owner@codex":{"plan":"enterprise","credits":100000,"wallet_usd":0.0},"reader@codex":{"plan":"free","credits":500,"wallet_usd":0.0}}}, indent=2))
+W("codex/data/coupons.json", json.dumps({"coupons":{"WELCOME10":{"percent":10},"VIP25":{"percent":25}}}, indent=2))
+W("codex/data/subscriptions.json", json.dumps({"subs":{}}, indent=2))
+W("codex/data/payouts.json", json.dumps({"payouts":[]}, indent=2))
+
+# ---------------- Rate limit & fraud guard ----------------
+W("codex/guard/rate.py","""from codex.utils.clock import now\nWINDOW=60\nHITS={}\ndef allow(key:str, limit:int)->bool:\n    t=now(); b=t//WINDOW\n    k=(key,b)\n    HITS[k]=HITS.get(k,0)+1\n    return HITS[k]<=limit\n""")
+W("codex/guard/fraud.py","""def risky(order)->bool:\n    # toy heuristic: very high price without creator share looks odd\n    return order.get('price',0)>9999 and order.get('rev_share',{}).get('creator',0)==0\n""")
+
+# ---------------- Usage & pricing extensions ----------------
+W("codex/economics/usage.py","""import json, os, time\nDB='codex/data/usage.jsonl'\n\
+def record(user:str, units:int, kind:str='generic')->dict:\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    evt={'ts':time.time(),'user':user,'units':int(units),'kind':kind}\n\
+    with open(DB,'a',encoding='utf-8') as f: f.write(json.dumps(evt, sort_keys=True)+'\\n')\n\
+    return {'ok':True, 'event':evt}\n\
+def export()->list:\n\
+    if not os.path.exists(DB): return []\n\
+    return [json.loads(l) for l in open(DB,encoding='utf-8')]\n\
+def daily_aggregate()->dict:\n\
+    out={}\n\
+    for e in export():\n\
+        day=int(e['ts'])//86400\n\
+        out.setdefault(day,0); out[day]+=e['units']\n\
+    return {'days':out}\n""")
+
+W("codex/economics/pricing.py","""import json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nPLANS=CFG['plans']\n\
+def quote(plan:str, units:int, coupon=None)->dict:\n\
+    p=PLANS[plan]\n\
+    over=max(0, units - p['quota'])\n\
+    base=p['monthly_fee'] + over * p['overage_per_unit']\n\
+    discount=0\n\
+    if coupon and isinstance(coupon, dict) and coupon.get('percent'):\n\
+        discount=base * (coupon['percent']/100)\n\
+    total=round(max(0, base-discount), 4)\n\
+    return {'plan': plan, 'units': units, 'quota': p['quota'], 'overage_units': over, 'amount': total, 'currency': CFG['currency'], 'discount': round(discount,4)}\n""")
+
+W("codex/economics/invoice.py","""import json, time, os, random\nfrom codex.utils.crypto import sha256_json\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\n\
+def issue(user:str, line_items:list, coupon=None)->dict:\n\
+    total=sum(li['amount'] for li in line_items)\n\
+    if coupon and coupon.get('percent'): total = round(total*(1.0 - coupon['percent']/100),2)\n\
+    inv={'id': f'INV-{int(time.time())}-{random.randint(1000,9999)}','user':user,'lines':line_items,'total':round(total,2),'currency':CFG['currency'],'btc_address':CFG['btc_address'],'ln_invoice':CFG['lightning_invoice_prefix']+'-'+str(int(time.time()))}\n\
+    inv['hash']=sha256_json(inv)\n\
+    os.makedirs('codex/data', exist_ok=True)\n\
+    with open(f"codex/data/{inv['id']}.json",'w',encoding='utf-8') as f: json.dump(inv,f,indent=2)\n\
+    return inv\n""")
+
+# ---------------- Subscriptions, coupons, payouts ----------------
+W("codex/economics/subs.py","""import json, time\nSUBS=json.load(open('codex/data/subscriptions.json',encoding='utf-8'))\n\
+def create(user:str, plan:str)->dict:\n\
+    sub={'user':user,'plan':plan,'since':time.time(),'active':True}\n\
+    SUBS['subs'][user]=sub; _save(); return {'ok':True,'sub':sub}\n\
+def cancel(user:str)->dict:\n\
+    s=SUBS['subs'].get(user); \n\
+    if not s: return {'ok':False,'error':'not_found'}\n\
+    s['active']=False; _save(); return {'ok':True,'sub':s}\n\
+def get(user:str)->dict: return SUBS['subs'].get(user)\n\
+def _save():\n\
+    with open('codex/data/subscriptions.json','w',encoding='utf-8') as f: json.dump(SUBS,f,indent=2)\n""")
+
+W("codex/economics/coupons.py","""import json\nCOUP=json.load(open('codex/data/coupons.json',encoding='utf-8'))\n\
+def get(code:str): return COUP['coupons'].get(code)\n""")
+
+W("codex/economics/payouts.py","""import json, time\nDB=json.load(open('codex/data/payouts.json',encoding='utf-8'))\n\
+def schedule(order)->dict:\n\
+    share=order.get('rev_share',{'creator':0.7,'platform':0.3})\n\
+    creator_due=round(order['price']*share.get('creator',0),2)\n\
+    rec={'ts':time.time(),'order':order,'creator_due':creator_due,'status':'scheduled'}\n\
+    DB['payouts'].append(rec); _save(); return {'ok':True,'payout':rec}\n\
+def list_all(): return DB['payouts']\n\
+def _save():\n\
+    with open('codex/data/payouts.json','w',encoding='utf-8') as f: json.dump(DB,f,indent=2)\n""")
+
+# ---------------- Marketplace (extended) ----------------
+W("codex/market/skus.json", json.dumps({
+  "skus": {
+    "seal.codex.pro": {"title":"Pro Seal Pack","price":19.0,"units":1,"creator":"cfbk","rev_share":{"creator":0.7,"platform":0.3}},
+    "gpu.batch.1h": {"title":"GPU Batch (1 hour)","price":4.0,"units":3600,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}},
+    "token.100k": {"title":"100k API Tokens","price":3.0,"units":100000,"creator":"platform","rev_share":{"creator":0.0,"platform":1.0}}
+  }
+}, indent=2))
+
+W("codex/market/market.py","""import json, time\nfrom codex.economics.payouts import schedule\nfrom codex.guard.fraud import risky\nSKUS=json.load(open('codex/market/skus.json',encoding='utf-8'))['skus']\n\
+def list_skus(): return SKUS\n\
+def buy(user:str, sku_id:str)->dict:\n\
+    sku=SKUS.get(sku_id)\n\
+    if not sku: return {'ok':False,'error':'unknown_sku'}\n\
+    order={'id': f'ORD-{int(time.time())}', 'user':user, 'sku':sku_id, 'price':sku['price'], 'units':sku['units'], 'creator': sku['creator'], 'rev_share': sku['rev_share']}\n\
+    if risky(order): return {'ok':False,'error':'risk_detected'}\n\
+    schedule(order)\n\
+    return {'ok':True,'order':order}\n""")
+
+# ---------------- Webhooks ----------------
+W("codex/hooks/webhooks.py","""import json, urllib.request, ssl\nCFG=json.load(open('codex/config.json',encoding='utf-8'))\nssl_ctx=ssl.create_default_context()\n\
+def broadcast(event:str, payload:dict)->dict:\n\
+    ok,fail=0,0\n\
+    for t in CFG.get('webhooks',[]):\n\
+        try:\n\
+            req=urllib.request.Request(t, data=json.dumps({'event':event,'payload':payload}).encode(), headers={'Content-Type':'application/json'})\n\
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=5) as r: ok+=1\n\
+        except Exception:\n\
+            fail+=1\n\
+    return {'ok':True,'sent':ok,'failed':fail}\n""")
+
+# ---------------- CSV exporter ----------------
+W("codex/export/csv.py","""import csv, io, json, os\n\
+def to_csv(rows, fields):\n\
+    buf=io.StringIO()\n\
+    w=csv.DictWriter(buf, fieldnames=fields)\n\
+    w.writeheader()\n\
+    for r in rows: w.writerow({k:r.get(k) for k in fields})\n\
+    return buf.getvalue()\n""")
+
+# ---------------- OpenAPI ----------------
+W("codex/openapi/spec.json", json.dumps({
+  "openapi":"3.0.0","info":{"title":"Codex Χ·X (Chi Extended) API","version":"v210.x"},
+  "paths":{
+    "/api/usage/record":{"post":{"summary":"Record usage"}},
+    "/api/usage/export":{"get":{"summary":"Export usage JSON"}},
+    "/api/usage/export_csv":{"get":{"summary":"Export usage CSV"}},
+    "/api/usage/daily":{"get":{"summary":"Daily aggregates"}},
+    "/api/price/quote":{"post":{"summary":"Quote with coupon"}},
+    "/api/invoice/issue":{"post":{"summary":"Issue invoice (+coupon)"}},
+    "/api/subs/create":{"post":{"summary":"Create subscription"}},
+    "/api/subs/cancel":{"post":{"summary":"Cancel subscription"}},
+    "/api/subs/get":{"post":{"summary":"Get subscription"}},
+    "/api/coupons/get":{"post":{"summary":"Get coupon"}},
+    "/api/market/list":{"get":{"summary":"List SKUs"}},
+    "/api/market/buy":{"post":{"summary":"Buy SKU → payout schedule"}},
+    "/api/payouts/list":{"get":{"summary":"List scheduled payouts"}},
+    "/api/hooks/broadcast":{"post":{"summary":"Broadcast webhook"}},
+    "/metrics":{"get":{"summary":"Metrics"}},
+    "/openapi.json":{"get":{"summary":"OpenAPI"}}
+  }
+}, indent=2))
+
+# ---------------- API Server ----------------
+W("dashboard/api.py","""#!/usr/bin/env python3
+import http.server, json, os
+from urllib.parse import urlparse, parse_qs
+from codex.metrics.collector import bump, render as metrics_render, C
+from codex.guard.rate import allow as rl_allow
+from codex.economics.usage import record as u_record, export as u_export, daily_aggregate
+from codex.economics.pricing import quote
+from codex.economics.invoice import issue
+from codex.economics.subs import create as s_create, cancel as s_cancel, get as s_get
+from codex.economics.coupons import get as c_get
+from codex.market.market import list_skus, buy
+from codex.economics.payouts import list_all as payouts_list
+from codex.export.csv import to_csv
+from codex.hooks.webhooks import broadcast
+
+CFG=json.load(open('codex/config.json',encoding='utf-8'))
+
+class H(http.server.SimpleHTTPRequestHandler):
+    def _json(self):
+        ln=int(self.headers.get('Content-Length','0') or '0')
+        return json.loads(self.rfile.read(ln).decode() or '{}') if ln>0 else {}
+
+    def _ratekey(self): return self.client_address[0]
+
+    def do_POST(self):
+        body=self._json(); p=urlparse(self.path).path
+        bump('requests_total')
+        if not rl_allow(self._ratekey(), CFG['rate_limit_per_minute']):
+            bump('rate_drops'); return self._ok({'ok':False,'error':'rate_limited'})
+
+        if p=='/api/usage/record': return self._ok(u_record(body.get('user','reader@codex'), int(body.get('units',1)), body.get('kind','generic')))
+        if p=='/api/price/quote': return self._ok(quote(body.get('plan','free'), int(body.get('units',0)), c_get(body.get('coupon')) if body.get('coupon') else None))
+        if p=='/api/invoice/issue':
+            inv=issue(body.get('user','reader@codex'), body.get('line_items',[]), c_get(body.get('coupon')) if body.get('coupon') else None)
+            bump('invoices'); broadcast('invoice.issued', inv); return self._ok(inv)
+        if p=='/api/subs/create': bump('subs'); return self._ok(s_create(body.get('user','reader@codex'), body.get('plan','pro')))
+        if p=='/api/subs/cancel': return self._ok(s_cancel(body.get('user','reader@codex')))
+        if p=='/api/subs/get': return self._ok({'sub': s_get(body.get('user','reader@codex'))})
+        if p=='/api/coupons/get': return self._ok({'coupon': c_get(body.get('code',''))})
+        if p=='/api/market/buy':
+            res=buy(body.get('user','reader@codex'), body.get('sku','token.100k')); 
+            if res.get('ok'): bump('orders'); broadcast('market.order', res['order'])
+            return self._ok(res)
+        if p=='/api/hooks/broadcast':
+            r=broadcast(body.get('event','codex.event'), body.get('payload',{})); bump('webhooks'); return self._ok(r)
+        self.send_error(404)
+
+    def do_GET(self):
+        p=urlparse(self.path).path; bump('requests_total')
+        if p=='/api/usage/export': return self._ok(u_export())
+        if p=='/api/usage/daily': return self._ok(daily_aggregate())
+        if p=='/api/usage/export_csv':
+            rows=u_export(); csv_data=to_csv(rows, ['ts','user','units','kind'])
+            self.send_response(200); self.send_header('Content-Type','text/csv'); self.end_headers(); self.wfile.write(csv_data.encode()); return
+        if p=='/api/market/list': return self._ok(list_skus())
+        if p=='/api/payouts/list': return self._ok(payouts_list())
+        if p=='/openapi.json':
+            spec=open('codex/openapi/spec.json','r',encoding='utf-8').read()
+            self.send_response(200); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(spec.encode()); return
+        if p=='/metrics':
+            txt=metrics_render()
+            self.send_response(200); self.send_header('Content-Type','text/plain'); self.end_headers(); self.wfile.write(txt.encode()); return
+        return super().do_GET()
+
+    def _ok(self, obj, code=200):
+        self.send_response(code); self.send_header('Content-Type','application/json'); self.end_headers()
+        self.wfile.write(json.dumps(obj, indent=2).encode())
+
+if __name__=='__main__':
+    os.chdir('.'); http.server.test(HandlerClass=H, port=8891)
+""")
+
+# ---------------- Tiny HTML console ----------------
+W("dashboard/ui.html","""<!doctype html><html><head><meta charset="utf-8"><title>Codex Χ·X (8891)</title>
+<style>body{font-family:system-ui;background:#0b0f14;color:#e6edf3;margin:24px}button{padding:8px;margin:6px}pre{background:#0f1620;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body>
+<h1>Codex Logos Χ·X — Economics Extended</h1>
+<div>
+  <button onclick="listSkus()">List SKUs</button>
+  <button onclick="buy()">Buy token.100k</button>
+  <button onclick="quote()">Quote PRO 120k + VIP25</button>
+  <button onclick="sub()">Create SUB</button>
+  <button onclick="inv()">Issue invoice</button>
+  <a href="/openapi.json" target="_blank">OpenAPI</a>
+  <a href="/metrics" target="_blank">Metrics</a>
+</div>
+<pre id="out"></pre>
+<script>
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});document.getElementById('out').textContent=await r.text();}
+async function get(u){const r=await fetch(u);document.getElementById('out').textContent=await r.text();}
+function listSkus(){get('/api/market/list')}
+function buy(){post('/api/market/buy',{user:'reader@codex',sku:'token.100k'})}
+function quote(){post('/api/price/quote',{plan:'pro',units:120000,coupon:'VIP25'})}
+function sub(){post('/api/subs/create',{user:'reader@codex',plan:'pro'})}
+function inv(){post('/api/invoice/issue',{user:'reader@codex',line_items:[{desc:'overage',amount:12.34}],coupon:'WELCOME10'})}
+</script>
+</body></html>
+""")
+
+# ---------------- Docker / Compose / CI / Tests ----------------
+W("deploy/Dockerfile","""FROM python:3.12-alpine
+WORKDIR /app
+COPY . /app
+EXPOSE 8891
+CMD ["python3","dashboard/api.py"]
+""")
+W("docker-compose.yml","""services:
+  codex-chi-x:
+    build: ./deploy
+    ports:
+      - "8891:8891"
+    restart: unless-stopped
+""")
+W(".github/workflows/ci.yml","""name: Codex Χ·X (v210.x) CI
+on: [push, workflow_dispatch]
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Quote + CSV + Sub + Buy
+        run: python3 - <<'PY'\nfrom codex.economics.pricing import quote\nfrom codex.economics.subs import create, get\nfrom codex.economics.coupons import get as cget\nfrom codex.export.csv import to_csv\nprint(quote('pro',120000,cget('VIP25'))['discount']>0)\ncreate('ci@codex','pro')\nprint(get('ci@codex')['plan']=='pro')\nprint(len(to_csv([{'ts':1,'user':'u','units':2,'kind':'x'}],['ts','user','units','kind']))>0)\nPY
+""")
+W("tests/test_chi_x.py","""from codex.economics.pricing import quote\nfrom codex.economics.coupons import get\nq=quote('pro',120000,get('VIP25'))\nassert q['amount']>=0 and q['discount']>0\nprint('chi-x ok')\n""")
+
+# ---------------- Manifest ----------------
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn)
+        rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("codex/manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+# ---------------- ZIP ----------------
+zip_path="/mnt/data/codex_v210x_chi_plus.zip"
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", zip_path, BASE)

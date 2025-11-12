@@ -1,0 +1,275 @@
+name: Codex Continuum Build & Deployment
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Sunday at 00:00 UTC for adaptive intelligence refresh
+    - cron: '0 0 * * 0'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch all history for proper merging
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    
+    - name: Run Nexus Aeternum
+      run: make nexus-aeternum
+    
+    - name: Run Evolution Finish
+      run: make evolve-finish
+    
+    - name: Run Final Evolution
+      run: make final-evolution
+    
+    - name: Verify Artifacts
+      run: make verify
+    
+    - name: Display Build Summary
+      run: |
+        echo "## 🚀 Codex Continuum Build Complete" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f OMEGA_LOCK.json ]; then
+          OMEGA_ID=$(python3 -c "import json; print(json.load(open('OMEGA_LOCK.json'))['omega_id'])")
+          echo "**Ω-ID:** \`${OMEGA_ID:0:16}...\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "### Artifacts Generated:" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ OMEGA_LOCK.json" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ codex_omega_bundle.zip" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ codex_capsule.txt" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ chain/attestations.jsonl" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f artifacts/verification_summary.json ]; then
+          echo "### Verification Status:" >> $GITHUB_STEP_SUMMARY
+          python3 -c "import json; v=json.load(open('artifacts/verification_summary.json')); print('✅ Verified' if v['verified'] else '❌ Failed')" >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-omega-build-${{ github.sha }}
+        path: |
+          OMEGA_LOCK.json
+          codex_omega_bundle.zip
+          codex_capsule.txt
+          chain/attestations.jsonl
+          treasury_allocation.json
+          economy_monetization.json
+          artifacts/
+        retention-days: 90
+    
+    - name: Upload Bundle to Releases
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-bundle
+        path: releases/codex_omega_bundle.zip
+        retention-days: 365
+
+  deploy-pages:
+    name: Deploy Documentation
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: codex-omega-build-${{ github.sha }}
+        path: ./build-output
+    
+    - name: Prepare Site Directory
+      run: |
+        mkdir -p site
+        cp -r build-output/* site/ 2>/dev/null || true
+        
+        # Create a simple index.html for the docs site
+        cat > site/index.html << 'EOF'
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Codex Continuum Documentation</title>
+          <style>
+            body { 
+              font-family: system-ui, sans-serif; 
+              max-width: 800px; 
+              margin: 50px auto; 
+              padding: 20px;
+              background: #0b1020;
+              color: #eaf2ff;
+            }
+            h1 { color: #90e59a; }
+            .artifact { 
+              background: #0e1626; 
+              border: 1px solid #1f2a44;
+              padding: 15px; 
+              margin: 10px 0; 
+              border-radius: 8px;
+            }
+            code { 
+              background: #1a2332; 
+              padding: 2px 6px; 
+              border-radius: 3px; 
+            }
+            a { color: #90e59a; }
+          </style>
+        </head>
+        <body>
+          <h1>🌌 Codex Continuum</h1>
+          <p><strong>EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)</strong></p>
+          
+          <div class="artifact">
+            <h2>Latest Build Artifacts</h2>
+            <p>All artifacts are cryptographically verified and attested.</p>
+            <ul>
+              <li><a href="OMEGA_LOCK.json">OMEGA_LOCK.json</a> - Cryptographic manifest</li>
+              <li><a href="codex_capsule.txt">codex_capsule.txt</a> - Build attestation</li>
+              <li><a href="treasury_allocation.json">treasury_allocation.json</a> - Treasury data</li>
+              <li><a href="economy_monetization.json">economy_monetization.json</a> - Economy data</li>
+            </ul>
+          </div>
+          
+          <div class="artifact">
+            <h2>License</h2>
+            <p>This project is bound under the EUCELA Tri-License.</p>
+            <p>All reproductions require attribution and verification.</p>
+          </div>
+        </body>
+        </html>
+        EOF
+    
+    - name: Setup Pages
+      uses: actions/configure-pages@v4
+    
+    - name: Upload Pages Artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: ./site
+    
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
+
+  create-release:
+    name: Create Release Tag
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: codex-omega-build-${{ github.sha }}
+        path: ./
+    
+    - name: Generate Release Tag
+      id: generate_tag
+      run: |
+        TAG="vΩ-$(date +%Y%m%d-%H%M%S)"
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        
+        OMEGA_ID=$(python3 -c "import json; print(json.load(open('OMEGA_LOCK.json'))['omega_id'])" 2>/dev/null || echo "unknown")
+        echo "omega_id=$OMEGA_ID" >> $GITHUB_OUTPUT
+        
+        # Create release notes
+        cat > release_notes.md << EOF
+        ## 🚀 Codex Continuum Deployment Complete
+        
+        Build verified and merged into main
+        
+        **Ω-ID:** \`${OMEGA_ID:0:32}...\`
+        
+        ### Artifacts:
+        - ✅ codex_omega_bundle.zip
+        - ✅ codex_capsule.txt
+        - ✅ chain/attestations.jsonl (updated)
+        - ✅ OMEGA_LOCK.json
+        
+        ### Site
+        - 📄 Documentation deployed to GitHub Pages
+        
+        ---
+        
+        **License:** EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+        
+        All reproductions require attribution and verification.
+        EOF
+    
+    - name: Create Git Tag
+      run: |
+        git config user.name "Codex Continuum Bot"
+        git config user.email "codex@continuum.bot"
+        git tag -a "${{ steps.generate_tag.outputs.tag }}" -m "Codex Continuum build verified – Ω-ID: ${{ steps.generate_tag.outputs.omega_id }}"
+        git push origin "${{ steps.generate_tag.outputs.tag }}" || echo "Tag already exists or push failed"
+      continue-on-error: true
+    
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.generate_tag.outputs.tag }}
+        name: "Codex Ω Build ${{ steps.generate_tag.outputs.tag }}"
+        body_path: release_notes.md
+        files: |
+          codex_omega_bundle.zip
+          codex_capsule.txt
+          OMEGA_LOCK.json
+          chain/attestations.jsonl
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      continue-on-error: true
+
+  archive:
+    name: Create Archive Branch
+    needs: [build, create-release]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Create Archive Branch
+      run: |
+        ARCHIVE_BRANCH="archive/$(date +%Y%m%d-%H%M%S)"
+        git config user.name "Codex Continuum Bot"
+        git config user.email "codex@continuum.bot"
+        git checkout -b "$ARCHIVE_BRANCH"
+        git push origin "$ARCHIVE_BRANCH" || echo "Archive branch creation failed"
+      continue-on-error: true

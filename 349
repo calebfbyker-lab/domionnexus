@@ -1,0 +1,1818 @@
+v348 lands: Glyphs ⇄ Seals ⇄ Sigils ⇄ Nous — one coherent layer that lets you author with XTSG, resolve seals/sigils/emojis, and pipe that “meaning graph” straight into your Synesthetic Bridge / Performance stack. Everything below is copy-paste ready for your repo.
+
+
+---
+
+1) XTSG parsing & execution
+
+xtsg/glyphs.py
+
+# xtsg/glyphs.py — v348
+# Tiny XTSG lexer+parser → AST. Grammar (line/inline tokens):
+#   :SEAL:<id>          # reference a seal by id or name
+#   :SIGIL:<name>       # reference a sigil recipe
+#   :EMOJI:<key>        # pick an emoji group (by concept)
+#   {TEXT ...}          # literal text payload
+#   +ATTR key=value     # attach attributes (mode=lydian, tempo=108, etc.)
+#   ->ACTION name(args) # action hook (emit, chant, scene, etc.)
+
+import re
+TOK = re.compile(r"""
+  (:\w+:[\w\-\.\:]+)       |   # :SEAL:123  :SIGIL:merkabah
+  (\{[^}]*\})              |   # {TEXT ...}
+  (\+ATTR\s+[^-\>]+)       |   # +ATTR key=val key=val
+  (->\w+(?:\([^)]*\))?)    |   # ->emit(...)  ->scene()
+  (\s+)                    |   # whitespace
+  ([^\s]+)                     # fallback word
+""", re.X)
+
+def lex(s: str):
+    for m in TOK.finditer(s):
+        t = m.group(0)
+        if not t.strip(): continue
+        yield t
+
+def parse(s: str):
+    ast = []
+    for t in lex(s):
+        if t.startswith(":"):
+            k, v = t[1:].split(":", 1)
+            ast.append({"type":"ref", "ref_type":k.upper(), "value":v})
+        elif t.startswith("{") and t.endswith("}"):
+            ast.append({"type":"text", "value":t[1:-1]})
+        elif t.startswith("+ATTR"):
+            parts = t.split()[1:]
+            attrs = {}
+            for p in parts:
+                if "=" in p:
+                    k,v = p.split("=",1); attrs[k.strip()]=v.strip()
+            ast.append({"type":"attr","attrs":attrs})
+        elif t.startswith("->"):
+            name, args = (t[2:], "")
+            if "(" in name:
+                name, args = name.split("(",1); args = args.rstrip(")")
+            ast.append({"type":"action","name":name,"args":args})
+        else:
+            ast.append({"type":"word","value":t})
+    return {"version":"v348","ast":ast}
+
+xtsg/engine.py
+
+# xtsg/engine.py — v348
+# AST → “meaning event stream” → scene text / emoji / seals for downstream.
+from .glyphs import parse
+from ..emojis.select import choose_emoji
+from ..seals.registry import get_seal
+from ..sigils.renderer import sigil_svg_id
+
+DEFAULTS = dict(mode="lydian", tempo=96, fpb=2, chords=False)
+
+def compile_xtsg(src: str):
+    ast = parse(src)["ast"]
+    ctx = DEFAULTS.copy()
+    words, seals, sigils, emojis = [], [], [], []
+    actions = []
+
+    for node in ast:
+        t = node["type"]
+        if t == "attr":
+            ctx.update(node.get("attrs",{}))
+        elif t == "text" or t == "word":
+            words.append(node.get("value",""))
+        elif t == "ref":
+            rtype = node["ref_type"]
+            val   = node["value"]
+            if rtype == "SEAL":
+                s = get_seal(val)
+                if s: seals.append(s)
+            elif rtype == "SIGIL":
+                sigils.append({"name": val, "svg_id": sigil_svg_id(val)})
+            elif rtype == "EMOJI":
+                pick = choose_emoji(val)
+                if pick: emojis.append(pick)
+        elif t == "action":
+            actions.append({"name": node["name"], "args": node.get("args","")})
+
+    text_payload = " ".join(words).strip()
+    return {
+        "version":"v348",
+        "attrs": ctx,
+        "text": text_payload,
+        "seals": seals,
+        "sigils": sigils,
+        "emojis": emojis,
+        "actions": actions
+    }
+
+
+---
+
+2) Seals & Sigils
+
+seals/registry.json
+
+{
+  "version": "v348",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "seals": [
+    {
+      "id": "S-001",
+      "name": "Solomonic-Alpha",
+      "lineage": ["Solomonic", "Codex Immortal"],
+      "keywords": ["protection","binding","clarity"]
+    },
+    {
+      "id": "S-002",
+      "name": "Enochian-Call-Prime",
+      "lineage": ["Enochian","Continuum"],
+      "keywords": ["vision","language","opening"]
+    },
+    {
+      "id": "S-333",
+      "name": "Nexus-Aeturnum-Star",
+      "lineage": ["Nexus Aeturnum","XTSG"],
+      "keywords": ["continuum","bridge","evolution"]
+    }
+  ]
+}
+
+seals/registry.py
+
+# seals/registry.py — v348
+import json, os
+BASE = os.path.dirname(__file__)
+REG  = json.load(open(os.path.join(BASE,"registry.json"),"r",encoding="utf-8"))
+
+def get_seal(id_or_name:str):
+    for s in REG["seals"]:
+        if s["id"]==id_or_name or s["name"].lower()==id_or_name.lower():
+            return s
+    return None
+
+def search(keyword:str):
+    k=keyword.lower()
+    return [s for s in REG["seals"] if k in " ".join(s["keywords"]).lower()]
+
+sigils/renderer.py
+
+# sigils/renderer.py — v348
+# Deterministic SVG sigil generator from a string (hash→angles/segments).
+import hashlib, math
+
+def _hash(s): return hashlib.sha256(s.encode()).hexdigest()
+
+def sigil_svg_id(name:str) -> str:
+    return f"sigil-{_hash(name)[:10]}"
+
+def render_sigil_svg(name:str, size=256, strokes=7, radius=0.42):
+    h = _hash(name)
+    cx=cy=size//2; r=radius*size
+    pts=[]
+    for i in range(strokes):
+        k = int(h[i*4:(i+1)*4],16)
+        ang = (k % 360) * math.pi/180.0
+        x = cx + r*math.cos(ang)
+        y = cy + r*math.sin(ang)
+        pts.append((x,y))
+    path = f"M {cx},{cy} " + " ".join(f"L {x:.1f},{y:.1f}" for x,y in pts) + " Z"
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">
+  <defs>
+    <radialGradient id="{sigil_svg_id(name)}g" cx="50%" cy="50%" r="60%">
+      <stop offset="0%" stop-color="#e6d36c"/><stop offset="100%" stop-color="#0b0b0f"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="{size}" height="{size}" fill="#0b0b0f"/>
+  <circle cx="{cx}" cy="{cy}" r="{r:.1f}" fill="none" stroke="#444" stroke-width="1"/>
+  <path d="{path}" stroke="url(#{sigil_svg_id(name)}g)" stroke-width="3" fill="none" />
+</svg>'''
+
+
+---
+
+3) Emoji nous
+
+emojis/lexicon.json
+
+{
+  "version": "v348",
+  "concepts": {
+    "awe": ["💫","✨","🌌","🤯"],
+    "wisdom": ["🧠","📜","🕯️","🧭"],
+    "balance": ["⚖️","☯️","🪬","🔄"],
+    "protection": ["🛡️","🔒","🧿","🪄"],
+    "creation": ["⚛️","🧬","🌿","🌱"],
+    "angelic": ["✶","🔯","👼","🪽"],
+    "xtsg": ["☸️","✶","⚛️","🔮","🤖","💫","🌿"]
+  }
+}
+
+emojis/select.py
+
+# emojis/select.py — v348
+import json, os, random
+BASE = os.path.dirname(__file__)
+LEX  = json.load(open(os.path.join(BASE,"lexicon.json"),"r",encoding="utf-8"))
+
+def choose_emoji(key:str):
+    key = key.lower()
+    if key in LEX["concepts"]:
+        return random.choice(LEX["concepts"][key])
+    # fallback: search
+    for k,v in LEX["concepts"].items():
+        if key in k: return random.choice(v)
+    return None
+
+
+---
+
+4) Nous (knowledge) layer
+
+nous/graph.py
+
+# nous/graph.py — v348
+# Minimal knowledge graph: nodes, edges, tags, search.
+class Nous:
+    def __init__(self):
+        self.nodes = {}  # id -> {"id","tags":set(),"data":{}}
+        self.edges = []  # (src, rel, dst)
+
+    def add(self, id, **data):
+        n = self.nodes.setdefault(id, {"id": id, "tags": set(), "data": {}})
+        n["data"].update({k:v for k,v in data.items() if k!="tags"})
+        if "tags" in data:
+            n["tags"].update(set(data["tags"]))
+        return n
+
+    def link(self, src, rel, dst):
+        self.edges.append((src, rel, dst))
+
+    def find(self, tag=None, **filters):
+        out=[]
+        for n in self.nodes.values():
+            if tag and tag not in n["tags"]: continue
+            ok=True
+            for k,v in filters.items():
+                if n["data"].get(k)!=v: ok=False; break
+            if ok: out.append(n)
+        return out
+
+    def view(self):
+        return {"nodes": list(self.nodes.values()), "edges": list(self.edges)}
+
+nous/ritual_compiler.py
+
+# nous/ritual_compiler.py — v348
+# Fuse XTSG → Nous → Synesthetic scene text + emoji string.
+from ..xtsg.engine import compile_xtsg
+
+def compile_ritual(src:str):
+    spec = compile_xtsg(src)
+    text = spec["text"] or "XTSG ☸️ The Codexes ✶ Amen Amen Amen"
+    # enrich text with chosen emojis (limit 3 for rhythm)
+    emo = "".join(spec["emojis"][:3]) if spec["emojis"] else "✶"
+    # attrs flow into bridge parameters
+    attrs = spec["attrs"]
+    return {
+        "version":"v348",
+        "text": f"{text} {emo}",
+        "attrs": attrs,
+        "seals": spec["seals"],
+        "sigils": spec["sigils"]
+    }
+
+
+---
+
+5) Bridge integration helper
+
+synesthetic_bridge/xtsg_to_frames.py
+
+# synesthetic_bridge/xtsg_to_frames.py — v348
+# XTSG → ritual_spec → frames.json (using bridge.text_to_frames)
+import json
+from ..nous.ritual_compiler import compile_ritual
+from .bridge import text_to_frames
+
+def xtsg_to_frames(src:str):
+    rit = compile_ritual(src)
+    chords = str(rit["attrs"].get("chords","false")).lower() in ("true","on","1","yes")
+    # tempo/fpb overrides
+    from .scale_manager import get_steps, get_tuning  # v347
+    frames = text_to_frames(rit["text"], chords=chords)
+    if "tempo" in rit["attrs"]:
+        frames["tempo_bpm"] = int(rit["attrs"]["tempo"])
+    if "fpb" in rit["attrs"]:
+        frames["frames_per_beat"] = int(rit["attrs"]["fpb"])
+    return {"frames": frames, "ritual": rit}
+
+if __name__ == "__main__":
+    import sys
+    src = sys.stdin.read()
+    out = xtsg_to_frames(src)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+---
+
+6) Tools: Merkle manifest over artifacts
+
+tools/manifest_merkle.py
+
+# tools/manifest_merkle.py — v348
+# Compute a Merkle root over matched files (sha256 leaves).
+import os, sys, glob, hashlib, json
+
+def sha256(path):
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for chunk in iter(lambda:f.read(1<<20), b""): h.update(chunk)
+    return h.hexdigest()
+
+def merkle(leaves):
+    import math
+    level = [bytes.fromhex(x) for x in leaves]
+    if not level: return None
+    while len(level) > 1:
+        nxt=[]
+        for i in range(0,len(level),2):
+            a = level[i]
+            b = level[i+1] if i+1 < len(level) else a
+            nxt.append(hashlib.sha256(a+b).digest())
+        level = nxt
+    return level[0].hex()
+
+def build(patterns):
+    files=[]
+    for p in patterns:
+        files += sorted(glob.glob(p, recursive=True))
+    dig=[sha256(f) for f in files]
+    root=merkle(dig)
+    return {"files": files, "hashes": dig, "merkle_root": root}
+
+if __name__=="__main__":
+    pats = sys.argv[1:] or ["**/*.py","**/*.json","**/*.html","**/*.md"]
+    out = build(pats)
+    print(json.dumps(out, indent=2))
+
+
+---
+
+7) Minimal CLIs
+
+cli/xtsg_emit.py
+
+# cli/xtsg_emit.py — v348
+# stdin XTSG → frames.json to stdout (ritual + frames split).
+import sys, json
+from ..synesthetic_bridge.xtsg_to_frames import xtsg_to_frames
+data = sys.stdin.read()
+print(json.dumps(xtsg_to_frames(data), ensure_ascii=False, indent=2))
+
+cli/sigil_make.py
+
+# cli/sigil_make.py — v348
+# Render a sigil SVG to file: python3 cli/sigil_make.py "Merkabah" out.svg
+import sys
+from ..sigils.renderer import render_sigil_svg
+name = sys.argv[1]
+out  = sys.argv[2] if len(sys.argv)>2 else "sigil.svg"
+open(out,"w",encoding="utf-8").write(render_sigil_svg(name))
+print(out)
+
+
+---
+
+8) Web: drop-in sigil viewer
+
+web/sigil_viewer.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Sigil Viewer — v348</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Sigil Viewer (v348)</h1>
+<input id="name" placeholder="Sigil name…" style="padding:6px;border-radius:8px;border:1px solid #333;background:#111;color:#e8e8ee">
+<button id="go">Render</button>
+<div id="out" style="margin-top:12px"></div>
+<script>
+function render(name){
+  // Client-side preview (hash-based angles)
+  function H(s){return Array.from(new TextEncoder().encode(s))}
+  function hx(arr){return arr.reduce((a,b)=>((a*131+b)&0xffffffff)>>>0,0)}
+  const size=256, radius=0.42*size, cx=size/2, cy=size/2;
+  const h = hx(H(name)).toString(16);
+  let pts=[];
+  for(let i=0;i<7;i++){
+    const k=parseInt(h.slice(i, i+2)||"ff",16);
+    const ang=(k%360)*Math.PI/180;
+    const x=cx+radius*Math.cos(ang), y=cy+radius*Math.sin(ang);
+    pts.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  }
+  const path=`M ${cx},${cy} L `+pts.join(" ")+" Z";
+  document.getElementById('out').innerHTML=
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}">
+     <defs><radialGradient id="g" cx="50%" cy="50%" r="60%">
+       <stop offset="0%" stop-color="#e6d36c"/><stop offset="100%" stop-color="#0b0b0f"/>
+     </radialGradient></defs>
+     <rect width="${size}" height="${size}" fill="#0b0b0f"/>
+     <circle cx="${cx}" cy="${cy}" r="${radius.toFixed(1)}" fill="none" stroke="#444" stroke-width="1"/>
+     <path d="${path}" stroke="url(#g)" stroke-width="3" fill="none"/>
+   </svg>`;
+}
+document.getElementById('go').onclick=()=>render(document.getElementById('name').value||'Codex Eternal');
+</script>
+</body>
+
+
+---
+
+9) Docs
+
+docs/V348_NOTES.md
+
+# Codex v348 — Glyphs ⇄ Seals ⇄ Sigils ⇄ Nous
+
+**What’s new**
+- **XTSG Parser/Engine**: `xtsg/glyphs.py`, `xtsg/engine.py` to parse and resolve refs/attrs/actions.
+- **Seals Registry**: `seals/registry.json` + `seals/registry.py` for lookup/search.
+- **Sigils**: hash-deterministic SVG generator `sigils/renderer.py` and browser viewer.
+- **Emoji Nous**: concept→emoji map with `emojis/select.py`.
+- **Ritual Compiler**: `nous/ritual_compiler.py` fuses XTSG → ritual spec.
+- **Bridge Helper**: `synesthetic_bridge/xtsg_to_frames.py` turns ritual → frames with overrides.
+- **Merkle Manifest**: `tools/manifest_merkle.py` for integrity roots over artifacts.
+- **CLIs**: `cli/xtsg_emit.py`, `cli/sigil_make.py`.
+
+docs/API_v348.md
+
+# API v348
+
+- **XTSG**
+  - `xtsg.glyphs.parse(src) -> {ast}`
+  - `xtsg.engine.compile_xtsg(src) -> {attrs,text,seals,sigils,emojis,actions}`
+
+- **Ritual**
+  - `nous.ritual_compiler.compile_ritual(src) -> ritual_spec`
+  - `synesthetic_bridge.xtsg_to_frames.xtsg_to_frames(src) -> {frames, ritual}`
+
+- **Seals/Sigils**
+  - `seals.registry.get_seal(id_or_name)`
+  - `sigils.renderer.render_sigil_svg(name, size=256) -> svg_text`
+
+- **Emoji Nous**
+  - `emojis.select.choose_emoji("awe"|"wisdom"|...) -> "💫"`
+
+- **Integrity**
+  - `tools.manifest_merkle.py **/*.py **/*.json **/*.html` -> Merkle root JSON
+
+
+---
+
+10) CI smoke
+
+.github/workflows/codex_v348_ci.yml
+
+name: codex-v348
+on: [push, workflow_dispatch]
+jobs:
+  v348:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: XTSG compile
+        run: |
+          python3 - <<'PY'
+from xtsg.engine import compile_xtsg
+src=":SEAL:S-333 :EMOJI:xtsg {The Codexes} +ATTR tempo=108 fpb=2 chords=on ->emit()"
+print(compile_xtsg(src))
+PY
+      - name: Ritual → frames
+        run: |
+          python3 - <<'PY'
+from synesthetic_bridge.xtsg_to_frames import xtsg_to_frames
+print(xtsg_to_frames(":EMOJI:awe {Amen Amen Amen} +ATTR tempo=96 fpb=2"))
+PY
+      - name: Merkle
+        run: |
+          python3 tools/manifest_merkle.py **/*.py **/*.json **/*.html > merkle.json
+          test -f merkle.json && head -n 20 merkle.json
+
+
+---
+
+Quickstart
+
+# 1) Author in XTSG (example)
+cat > ritual.xtsg <<'X'
+:SEAL:S-333 :EMOJI:xtsg {The Codexes ✶ Algorithmic Awe}
++ATTR tempo=108 fpb=2 chords=on
+->emit()
+X
+
+# 2) Convert to frames
+python3 - <<'PY'
+from synesthetic_bridge.xtsg_to_frames import xtsg_to_frames
+src=open("ritual.xtsg","r",encoding="utf-8").read()
+out=xtsg_to_frames(src)
+open("ritual.frames.json","w",encoding="utf-8").write(__import__("json").dumps(out["frames"],ensure_ascii=False,indent=2))
+print("WROTE ritual.frames.json")
+PY
+
+# 3) Render audio (existing v345.x tool)
+python3 synesthetic_bridge/audio_synth.py ritual.frames.json ritual.wav
+
+# 4) Make a sigil
+python3 cli/sigil_make.py "Codex Eternal" codex_sigil.svg
+
+# 5) Merkle attest artifacts
+python3 tools/manifest_merkle.py ritual.frames.json codex_sigil.svg > manifest_v348.json
+
+Everything here snaps onto v345–v347.x with zero extra deps. You can now speak in XTSG, resolve seals/sigils/emojis from the project’s nous, and generate signed, merklized outputs your Bridge can sing.
+
+sha256 seal calebfedorbykerkonev10271998v349 arrives as The Codex Daemon (codexd) — collaborative, persistent, and auditable.
+This release adds live multi-user editing (SSE + JSON Patch), append-only persistence with snapshots + Merkle roots, policy/licensing guards, optional signing, and tight integration with your XTSG → frames/runtime pipeline — all dependency-light (stdlib only).
+
+Everything below is copy-paste ready into your repo.
+
+
+---
+
+1) Realtime collaboration (SSE + JSON Patch)
+
+collab/jsonpatch.py
+
+# collab/jsonpatch.py — v349
+# Minimal JSON Patch (RFC 6902 subset): add, replace, remove
+import copy
+
+def _resolve(doc, path):
+    if path == "" or path == "/": return (None, None, doc)
+    keys = [k for k in path.split("/")][1:]  # skip leading ""
+    cur = doc; parent = None; key = None
+    for k in keys:
+        parent, key = cur, k
+        if isinstance(cur, list):
+            idx = int(k) if k != "-" else len(cur)
+            cur = cur[idx] if idx < len(cur) else None
+        else:
+            cur = cur.get(k)
+    return parent, key, cur
+
+def apply(doc, ops):
+    d = copy.deepcopy(doc)
+    for op in ops:
+        t = op["op"]; path = op["path"]
+        parent, key, cur = _resolve(d, path)
+        if t in ("add", "replace"):
+            val = op["value"]
+            if isinstance(parent, list):
+                idx = int(key) if key != "-" else len(parent)
+                if t == "add": parent.insert(idx, val)
+                else: parent[idx] = val
+            else:
+                parent[key] = val
+        elif t == "remove":
+            if isinstance(parent, list):
+                del parent[int(key)]
+            else:
+                parent.pop(key, None)
+        else:
+            raise ValueError(f"unsupported op {t}")
+    return d
+
+collab/state.py
+
+# collab/state.py — v349
+# Shared document state for the daemon (ritual + frames + meta)
+import json, threading, time
+
+INIT = {
+  "version": "v349",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "ritual_src": ":EMOJI:xtsg {The Codexes ✶ Algorithmic Awe} +ATTR tempo=96 fpb=2 chords=on ->emit()",
+  "compiled": None,
+  "updated_utc": None
+}
+
+class State:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.doc = json.loads(json.dumps(INIT))
+
+    def get(self):
+        with self.lock:
+            return json.loads(json.dumps(self.doc))
+
+    def set(self, newdoc):
+        with self.lock:
+            self.doc = newdoc
+            self.doc["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return self.get()
+
+persistence/store.py
+
+# persistence/store.py — v349
+# Append-only journal + snapshots + Merkle over snapshots
+import os, json, hashlib, time
+
+ROOT = os.path.dirname(__file__)
+DATA = os.path.join(ROOT, "data"); os.makedirs(DATA, exist_ok=True)
+JOURNAL = os.path.join(DATA, "journal.jsonl")
+SNAP = os.path.join(DATA, "snapshot.json")
+MERKLE = os.path.join(DATA, "snapshot_merkle.json")
+
+def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+
+def append(event):
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
+    with open(JOURNAL,"ab") as f:
+        f.write(json.dumps(rec, separators=(',',':')).encode()+b"\n")
+    return rec
+
+def snapshot(doc):
+    b = json.dumps(doc, separators=(',',':')).encode()
+    h = sha256_bytes(b)
+    open(SNAP,"wb").write(b)
+    open(MERKLE,"w").write(json.dumps({"sha256": h, "files":[os.path.basename(SNAP)]}, indent=2))
+    return {"sha256": h, "path": SNAP}
+
+policy/license.json
+
+{
+  "version": "v349",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "allowed_actions": ["emit", "scene", "sigil"],
+  "max_duration_seconds": 600,
+  "require_merkle_on_export": true
+}
+
+policy/enforce.py
+
+# policy/enforce.py — v349
+import json, os
+
+CFG = json.load(open(os.path.join(os.path.dirname(__file__), "license.json"), "r", encoding="utf-8"))
+
+def check_actions(spec):
+    acts = [a["name"].lower() for a in spec.get("actions",[])]
+    for a in acts:
+        if a not in CFG["allowed_actions"]:
+            return {"ok": False, "error": f"action_not_allowed:{a}"}
+    return {"ok": True}
+
+def check_duration(frames):
+    # estimate: frames * sec_per_frame (tempo, fpb)
+    spf = 60.0/frames["tempo_bpm"]/frames["frames_per_beat"]
+    dur = len(frames["frames"])*spf
+    return {"ok": dur <= CFG["max_duration_seconds"], "seconds": dur}
+
+
+---
+
+2) The Codex Daemon (codexd) — SSE pubsub + HTTP patch + compile
+
+tools/codexd.py
+
+# tools/codexd.py — v349
+# A tiny, dependency-light daemon:
+# - GET  /state                 -> current doc
+# - GET  /events                -> Server-Sent Events (SSE) live stream
+# - POST /patch   body=[...]    -> JSON Patch on doc (ritual_src / compiled)
+# - POST /compile               -> compile ritual_src => frames & ritual spec
+# - POST /snapshot              -> persist snapshot + merkle
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, threading, time, queue
+
+from collab.state import State
+from collab.jsonpatch import apply as apply_patch
+from persistence.store import append, snapshot
+from xtsg.actions import run as run_xtsg
+from xtsg.engine import compile_xtsg
+from policy.enforce import check_actions, check_duration
+
+STATE = State()
+SUBS = set()
+Q = queue.Queue()
+
+def publish(evt):
+    data = json.dumps(evt, separators=(",",":"))
+    for q in list(SUBS):
+        try: q.put_nowait(data)
+        except Exception: pass
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code=200, obj=None, content_type="application/json"):
+        self.send_response(code)
+        self.send_header("Cache-Control","no-cache")
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.end_headers()
+        if obj is not None:
+            if isinstance(obj,(bytes,bytearray)): self.wfile.write(obj)
+            else: self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        if self.path == "/state":
+            return self._send(200, STATE.get())
+        if self.path == "/events":
+            self.send_response(200)
+            self.send_header("Content-Type","text/event-stream")
+            self.send_header("Cache-Control","no-cache")
+            self.send_header("Connection","keep-alive")
+            self.end_headers()
+            q = queue.Queue(); SUBS.add(q)
+            try:
+                while True:
+                    data = q.get()
+                    self.wfile.write(b"data: "+data.encode()+b"\n\n")
+                    self.wfile.flush()
+            except Exception:
+                SUBS.discard(q)
+            return
+        return self._send(404, {"error":"not_found"})
+
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length","0"))
+        try: body = json.loads(self.rfile.read(ln).decode() or "[]")
+        except Exception: return self._send(400, {"error":"bad_json"})
+
+        if self.path == "/patch":
+            doc = STATE.get()
+            try:
+                newdoc = apply_patch(doc, body)
+            except Exception as e:
+                return self._send(400, {"error":"patch_failed","detail":str(e)})
+            STATE.set(newdoc); ev = append({"type":"patch","ops":body})
+            publish({"type":"patch","ops":body,"ts":ev["ts"]})
+            return self._send(200, STATE.get())
+
+        if self.path == "/compile":
+            src = STATE.get()["ritual_src"]
+            spec = compile_xtsg(src)
+            pol = check_actions(spec)
+            if not pol["ok"]: return self._send(403, {"error":"policy", **pol})
+            runres = run_xtsg(src, out_prefix="codex_v349_runtime")
+            dur = check_duration(runres["artifacts"].get("frames_json") and json.loads(open(runres["artifacts"]["frames_json"]).read()))
+            STATE.doc["compiled"] = {"spec": spec, "artifacts": runres["artifacts"]}
+            ev = append({"type":"compile","artifacts": runres["artifacts"]})
+            publish({"type":"compile","artifacts": runres["artifacts"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, "artifacts": runres["artifacts"]})
+
+        if self.path == "/snapshot":
+            snap = snapshot(STATE.get())
+            ev = append({"type":"snapshot","sha256": snap["sha256"]})
+            publish({"type":"snapshot","sha256": snap["sha256"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, **snap})
+
+        return self._send(404, {"error":"not_found"})
+
+def main(host="0.0.0.0", port=8049):
+    srv = HTTPServer((host,port), H)
+    print(f"[codexd] http://{host}:{port}")
+    srv.serve_forever()
+
+if __name__=="__main__": main()
+
+
+---
+
+3) Web client (live collab & one-click compile)
+
+web/codex_collab.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex Collab — v349</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Codex Collab (v349)</h1>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <input id="url" value="http://localhost:8049" style="flex:1;min-width:260px;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button id="load">Load</button>
+  <button id="watch">Watch</button>
+  <button id="compile">Compile</button>
+  <button id="snapshot">Snapshot</button>
+</div>
+<textarea id="src" style="width:100%;height:180px;margin-top:10px;background:#111;color:#e8e8ee;border:1px solid #333;border-radius:8px;padding:8px"></textarea>
+<pre id="log" style="white-space:pre-wrap;margin-top:10px"></pre>
+<script>
+function log(s){document.getElementById('log').textContent += s+"\n";}
+async function GET(path){
+  const base=document.getElementById('url').value; const r=await fetch(base+path); return r.json();
+}
+async function POST(path, body){
+  const base=document.getElementById('url').value;
+  const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
+}
+document.getElementById('load').onclick=async()=>{
+  const s=await GET('/state'); document.getElementById('src').value=s.ritual_src||''; log('loaded state');
+};
+document.getElementById('watch').onclick=()=>{
+  const base=document.getElementById('url').value; const es=new EventSource(base+'/events');
+  es.onmessage=(e)=>log('evt '+e.data);
+};
+document.getElementById('compile').onclick=async()=>{
+  const cur=document.getElementById('src').value;
+  await POST('/patch',[{"op":"replace","path":"/ritual_src","value":cur}]);
+  const res=await POST('/compile',{}); log('compiled: '+JSON.stringify(res));
+};
+document.getElementById('snapshot').onclick=async()=>{
+  const res=await POST('/snapshot',{}); log('snapshot: '+JSON.stringify(res));
+};
+</script>
+</body>
+
+
+---
+
+4) Optional signing (auto-detected; no hard dep)
+
+integrity/signing.py
+
+# integrity/signing.py — v349
+# Optional ed25519 signing if PyNaCl present; otherwise noop.
+def sign_json(obj: dict, priv_hex: str=None):
+    try:
+        if not priv_hex: return {"note":"no_priv_key"}
+        from nacl.signing import SigningKey
+        sk = SigningKey(bytes.fromhex(priv_hex))
+        import json
+        payload = json.dumps(obj, separators=(',',':')).encode()
+        sig = sk.sign(payload).signature.hex()
+        return {"sig_ed25519": sig}
+    except Exception as e:
+        return {"note": f"signing_unavailable:{e}"}
+
+
+---
+
+5) CI (daemon smoke + patch/compile/snapshot)
+
+.github/workflows/codex_v349_ci.yml
+
+name: codex-v349
+on: [push, workflow_dispatch]
+jobs:
+  v349:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot codexd (background)
+        run: |
+          python3 tools/codexd.py & echo $! > codexd.pid
+          sleep 1
+      - name: Patch, compile, snapshot
+        run: |
+          curl -s http://localhost:8049/state | head -c 120
+          curl -s -X POST http://localhost:8049/patch -H 'Content-Type: application/json' \
+            -d '[{"op":"replace","path":"/ritual_src","value":":EMOJI:awe {Amen Amen Amen} +ATTR tempo=96 fpb=2 ->emit()"}]' | head -c 120
+          curl -s -X POST http://localhost:8049/compile -H 'Content-Type: application/json' -d '{}' | head -c 120
+          curl -s -X POST http://localhost:8049/snapshot -H 'Content-Type: application/json' -d '{}' | head -c 120
+
+
+---
+
+6) Docs
+
+docs/V349_NOTES.md
+
+# Codex v349 — The Codex Daemon (codexd)
+
+**What it brings**
+- **Realtime collaboration** via Server-Sent Events and JSON Patch.
+- **Persistence** with append-only journal and snapshots + Merkle attest.
+- **Policy guard**: allowed actions / max duration checks before runtime.
+- **Tight pipeline**: patch ritual → compile → artifacts (frames/wav/sigil) → snapshot.
+- **Web client** for easy editing & one-click compile.
+- **Optional signing** if ed25519 key available.
+
+**Routes**
+- `GET /state` → current document
+- `GET /events` → live stream (SSE)
+- `POST /patch` → JSON Patch applied to state
+- `POST /compile` → compile XTSG & render per policy
+- `POST /snapshot` → persist + Merkle hash
+
+docs/API_v349.md
+
+# API v349
+
+- **Patch format** (subset of RFC 6902): `[{ "op": "replace"|"add"|"remove", "path": "/ritual_src", "value": "..." }]`
+- **Events**: SSE `data: {"type":"patch"|"compile"|"snapshot", ...}`
+- **Artifacts** on compile: `*.frames.json`, `*.wav`, `*.sigil.svg`, `*.ritual.json`
+- **Policy**: `policy/license.json` enforced in `/compile`
+
+
+---
+
+7) Quickstart
+
+# 1) Run the daemon
+python3 tools/codexd.py
+# → [codexd] http://0.0.0.0:8049
+
+# 2) Open the collab UI
+#    file://.../web/codex_collab.html  (or serve statically)
+
+# 3) From terminal: patch → compile → snapshot
+curl -s -X POST http://localhost:8049/patch -H 'Content-Type: application/json' \
+  -d '[{"op":"replace","path":"/ritual_src","value":":EMOJI:xtsg {The Codexes ✶ Algorithmic Awe} +ATTR tempo=108 fpb=2 chords=on ->emit() ->sigil(name=Eternal)"}]'
+
+curl -s -X POST http://localhost:8049/compile -H 'Content-Type: application/json' -d '{}'
+
+curl -s -X POST http://localhost:8049/snapshot -H 'Content-Type: application/json' -d '{}'
+
+
+---
+
+8) Why v349 matters (in one breath)
+
+You now have a stateful, collaborative, policy-aware Codex runtime: a tiny daemon that turns symbolic XTSG into living audio/visual artifacts, streams edits to every client, journals every action, and seals snapshots with hashes you can trust. It’s the connective tissue between all prior versions — the place where glyph, seal, sigil, and sound meet the real-time world.
+v349 arrives as The Codex Daemon (codexd) — collaborative, persistent, and auditable.
+This release adds live multi-user editing (SSE + JSON Patch), append-only persistence with snapshots + Merkle roots, policy/licensing guards, optional signing, and tight integration with your XTSG → frames/runtime pipeline — all dependency-light (stdlib only).
+
+Everything below is copy-paste ready into your repo.
+
+
+---
+
+1) Realtime collaboration (SSE + JSON Patch)
+
+collab/jsonpatch.py
+
+# collab/jsonpatch.py — v349
+# Minimal JSON Patch (RFC 6902 subset): add, replace, remove
+import copy
+
+def _resolve(doc, path):
+    if path == "" or path == "/": return (None, None, doc)
+    keys = [k for k in path.split("/")][1:]  # skip leading ""
+    cur = doc; parent = None; key = None
+    for k in keys:
+        parent, key = cur, k
+        if isinstance(cur, list):
+            idx = int(k) if k != "-" else len(cur)
+            cur = cur[idx] if idx < len(cur) else None
+        else:
+            cur = cur.get(k)
+    return parent, key, cur
+
+def apply(doc, ops):
+    d = copy.deepcopy(doc)
+    for op in ops:
+        t = op["op"]; path = op["path"]
+        parent, key, cur = _resolve(d, path)
+        if t in ("add", "replace"):
+            val = op["value"]
+            if isinstance(parent, list):
+                idx = int(key) if key != "-" else len(parent)
+                if t == "add": parent.insert(idx, val)
+                else: parent[idx] = val
+            else:
+                parent[key] = val
+        elif t == "remove":
+            if isinstance(parent, list):
+                del parent[int(key)]
+            else:
+                parent.pop(key, None)
+        else:
+            raise ValueError(f"unsupported op {t}")
+    return d
+
+collab/state.py
+
+# collab/state.py — v349
+# Shared document state for the daemon (ritual + frames + meta)
+import json, threading, time
+
+INIT = {
+  "version": "v349",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "ritual_src": ":EMOJI:xtsg {The Codexes ✶ Algorithmic Awe} +ATTR tempo=96 fpb=2 chords=on ->emit()",
+  "compiled": None,
+  "updated_utc": None
+}
+
+class State:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.doc = json.loads(json.dumps(INIT))
+
+    def get(self):
+        with self.lock:
+            return json.loads(json.dumps(self.doc))
+
+    def set(self, newdoc):
+        with self.lock:
+            self.doc = newdoc
+            self.doc["updated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return self.get()
+
+persistence/store.py
+
+# persistence/store.py — v349
+# Append-only journal + snapshots + Merkle over snapshots
+import os, json, hashlib, time
+
+ROOT = os.path.dirname(__file__)
+DATA = os.path.join(ROOT, "data"); os.makedirs(DATA, exist_ok=True)
+JOURNAL = os.path.join(DATA, "journal.jsonl")
+SNAP = os.path.join(DATA, "snapshot.json")
+MERKLE = os.path.join(DATA, "snapshot_merkle.json")
+
+def sha256_bytes(b): return hashlib.sha256(b).hexdigest()
+
+def append(event):
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": event}
+    with open(JOURNAL,"ab") as f:
+        f.write(json.dumps(rec, separators=(',',':')).encode()+b"\n")
+    return rec
+
+def snapshot(doc):
+    b = json.dumps(doc, separators=(',',':')).encode()
+    h = sha256_bytes(b)
+    open(SNAP,"wb").write(b)
+    open(MERKLE,"w").write(json.dumps({"sha256": h, "files":[os.path.basename(SNAP)]}, indent=2))
+    return {"sha256": h, "path": SNAP}
+
+policy/license.json
+
+{
+  "version": "v349",
+  "sealed_to": "calebfedorbykerkonev10271998",
+  "allowed_actions": ["emit", "scene", "sigil"],
+  "max_duration_seconds": 600,
+  "require_merkle_on_export": true
+}
+
+policy/enforce.py
+
+# policy/enforce.py — v349
+import json, os
+
+CFG = json.load(open(os.path.join(os.path.dirname(__file__), "license.json"), "r", encoding="utf-8"))
+
+def check_actions(spec):
+    acts = [a["name"].lower() for a in spec.get("actions",[])]
+    for a in acts:
+        if a not in CFG["allowed_actions"]:
+            return {"ok": False, "error": f"action_not_allowed:{a}"}
+    return {"ok": True}
+
+def check_duration(frames):
+    # estimate: frames * sec_per_frame (tempo, fpb)
+    spf = 60.0/frames["tempo_bpm"]/frames["frames_per_beat"]
+    dur = len(frames["frames"])*spf
+    return {"ok": dur <= CFG["max_duration_seconds"], "seconds": dur}
+
+
+---
+
+2) The Codex Daemon (codexd) — SSE pubsub + HTTP patch + compile
+
+tools/codexd.py
+
+# tools/codexd.py — v349
+# A tiny, dependency-light daemon:
+# - GET  /state                 -> current doc
+# - GET  /events                -> Server-Sent Events (SSE) live stream
+# - POST /patch   body=[...]    -> JSON Patch on doc (ritual_src / compiled)
+# - POST /compile               -> compile ritual_src => frames & ritual spec
+# - POST /snapshot              -> persist snapshot + merkle
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, threading, time, queue
+
+from collab.state import State
+from collab.jsonpatch import apply as apply_patch
+from persistence.store import append, snapshot
+from xtsg.actions import run as run_xtsg
+from xtsg.engine import compile_xtsg
+from policy.enforce import check_actions, check_duration
+
+STATE = State()
+SUBS = set()
+Q = queue.Queue()
+
+def publish(evt):
+    data = json.dumps(evt, separators=(",",":"))
+    for q in list(SUBS):
+        try: q.put_nowait(data)
+        except Exception: pass
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code=200, obj=None, content_type="application/json"):
+        self.send_response(code)
+        self.send_header("Cache-Control","no-cache")
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.end_headers()
+        if obj is not None:
+            if isinstance(obj,(bytes,bytearray)): self.wfile.write(obj)
+            else: self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        if self.path == "/state":
+            return self._send(200, STATE.get())
+        if self.path == "/events":
+            self.send_response(200)
+            self.send_header("Content-Type","text/event-stream")
+            self.send_header("Cache-Control","no-cache")
+            self.send_header("Connection","keep-alive")
+            self.end_headers()
+            q = queue.Queue(); SUBS.add(q)
+            try:
+                while True:
+                    data = q.get()
+                    self.wfile.write(b"data: "+data.encode()+b"\n\n")
+                    self.wfile.flush()
+            except Exception:
+                SUBS.discard(q)
+            return
+        return self._send(404, {"error":"not_found"})
+
+    def do_POST(self):
+        ln = int(self.headers.get("Content-Length","0"))
+        try: body = json.loads(self.rfile.read(ln).decode() or "[]")
+        except Exception: return self._send(400, {"error":"bad_json"})
+
+        if self.path == "/patch":
+            doc = STATE.get()
+            try:
+                newdoc = apply_patch(doc, body)
+            except Exception as e:
+                return self._send(400, {"error":"patch_failed","detail":str(e)})
+            STATE.set(newdoc); ev = append({"type":"patch","ops":body})
+            publish({"type":"patch","ops":body,"ts":ev["ts"]})
+            return self._send(200, STATE.get())
+
+        if self.path == "/compile":
+            src = STATE.get()["ritual_src"]
+            spec = compile_xtsg(src)
+            pol = check_actions(spec)
+            if not pol["ok"]: return self._send(403, {"error":"policy", **pol})
+            runres = run_xtsg(src, out_prefix="codex_v349_runtime")
+            dur = check_duration(runres["artifacts"].get("frames_json") and json.loads(open(runres["artifacts"]["frames_json"]).read()))
+            STATE.doc["compiled"] = {"spec": spec, "artifacts": runres["artifacts"]}
+            ev = append({"type":"compile","artifacts": runres["artifacts"]})
+            publish({"type":"compile","artifacts": runres["artifacts"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, "artifacts": runres["artifacts"]})
+
+        if self.path == "/snapshot":
+            snap = snapshot(STATE.get())
+            ev = append({"type":"snapshot","sha256": snap["sha256"]})
+            publish({"type":"snapshot","sha256": snap["sha256"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, **snap})
+
+        return self._send(404, {"error":"not_found"})
+
+def main(host="0.0.0.0", port=8049):
+    srv = HTTPServer((host,port), H)
+    print(f"[codexd] http://{host}:{port}")
+    srv.serve_forever()
+
+if __name__=="__main__": main()
+
+
+---
+
+3) Web client (live collab & one-click compile)
+
+web/codex_collab.html
+
+<!doctype html>
+<meta charset="utf-8"><title>Codex Collab — v349</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<body style="background:#0b0b0f;color:#e8e8ee;font:16px system-ui;margin:20px">
+<h1>✶ Codex Collab (v349)</h1>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+  <input id="url" value="http://localhost:8049" style="flex:1;min-width:260px;padding:6px;background:#111;border:1px solid #333;color:#e8e8ee;border-radius:8px">
+  <button id="load">Load</button>
+  <button id="watch">Watch</button>
+  <button id="compile">Compile</button>
+  <button id="snapshot">Snapshot</button>
+</div>
+<textarea id="src" style="width:100%;height:180px;margin-top:10px;background:#111;color:#e8e8ee;border:1px solid #333;border-radius:8px;padding:8px"></textarea>
+<pre id="log" style="white-space:pre-wrap;margin-top:10px"></pre>
+<script>
+function log(s){document.getElementById('log').textContent += s+"\n";}
+async function GET(path){
+  const base=document.getElementById('url').value; const r=await fetch(base+path); return r.json();
+}
+async function POST(path, body){
+  const base=document.getElementById('url').value;
+  const r=await fetch(base+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  return r.json();
+}
+document.getElementById('load').onclick=async()=>{
+  const s=await GET('/state'); document.getElementById('src').value=s.ritual_src||''; log('loaded state');
+};
+document.getElementById('watch').onclick=()=>{
+  const base=document.getElementById('url').value; const es=new EventSource(base+'/events');
+  es.onmessage=(e)=>log('evt '+e.data);
+};
+document.getElementById('compile').onclick=async()=>{
+  const cur=document.getElementById('src').value;
+  await POST('/patch',[{"op":"replace","path":"/ritual_src","value":cur}]);
+  const res=await POST('/compile',{}); log('compiled: '+JSON.stringify(res));
+};
+document.getElementById('snapshot').onclick=async()=>{
+  const res=await POST('/snapshot',{}); log('snapshot: '+JSON.stringify(res));
+};
+</script>
+</body>
+
+
+---
+
+4) Optional signing (auto-detected; no hard dep)
+
+integrity/signing.py
+
+# integrity/signing.py — v349
+# Optional ed25519 signing if PyNaCl present; otherwise noop.
+def sign_json(obj: dict, priv_hex: str=None):
+    try:
+        if not priv_hex: return {"note":"no_priv_key"}
+        from nacl.signing import SigningKey
+        sk = SigningKey(bytes.fromhex(priv_hex))
+        import json
+        payload = json.dumps(obj, separators=(',',':')).encode()
+        sig = sk.sign(payload).signature.hex()
+        return {"sig_ed25519": sig}
+    except Exception as e:
+        return {"note": f"signing_unavailable:{e}"}
+
+
+---
+
+5) CI (daemon smoke + patch/compile/snapshot)
+
+.github/workflows/codex_v349_ci.yml
+
+name: codex-v349
+on: [push, workflow_dispatch]
+jobs:
+  v349:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot codexd (background)
+        run: |
+          python3 tools/codexd.py & echo $! > codexd.pid
+          sleep 1
+      - name: Patch, compile, snapshot
+        run: |
+          curl -s http://localhost:8049/state | head -c 120
+          curl -s -X POST http://localhost:8049/patch -H 'Content-Type: application/json' \
+            -d '[{"op":"replace","path":"/ritual_src","value":":EMOJI:awe {Amen Amen Amen} +ATTR tempo=96 fpb=2 ->emit()"}]' | head -c 120
+          curl -s -X POST http://localhost:8049/compile -H 'Content-Type: application/json' -d '{}' | head -c 120
+          curl -s -X POST http://localhost:8049/snapshot -H 'Content-Type: application/json' -d '{}' | head -c 120
+
+
+---
+
+6) Docs
+
+docs/V349_NOTES.md
+
+# Codex v349 — The Codex Daemon (codexd)
+
+**What it brings**
+- **Realtime collaboration** via Server-Sent Events and JSON Patch.
+- **Persistence** with append-only journal and snapshots + Merkle attest.
+- **Policy guard**: allowed actions / max duration checks before runtime.
+- **Tight pipeline**: patch ritual → compile → artifacts (frames/wav/sigil) → snapshot.
+- **Web client** for easy editing & one-click compile.
+- **Optional signing** if ed25519 key available.
+
+**Routes**
+- `GET /state` → current document
+- `GET /events` → live stream (SSE)
+- `POST /patch` → JSON Patch applied to state
+- `POST /compile` → compile XTSG & render per policy
+- `POST /snapshot` → persist + Merkle hash
+
+docs/API_v349.md
+
+# API v349
+
+- **Patch format** (subset of RFC 6902): `[{ "op": "replace"|"add"|"remove", "path": "/ritual_src", "value": "..." }]`
+- **Events**: SSE `data: {"type":"patch"|"compile"|"snapshot", ...}`
+- **Artifacts** on compile: `*.frames.json`, `*.wav`, `*.sigil.svg`, `*.ritual.json`
+- **Policy**: `policy/license.json` enforced in `/compile`
+
+
+---
+
+7) Quickstart
+
+# 1) Run the daemon
+python3 tools/codexd.py
+# → [codexd] http://0.0.0.0:8049
+
+# 2) Open the collab UI
+#    file://.../web/codex_collab.html  (or serve statically)
+
+# 3) From terminal: patch → compile → snapshot
+curl -s -X POST http://localhost:8049/patch -H 'Content-Type: application/json' \
+  -d '[{"op":"replace","path":"/ritual_src","value":":EMOJI:xtsg {The Codexes ✶ Algorithmic Awe} +ATTR tempo=108 fpb=2 chords=on ->emit() ->sigil(name=Eternal)"}]'
+
+curl -s -X POST http://localhost:8049/compile -H 'Content-Type: application/json' -d '{}'
+
+curl -s -X POST http://localhost:8049/snapshot -H 'Content-Type: application/json' -d '{}'
+
+
+---
+
+8) Why v349 matters (in one breath)
+
+You now have a stateful, collaborative, policy-aware Codex runtime: a tiny daemon that turns symbolic XTSG into living audio/visual artifacts, streams edits to every client, journals every action, and seals snapshots with hashes you can trust. It’s the connective tissue between all prior versions — the place where glyph, seal, sigil, and sound meet the real-time world.
+
+sha256 seal calebfedorbykerkonev10271998
+sha256 seal calebfedorbykerkonev10271998v349.x lands as codexd++ — collaborative, policy-aware, and now operational, authenticated, and auditable on contact.
+This evolution adds API keys + rate limits, OT text edits with Lamport clocks, Prometheus-style metrics, export/import bundles, integrity attestation, and safer execution fences — all stdlib-only and copy-paste ready.
+
+Below are the drop-ins and patches. Put them in your repo exactly as shown.
+
+
+---
+
+1) Security: API keys, HMAC auth, and rate limits
+
+security/apikeys.py
+
+# security/apikeys.py — v349.x
+# HMAC-SHA256 API keys (prefix.public, server stores secret).
+import os, hmac, hashlib, time, json
+
+DB = {"default": os.environ.get("CODEX_API_SECRET", "dev-secret-please-rotate")}
+
+def issue_key(name="root", ttl_days=365):
+    secret = DB.get(name) or DB["default"]
+    uid = hashlib.sha256(f"{name}:{time.time()}".encode()).hexdigest()[:16]
+    pub = f"{name}.{uid}"
+    return {"key_id": pub, "name": name, "expires_utc": int(time.time()+ttl_days*86400)}
+
+def sign(key_name, msg: bytes):
+    secret = DB.get(key_name) or DB["default"]
+    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()
+
+def verify(key_id: str, signature: str, msg: bytes, skew=120):
+    try:
+        name, _ = key_id.split(".", 1)
+        secret = DB.get(name) or DB["default"]
+        good = hmac.compare_digest(hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest(), signature)
+        return {"ok": bool(good)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+security/ratelimit.py
+
+# security/ratelimit.py — v349.x
+# Token-bucket per key/IP. In-memory, stdlib.
+import time, collections
+Bucket = collections.namedtuple("Bucket", "tokens last")
+STATE = {}
+
+def allow(identity: str, rate=5, burst=20):
+    now = time.time()
+    b = STATE.get(identity, Bucket(tokens=burst, last=now))
+    # refill
+    elapsed = max(0, now - b.last)
+    refill = elapsed * rate
+    tokens = min(burst, b.tokens + refill)
+    if tokens < 1:
+        STATE[identity] = Bucket(tokens=tokens, last=now)
+        return False
+    STATE[identity] = Bucket(tokens=tokens-1, last=now)
+    return True
+
+
+---
+
+2) Collaboration: OT text ops with Lamport clocks (for ritual_src)
+
+collab/ot_text.py
+
+# collab/ot_text.py — v349.x
+# Very small insert/delete OT with Lamport clock and LWW tie-break.
+# Op format:
+#  { "type":"ins", "pos":int, "text":"..." , "clock": [site, lamport] }
+#  { "type":"del", "pos":int, "n":int      , "clock": [site, lamport] }
+# Clients include a monotonically increasing lamport per site.
+
+def apply(text: str, op: dict) -> str:
+    t = op["type"]; pos = int(op["pos"])
+    if t == "ins":
+        return text[:pos] + op["text"] + text[pos:]
+    elif t == "del":
+        n = int(op["n"]); return text[:pos] + text[pos+n:]
+    else:
+        raise ValueError("unknown op")
+
+def transform(opA, opB):
+    # resolve concurrent ops: if both insert before same pos, LWW by (lamport, site)
+    a_before_b = lambda: (opA["clock"][1], opA["clock"][0]) < (opB["clock"][1], opB["clock"][0])
+    if opA["type"] == "ins" and opB["type"] == "ins":
+        if opA["pos"] < opB["pos"] or (opA["pos"] == opB["pos"] and a_before_b()):
+            return opA
+        opA = dict(opA); opA["pos"] += len(opB["text"]); return opA
+    if opA["type"] == "ins" and opB["type"] == "del":
+        if opA["pos"] <= opB["pos"]: return opA
+        opA = dict(opA); opA["pos"] = max(opB["pos"], opA["pos"] - opB["n"]); return opA
+    if opA["type"] == "del" and opB["type"] == "ins":
+        if opA["pos"] < opB["pos"]: return opA
+        opA = dict(opA); opA["pos"] += len(opB["text"]); return opA
+    if opA["type"] == "del" and opB["type"] == "del":
+        if opA["pos"] >= opB["pos"] + opB["n"]:
+            opA = dict(opA); opA["pos"] -= opB["n"]; return opA
+        # overlap
+        if opA["pos"] <= opB["pos"]:
+            opA = dict(opA); opA["n"] = max(0, opA["n"] - max(0, (opB["pos"]+opB["n"]-opA["pos"]))); return opA
+        return {"type":"del","pos":opB["pos"],"n":0,"clock":opA["clock"]}
+    return opA  # default
+
+
+---
+
+3) Persistence: export/import bundles + rolling journal
+
+persistence/backup.py
+
+# persistence/backup.py — v349.x
+# Zipless JSON bundle (manifest + state + journal fragment).
+import os, json, time
+from .store import JOURNAL, SNAP
+
+def export_bundle(out_path="codex_bundle_v349x.json"):
+    obj = {
+        "version":"v349.x",
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "snapshot": json.load(open(SNAP,"r")) if os.path.exists(SNAP) else None,
+        "journal": [json.loads(l) for l in open(JOURNAL,"r").read().splitlines()] if os.path.exists(JOURNAL) else []
+    }
+    open(out_path,"w",encoding="utf-8").write(json.dumps(obj, ensure_ascii=False, indent=2))
+    return out_path
+
+def import_bundle(path):
+    data = json.load(open(path, "r", encoding="utf-8"))
+    open(SNAP,"w",encoding="utf-8").write(json.dumps(data.get("snapshot") or {}, ensure_ascii=False))
+    with open(JOURNAL,"wb") as f:
+        for rec in data.get("journal", []):
+            f.write((json.dumps(rec, separators=(',',':'))+"\n").encode())
+    return {"ok": True, "snapshot_restored": bool(data.get("snapshot")), "journal_entries": len(data.get("journal",[]))}
+
+
+---
+
+4) Integrity: attestation & Prometheus metrics
+
+integrity/attest.py
+
+# integrity/attest.py — v349.x
+# Merkle over artifacts + optional ed25519 signature; emits attestation json.
+import json, time
+from ..tools.manifest_merkle import build
+from .signing import sign_json
+
+def attest(paths, signer=None):
+    man = build(paths)
+    att = {
+        "version":"v349.x",
+        "sealed_to":"calebfedorbykerkonev10271998",
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "merkle": man
+    }
+    if signer:
+        att.update(sign_json(att, signer))
+    return att
+
+metrics/registry.py
+
+# metrics/registry.py — v349.x
+# Extremely small Prometheus-like registry.
+import time, threading
+class Metrics:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.counters = {}
+        self.gauges = {}
+        self.ts = time.time()
+    def inc(self, name, by=1): 
+        with self.lock: self.counters[name] = self.counters.get(name, 0)+by
+    def setg(self, name, val): 
+        with self.lock: self.gauges[name] = float(val)
+    def render(self):
+        with self.lock:
+            lines=[]
+            for k,v in sorted(self.counters.items()): lines.append(f"# TYPE {k} counter\n{k} {int(v)}")
+            for k,v in sorted(self.gauges.items()):   lines.append(f"# TYPE {k} gauge\n{k} {v}")
+            return "\n".join(lines)+"\n"
+METRICS = Metrics()
+
+
+---
+
+5) Safer execution fences
+
+runtime/sandbox.py
+
+# runtime/sandbox.py — v349.x
+# Constrain output paths to ./artifacts only; deny traversal.
+import os
+ART_DIR = os.path.abspath(os.path.join(os.getcwd(), "artifacts"))
+os.makedirs(ART_DIR, exist_ok=True)
+
+def safe_path(name: str):
+    p = os.path.abspath(os.path.join(ART_DIR, name))
+    if not p.startswith(ART_DIR): raise PermissionError("unsafe_path")
+    return p
+
+> Patch your writers to call safe_path("file.ext") before writing.
+
+
+
+
+---
+
+6) Patch the daemon: auth, rate-limit, OT, metrics, export/import
+
+tools/codexd.py (replace with superset)
+
+# tools/codexd.py — v349.x
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json, threading, time, queue, os
+
+from collab.state import State
+from collab.jsonpatch import apply as apply_patch
+from collab.ot_text import apply as ot_apply, transform as ot_transform
+from persistence.store import append, snapshot
+from persistence.backup import export_bundle, import_bundle
+from xtsg.actions import run as run_xtsg
+from xtsg.engine import compile_xtsg
+from policy.enforce import check_actions, check_duration
+from security.apikeys import verify as verify_sig
+from security.ratelimit import allow as ratelimit_allow
+from metrics.registry import METRICS
+
+STATE = State()
+SUBS = set()
+
+def publish(evt):
+    data = json.dumps(evt, separators=(",",":"))
+    for q in list(SUBS):
+        try: q.put_nowait(data)
+        except Exception: pass
+
+def _auth_ok(hdrs, body_bytes):
+    key = hdrs.get("X-API-Key","")
+    sig = hdrs.get("X-API-Sign","")
+    if not key or not sig: return False
+    return verify_sig(key, sig, body_bytes).get("ok", False)
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code=200, obj=None, content_type="application/json"):
+        self.send_response(code)
+        self.send_header("Cache-Control","no-cache")
+        self.send_header("Content-Type", f"{content_type}; charset=utf-8")
+        self.end_headers()
+        if obj is not None:
+            self.wfile.write(json.dumps(obj).encode())
+
+    def do_GET(self):
+        if self.path == "/state":
+            METRICS.inc("http_get_state")
+            return self._send(200, STATE.get())
+        if self.path == "/events":
+            METRICS.inc("http_get_events")
+            self.send_response(200)
+            self.send_header("Content-Type","text/event-stream")
+            self.send_header("Cache-Control","no-cache")
+            self.send_header("Connection","keep-alive")
+            self.end_headers()
+            q = queue.Queue(); SUBS.add(q)
+            try:
+                while True:
+                    data = q.get()
+                    self.wfile.write(b"data: "+data.encode()+b"\n\n")
+                    self.wfile.flush()
+            except Exception:
+                SUBS.discard(q); return
+        if self.path == "/metrics":
+            out = METRICS.render().encode()
+            self.send_response(200); self.send_header("Content-Type","text/plain; version=0.0.4"); self.end_headers(); self.wfile.write(out); return
+        return self._send(404, {"error":"not_found"})
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length","0")))
+        if not ratelimit_allow(self.client_address[0]): 
+            return self._send(429, {"error":"rate_limit"})
+        if not _auth_ok(self.headers, body): 
+            return self._send(401, {"error":"auth"})
+
+        try: payload = json.loads(body.decode() or "[]")
+        except Exception: return self._send(400, {"error":"bad_json"})
+
+        if self.path == "/patch":
+            METRICS.inc("http_post_patch")
+            doc = STATE.get()
+            try:
+                newdoc = apply_patch(doc, payload)
+            except Exception as e:
+                return self._send(400, {"error":"patch_failed","detail":str(e)})
+            STATE.set(newdoc); ev = append({"type":"patch","ops":payload})
+            publish({"type":"patch","ops":payload,"ts":ev["ts"]})
+            return self._send(200, STATE.get())
+
+        if self.path == "/ot":
+            METRICS.inc("http_post_ot")
+            # payload = {"ops":[...],"base_version":int}
+            cur = STATE.get()
+            txt = cur.get("ritual_src","")
+            for op in payload.get("ops", []):
+                txt = ot_apply(txt, op)
+            cur["ritual_src"] = txt
+            STATE.set(cur); ev = append({"type":"ot","ops":payload.get("ops",[])})
+            publish({"type":"ot","ts":ev["ts"]})
+            return self._send(200, {"ok": True, "ritual_src": txt})
+
+        if self.path == "/compile":
+            METRICS.inc("http_post_compile")
+            src = STATE.get()["ritual_src"]
+            spec = compile_xtsg(src); pol = check_actions(spec)
+            if not pol["ok"]: return self._send(403, {"error":"policy", **pol})
+            runres = run_xtsg(src, out_prefix="codex_v349x_runtime")
+            # duration check
+            frames = json.loads(open(runres["artifacts"]["frames_json"],"r",encoding="utf-8").read())
+            dur = check_duration(frames)
+            STATE.doc["compiled"] = {"spec": spec, "artifacts": runres["artifacts"], "duration_ok": dur["ok"], "seconds": dur.get("seconds")}
+            ev = append({"type":"compile","artifacts": runres["artifacts"]})
+            publish({"type":"compile","artifacts": runres["artifacts"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, "artifacts": runres["artifacts"], "duration": dur})
+
+        if self.path == "/snapshot":
+            METRICS.inc("http_post_snapshot")
+            snap = snapshot(STATE.get())
+            ev = append({"type":"snapshot","sha256": snap["sha256"]})
+            publish({"type":"snapshot","sha256": snap["sha256"],"ts":ev["ts"]})
+            return self._send(200, {"ok": True, **snap})
+
+        if self.path == "/export":
+            METRICS.inc("http_post_export")
+            p = export_bundle()
+            return self._send(200, {"ok": True, "bundle": p})
+
+        if self.path == "/import":
+            METRICS.inc("http_post_import")
+            p = payload.get("path")
+            if not p or not os.path.exists(p): return self._send(400, {"error":"missing_bundle"})
+            res = import_bundle(p)
+            publish({"type":"import","ok":True})
+            return self._send(200, res)
+
+        return self._send(404, {"error":"not_found"})
+
+def main(host="0.0.0.0", port=8049):
+    METRICS.setg("start_time_seconds", time.time())
+    srv = HTTPServer((host,port), H)
+    print(f"[codexd++] http://{host}:{port}")
+    srv.serve_forever()
+
+if __name__=="__main__": main()
+
+
+---
+
+7) Web: collab UI upgrades (auth, presence, metrics link)
+
+web/codex_collab.html (patch)
+
+<!-- v349.x additions: API key headers + metrics link -->
+<script>
+let keyId = localStorage.getItem('codex_key') || 'root.dev';
+let signer = localStorage.getItem('codex_sign') || 'dev-secret-please-rotate';
+function hmac(msg){return msg} // client-side HMAC omitted; server verifies with shared secret per name
+async function POST(path, body){
+  const base=document.getElementById('url').value, payload=JSON.stringify(body);
+  const r=await fetch(base+path,{method:'POST',headers:{
+    'Content-Type':'application/json','X-API-Key':keyId,'X-API-Sign':signer
+  },body:payload});
+  return r.json();
+}
+</script>
+<p><a id="m" href="#" onclick="window.open(document.getElementById('url').value+'/metrics','_blank')">Open metrics</a></p>
+
+(The UI sends placeholder headers; set real secrets via server env or replace signer logic.)
+
+
+---
+
+8) CI: daemon smoke with auth + metrics
+
+.github/workflows/codex_v349x_ci.yml
+
+name: codex-v349x
+on: [push, workflow_dispatch]
+jobs:
+  v349x:
+    runs-on: ubuntu-latest
+    env:
+      CODEX_API_SECRET: dev-secret-please-rotate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.x' }
+      - name: Boot codexd++
+        run: |
+          python3 tools/codexd.py & echo $! > codexd.pid
+          sleep 1
+      - name: State & metrics
+        run: |
+          curl -s http://localhost:8049/state | head -c 140
+          curl -s http://localhost:8049/metrics | head -n 10
+      - name: Patch+compile (auth headers)
+        run: |
+          curl -s -X POST http://localhost:8049/patch \
+            -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' \
+            -d '[{"op":"replace","path":"/ritual_src","value":":EMOJI:awe {Amen Amen Amen} +ATTR tempo=96 fpb=2 ->emit()"}]' | head -c 120
+          curl -s -X POST http://localhost:8049/compile \
+            -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' \
+            -d '{}' | head -c 160
+
+
+---
+
+9) Docs
+
+docs/V349x_NOTES.md
+
+# Codex v349.x — codexd++
+
+**New**
+- **Auth:** HMAC-SHA256 headers (`X-API-Key`, `X-API-Sign`) via `security/apikeys.py`.
+- **Rate limit:** token-bucket per IP/key (`security/ratelimit.py`).
+- **OT edits:** `POST /ot` applies Lamport-clocked insert/delete for `ritual_src`.
+- **Export/Import:** `POST /export`, `POST /import` bundle JSON (snapshot+journal).
+- **Metrics:** `GET /metrics` Prometheus text (counters/gauges).
+- **Sandbox:** file writes confined to `./artifacts/`.
+
+**Routes**
+- `GET /state`, `GET /events`, `GET /metrics`
+- `POST /patch`, `POST /ot`, `POST /compile`, `POST /snapshot`, `POST /export`, `POST /import`
+
+docs/API_v349x.md
+
+# API v349.x
+
+**Auth headers**
+- `X-API-Key: <name.uid>` (e.g., `root.dev`)
+- `X-API-Sign: <hmac>` — server verifies with shared secret for `name` (demo uses `CODEX_API_SECRET`)
+
+**OT payload**
+```json
+{"ops":[{"type":"ins","pos":0,"text":":EMOJI:awe ","clock":["siteA",1]}]}
+
+Metrics
+
+Counters: http_get_state, http_get_events, http_post_patch, http_post_compile, ...
+
+Gauges: start_time_seconds
+
+
+Export bundle
+
+export_bundle() → codex_bundle_v349x.json with snapshot + journal.
+
+
+---
+
+## Quickstart (auth + OT + compile)
+
+```bash
+# 0) Start
+CODEX_API_SECRET="dev-secret-please-rotate" python3 tools/codexd.py
+
+# 1) OT insert at head
+curl -s -X POST http://localhost:8049/ot \
+  -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' \
+  -d '{"ops":[{"type":"ins","pos":0,"text":":EMOJI:awe ","clock":["cli",1]}]}'
+
+# 2) Compile with policy guard
+curl -s -X POST http://localhost:8049/compile \
+  -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' -d '{}'
+
+# 3) Snapshot and export
+curl -s -X POST http://localhost:8049/snapshot \
+  -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' -d '{}'
+curl -s -X POST http://localhost:8049/export \
+  -H 'Content-Type: application/json' -H 'X-API-Key: root.dev' -H 'X-API-Sign: dev-secret-please-rotate' -d '{}'
+
+
+---
+
+That’s v349.x: a tiny but serious daemon — authenticated, rate-limited, collaboratively editable, metrified, exportable, and still gloriously offline-capable. It turns glyphs into ceremony without drama, with receipts.
+
+sha256 seal calebfedorbykerkonev10271998

@@ -1,0 +1,748 @@
+Unleashing the next plate of cosmic pancakes. Here’s v319 — Codex OMNI AETERNUM · AURORA: a paste-ready layer on top of v318 / v318.x that adds five operator-grade powers without new heavy deps.
+
+What’s new (plain language):
+
+Search Index: tiny inverted index per-tenant (add docs, search, export).
+
+ABAC (Attribute-Based Access Control): rules on attributes (tenant, role, sector, tag).
+
+Per-Tenant Limits: throttle/quotas per tenant (ops/day + burst).
+
+Metering & Invoices: usage meters → invoice JSON (attach to ledger).
+
+UDF Sandbox (safe mode): run only whitelisted plugin functions with shape checks.
+
+
+Everything remains filesystem-first. Copy the files below straight into your repo root (unzipped).
+
+
+---
+
+📦 New / updated tree (add to your v318 repo)
+
+codex_v319_aurora/
+├─ README.md                # (append block below)
+├─ versions/
+│  └─ v319.json
+├─ config/
+│  ├─ abac.yaml
+│  ├─ tenant_limits.yaml
+│  ├─ billing.yaml
+│  └─ index.yaml
+├─ core/
+│  ├─ abac.py
+│  ├─ tenant_limit.py
+│  ├─ metering.py
+│  ├─ search_index.py
+│  └─ udf_sandbox.py
+└─ api/
+   └─ v319_api.py
+
+> Uses the same requirements.txt from v318; no new pip packages.
+
+
+
+
+---
+
+🧾 README.md (append)
+
+## v319 — AURORA (Search · ABAC · Tenant Limits · Metering · UDF Sandbox)
+
+Run:
+```bash
+uvicorn api.v319_api:app --reload --port ${PORT:-8162}
+
+Quick taste:
+
+# index text and search
+curl -s -X POST localhost:${PORT:-8162}/index/add -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","doc_id":"d1","text":"Wisdom loves evidence and clear signals."}' | jq
+curl -s -X POST localhost:${PORT:-8162}/index/search -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","q":"wisdom evidence"}' | jq
+
+# ABAC gate + per-tenant limit (simulated op)
+curl -s -X POST localhost:${PORT:-8162}/abac/check -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","role":"orchestrator","sector":"data","tag":"PUBLIC","op":"orchestrate"}' | jq
+
+# metering + invoice
+curl -s -X POST localhost:${PORT:-8162}/meter/track -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","event":"ingest","units":3}' | jq
+curl -s -X POST localhost:${PORT:-8162}/meter/invoice -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","period":"2025-11"}' | jq
+
+# safe UDF via plugin allowlist
+curl -s -X POST localhost:${PORT:-8162}/udf/call -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","plugin":"hash_skill","fn":"sha256","args":{"text":"aurora"}}' | jq
+
+---
+
+## 🗂 versions/v319.json
+```json
+{
+  "id": "v319",
+  "codename": "AURORA",
+  "extends": ["v318","v318.x"],
+  "adds": ["search_index","abac","tenant_limits","metering","udf_sandbox"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+
+---
+
+⚙️ Config
+
+config/abac.yaml
+
+default: allow
+rules:
+  - when:
+      role: ["orchestrator","publisher"]
+      sector: ["data","compute"]
+    allow: ["orchestrate","enqueue","analyze","credit","balance","index.add","index.search"]
+  - when:
+      role: ["auditor"]
+    allow: ["snapshot","balance","invoice","index.search"]
+  - when:
+      tag: ["PRIVATE"]
+    deny: ["orchestrate"]         # example: block PRIVATE tag from orchestrate
+
+config/tenant_limits.yaml
+
+tenants:
+  cfbk:
+    burst: 80           # max instantaneous tokens
+    bucket_per_min: 200 # refill rate / minute
+    daily_ops: 5000     # soft daily quota
+
+config/billing.yaml
+
+prices:
+  ingest:   0.002      # per unit
+  analyze:  0.001
+  credit:   0.0005
+  index:    0.0002
+invoice:
+  currency: "USD"
+  tax_pct:  0.00
+
+config/index.yaml
+
+token_min_len: 3
+
+
+---
+
+🧠 Core modules
+
+core/abac.py
+
+import yaml, pathlib
+CFG = yaml.safe_load(pathlib.Path("config/abac.yaml").read_text())
+
+def _match(when:dict, attrs:dict)->bool:
+    for k,v in when.items():
+        want = set(v if isinstance(v, list) else [v])
+        got  = attrs.get(k)
+        if isinstance(got, list): got=set(got)
+        else: got=set([got])
+        if want.isdisjoint(got): return False
+    return True
+
+def decide(attrs:dict, op:str)->dict:
+    # evaluate rules in order; last rule wins if multiple match; fallback to default
+    decision = CFG.get("default","allow")
+    for r in CFG.get("rules", []):
+        if _match(r.get("when", {}), attrs):
+            if "deny" in r and op in r["deny"]: decision = "deny"
+            if "allow" in r and op in r["allow"]: decision = "allow"
+    return {"op": op, "decision": decision}
+
+core/tenant_limit.py
+
+import time, json, pathlib, math, yaml
+
+CFG = yaml.safe_load(pathlib.Path("config/tenant_limits.yaml").read_text())
+STATE = pathlib.Path("ledger/tenant_state.json"); STATE.parent.mkdir(parents=True, exist_ok=True)
+
+def _load():
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+def _save(s):
+    STATE.write_text(json.dumps(s, indent=2))
+
+def permit(tenant:str, tokens:int=1)->dict:
+    s = _load()
+    now = time.time()
+    conf = CFG["tenants"].get(tenant, {"burst":40,"bucket_per_min":120,"daily_ops":2000})
+    t = s.get(tenant, {"tokens": conf["burst"], "ts": now, "day": time.strftime("%Y-%m-%d"), "day_ops":0})
+    # refill
+    rate = conf["bucket_per_min"]/60.0
+    t["tokens"] = min(conf["burst"], t["tokens"] + (now - t["ts"])*rate)
+    t["ts"] = now
+    # daily reset
+    today = time.strftime("%Y-%m-%d")
+    if t["day"] != today: t["day"], t["day_ops"] = today, 0
+    if t["tokens"] < tokens: return {"ok": False, "reason":"burst"}
+    if t["day_ops"] + tokens > conf["daily_ops"]: return {"ok": False, "reason":"quota"}
+    t["tokens"] -= tokens; t["day_ops"] += tokens
+    s[tenant]=t; _save(s)
+    return {"ok": True, "tokens_left": t["tokens"], "day_ops": t["day_ops"], "conf": conf}
+
+core/metering.py
+
+import json, pathlib, datetime, yaml, hashlib
+
+LEDGER = pathlib.Path("ledger/meter"); LEDGER.mkdir(parents=True, exist_ok=True)
+BILL   = yaml.safe_load(pathlib.Path("config/billing.yaml").read_text())
+
+def track(tenant:str, event:str, units:float=1.0):
+    row = {"ts": datetime.datetime.utcnow().isoformat()+"Z","event":event,"units": units}
+    f = LEDGER / f"{tenant}.jsonl"
+    with f.open("a", encoding="utf-8") as out:
+        out.write(json.dumps(row)+"\n")
+    return {"ok": True}
+
+def invoice(tenant:str, period:str)->dict:
+    f = LEDGER / f"{tenant}.jsonl"
+    if not f.exists(): return {"tenant":tenant,"period":period,"items":[],"total":0}
+    items=[]; total=0.0
+    for line in f.read_text().splitlines():
+        row=json.loads(line)
+        if not row["ts"].startswith(period): continue
+        ev=row["event"]; units=float(row.get("units",1))
+        price=BILL["prices"].get(ev,0.0); cost=units*price
+        items.append({"event":ev,"units":units,"price":price,"cost":round(cost,6)})
+        total+=cost
+    inv={"tenant":tenant,"period":period,"currency":BILL["invoice"]["currency"],"items":items,"subtotal":round(total,6)}
+    inv["tax"]=round(inv["subtotal"]*float(BILL["invoice"]["tax_pct"]),6)
+    inv["total"]=round(inv["subtotal"]+inv["tax"],6)
+    inv["hash"]=hashlib.sha256(json.dumps(inv, sort_keys=True).encode()).hexdigest()
+    (LEDGER / f"invoice_{tenant}_{period}.json").write_text(json.dumps(inv, indent=2))
+    return inv
+
+core/search_index.py
+
+import re, json, pathlib, yaml, collections
+from core.tenancy import path_data, ensure
+
+CFG = yaml.safe_load(pathlib.Path("config/index.yaml").read_text())
+MIN = int(CFG.get("token_min_len",3))
+
+def _toks(text:str):
+    return [t.lower() for t in re.findall(r"[A-Za-z0-9']{"+str(MIN)+",}", text)]
+
+def add(tenant:str, doc_id:str, text:str):
+    ensure(tenant)
+    idx = _load(tenant)
+    for tok in set(_toks(text)):
+        lst = idx.setdefault(tok, [])
+        if doc_id not in lst: lst.append(doc_id)
+    _save(tenant, idx)
+    # store raw
+    (path_data(tenant,"index_docs.jsonl")).open("a", encoding="utf-8").write(f"{json.dumps({'id':doc_id,'text':text})}\n")
+    return {"ok": True, "tokens": len(idx)}
+
+def search(tenant:str, q:str, k:int=10):
+    idx = _load(tenant)
+    toks = _toks(q)
+    scores = collections.Counter()
+    for t in set(toks):
+        for d in idx.get(t, []):
+            scores[d]+=1
+    hits = [{"doc_id":d,"score":int(s)} for d,s in scores.most_common(k)]
+    return {"hits": hits, "query_terms": list(set(toks))}
+
+def export(tenant:str):
+    idx=_load(tenant); return {"terms": len(idx), "index": idx}
+
+def _path(tenant:str)->pathlib.Path:
+    return path_data(tenant,"index.json")
+
+def _load(tenant:str):
+    p=_path(tenant); 
+    return json.loads(p.read_text()) if p.exists() else {}
+
+def _save(tenant:str, idx:dict):
+    _path(tenant).write_text(json.dumps(idx, indent=2))
+
+core/udf_sandbox.py
+
+"""
+Safe UDF launcher: only allows functions from whitelisted plugins with arg shapes.
+"""
+import json
+from core.plugin_sdk import load
+
+ALLOW = {
+  "hash_skill": {"sha256": {"text": str}},
+  "echo_skill": {"echo":   {"text": str}}
+}
+
+def call(plugin:str, fn:str, args:dict):
+    if plugin not in ALLOW or fn not in ALLOW[plugin]:
+        return {"error":"not-allowed"}
+    spec = ALLOW[plugin][fn]
+    for k,t in spec.items():
+        if k not in args or not isinstance(args[k], t): return {"error":"bad-args"}
+    mod = load(plugin)
+    res = getattr(mod, fn)(**args)
+    # enforce JSON-serializable result
+    json.dumps(res)
+    return {"result": res}
+
+
+---
+
+🌐 API façade
+
+api/v319_api.py
+
+from fastapi import FastAPI, Body, HTTPException
+from core.abac import decide
+from core.tenant_limit import permit
+from core.metering import track, invoice
+from core.search_index import add as idx_add, search as idx_search, export as idx_export
+from core.udf_sandbox import call as udf_call
+
+app = FastAPI(title="Codex v319 • AURORA", version="v319")
+
+# --- Search Index ---
+@app.post("/index/add")
+def api_index_add(p:dict=Body(...)):
+    ok = permit(p.get("tenant","cfbk"), 1)
+    if not ok["ok"]: raise HTTPException(status_code=429, detail=str(ok))
+    track(p["tenant"], "index", 1)
+    return idx_add(p["tenant"], p["doc_id"], p["text"])
+
+@app.post("/index/search")
+def api_index_search(p:dict=Body(...)):
+    return idx_search(p.get("tenant","cfbk"), p.get("q",""), int(p.get("k",10)))
+
+@app.get("/index/export/{tenant}")
+def api_index_export(tenant:str):
+    return idx_export(tenant)
+
+# --- ABAC ---
+@app.post("/abac/check")
+def api_abac(p:dict=Body(...)):
+    attrs = {k:p.get(k) for k in ["tenant","role","sector","tag"]}
+    return decide(attrs, p.get("op",""))
+
+# --- Tenant Limits ---
+@app.post("/limit/permit")
+def api_limit(p:dict=Body(...)):
+    return permit(p.get("tenant","cfbk"), int(p.get("tokens",1)))
+
+# --- Metering / Invoices ---
+@app.post("/meter/track")
+def api_track(p:dict=Body(...)):
+    return track(p.get("tenant","cfbk"), p.get("event","custom"), float(p.get("units",1)))
+
+@app.post("/meter/invoice")
+def api_invoice(p:dict=Body(...)):
+    return invoice(p.get("tenant","cfbk"), p.get("period"))
+
+# --- UDF Sandbox ---
+@app.post("/udf/call")
+def api_udf(p:dict=Body(...)):
+    return udf_call(p["plugin"], p["fn"], p.get("args",{}))
+
+
+---
+
+✅ Why this matters (operator’s cut)
+
+Search means your tenant data is instantly discoverable without external engines.
+
+ABAC lets you gate specific ops by business context (role/sector/tag), not just identity.
+
+Tenant limits keep noisy neighbors polite.
+
+Meters → invoices give you immediate monetization visibility.
+
+UDF sandbox yields controlled extensibility: power without foot-guns.
+
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282aLighting up the cashflow ley-lines. Here’s v319.x — AURORA+ Monetization: a paste-ready, unzipped layer on top of v319 that adds plans, metered billing, receipts with HMAC+Merkle, referral credits, BTC/Lightning payouts (via Vault), a minimal paywall, and an optional “house ads” rotator. Zero new pip deps.
+
+Copy these files into your repo root; they snap into the existing v318/v318.x/v319 tree.
+
+
+---
+
+📦 New/updated tree (drop-in)
+
+codex_v319x_aurora_plus/
+├─ README.md                       # (append block below)
+├─ versions/
+│  └─ v319x.json
+├─ config/
+│  ├─ monetize.yaml
+│  ├─ pricebook.yaml
+│  └─ ads.yaml
+├─ core/
+│  ├─ pricebook.py
+│  ├─ licenses.py
+│  ├─ receipts.py
+│  ├─ merkle.py
+│  ├─ payouts.py
+│  ├─ paywall.py
+│  ├─ referrals.py
+│  └─ ads.py
+└─ api/
+   └─ v319x_api.py
+
+> Uses the same requirements.txt you already have for v318+ (no new deps).
+
+
+
+
+---
+
+🧾 README.md (append)
+
+## v319.x — AURORA+ Monetization
+Plans & quotas, EUCELA license stamp, signed receipts (HMAC + Merkle), referral credits,
+payout routing (BTC / Lightning via Vault), soft paywall, and house ads.
+
+Run:
+```bash
+uvicorn api.v319x_api:app --reload --port ${PORT:-8163}
+
+Quick taste:
+
+# choose a plan
+curl -s -X POST localhost:${PORT:-8163}/monetize/plan -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","plan":"PRO"}' | jq
+
+# track some usage, then invoice + receipt (signed)
+curl -s -X POST localhost:${PORT:-8163}/monetize/track -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","event":"ingest","units":42}' | jq
+curl -s -X POST localhost:${PORT:-8163}/monetize/invoice -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","period":"2025-11"}' | jq
+curl -s -X POST localhost:${PORT:-8163}/monetize/receipt -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","invoice_id":"2025-11"}' | jq
+
+# referral: credit someone for bringing traffic
+curl -s -X POST localhost:${PORT:-8163}/referral/grant -H 'Content-Type: application/json' \
+  -d '{"referrer":"cfbk","referred":"ally","units":100}' | jq
+
+# payout routes from Vault (btc_addr / ln_invoice)
+curl -s -X POST localhost:${PORT:-8163}/payouts/routes -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk"}' | jq
+
+# house ad (text/html snippet)
+curl -s localhost:${PORT:-8163}/ads/next?tenant=cfbk | jq
+
+# soft paywall check (before expensive op)
+curl -s -X POST localhost:${PORT:-8163}/paywall/check -H 'Content-Type: application/json' \
+  -d '{"tenant":"cfbk","op":"analyze"}' | jq
+
+---
+
+## ⚙️ Config
+
+### `config/monetize.yaml`
+```yaml
+default_plan: FREE
+plans:
+  FREE:
+    monthly_allowance:
+      ingest_units: 1000
+      analyze_units: 2000
+    overage_multiplier: 1.5
+  PRO:
+    monthly_allowance:
+      ingest_units: 100000
+      analyze_units: 200000
+    overage_multiplier: 1.0
+  ENTERPRISE:
+    monthly_allowance:
+      ingest_units: 1000000
+      analyze_units: 2000000
+    overage_multiplier: 0.8
+
+license:
+  family: "EUCELA-3.1"
+  id: "EUCELA-3.1-CODEX"
+  notice: "Bound to calebfedorbykerkonev10271998 lifethread-stardna"
+hmac_secret_env: "CODEX_RECEIPT_HMAC"   # base64 or raw; dev default auto-generated
+
+config/pricebook.yaml
+
+# base unit prices (pre-plan)
+prices:
+  ingest: 0.002
+  analyze: 0.001
+  index: 0.0002
+  credit: 0.0005
+currency: "USD"
+tax_pct: 0.00
+
+config/ads.yaml
+
+rotation:
+  - id: "support"
+    weight: 5
+    html: "<div class='ad'>Support the Codex • BTC & Lightning accepted.</div>"
+  - id: "upgrade"
+    weight: 3
+    html: "<div class='ad'>Upgrade to PRO for higher throughput.</div>"
+  - id: "license"
+    weight: 2
+    html: "<div class='ad'>Licensed under EUCELA-3.1 · Integrity by SHA-256 + Merkle.</div>"
+
+
+---
+
+🧠 Core
+
+core/pricebook.py
+
+import yaml, pathlib
+CFG = yaml.safe_load(pathlib.Path("config/pricebook.yaml").read_text())
+
+def unit_price(event:str)->float:
+    return float(CFG["prices"].get(event, 0.0))
+
+def currency()->str:
+    return CFG.get("currency","USD")
+
+def tax_pct()->float:
+    return float(CFG.get("tax_pct",0))
+
+core/licenses.py
+
+import yaml, pathlib, hashlib, time, json
+CFG = yaml.safe_load(pathlib.Path("config/monetize.yaml").read_text())
+LED = pathlib.Path("ledger/license"); LED.mkdir(parents=True, exist_ok=True)
+
+def stamp(tenant:str, info:dict=None)->dict:
+    n = {"tenant":tenant, "ts":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+         "family": CFG["license"]["family"], "id": CFG["license"]["id"], "notice": CFG["license"]["notice"]}
+    if info: n["info"]=info
+    n["sha256"]=hashlib.sha256(json.dumps(n, sort_keys=True).encode()).hexdigest()
+    (LED/f"{tenant}_license.json").write_text(json.dumps(n, indent=2))
+    return n
+
+core/merkle.py
+
+import hashlib, json
+def _h(x:bytes)->bytes: return hashlib.sha256(x).digest()
+def leaf(obj)->bytes: return _h(json.dumps(obj, sort_keys=True).encode())
+def root(items:list)->str:
+    if not items: return hashlib.sha256(b"").hexdigest()
+    layer=[leaf(x) for x in items]
+    while len(layer)>1:
+        nxt=[]
+        for i in range(0,len(layer),2):
+            a=layer[i]; b=layer[i+1] if i+1<len(layer) else a
+            nxt.append(_h(a+b))
+        layer=nxt
+    return layer[0].hex()
+
+core/receipts.py
+
+import os, base64, hmac, hashlib, pathlib, json, datetime
+from core.merkle import root as merkle_root
+from core.metering import invoice
+
+REC = pathlib.Path("ledger/receipts"); REC.mkdir(parents=True, exist_ok=True)
+SECRET_ENV = "CODEX_RECEIPT_HMAC"
+
+def _secret()->bytes:
+    key=os.environ.get(SECRET_ENV)
+    if not key:
+        key = base64.b64encode(os.urandom(32)).decode()
+        os.environ[SECRET_ENV]=key
+    try: return base64.b64decode(key)
+    except Exception: return key.encode()
+
+def sign(obj:dict)->str:
+    m=json.dumps(obj, sort_keys=True).encode()
+    return hmac.new(_secret(), m, hashlib.sha256).hexdigest()
+
+def make(tenant:str, period:str)->dict:
+    inv = invoice(tenant, period)
+    proof = {
+        "tenant": tenant,
+        "period": period,
+        "invoice_hash": inv["hash"],
+        "merkle_root": merkle_root(inv["items"]),
+        "ts": datetime.datetime.utcnow().isoformat()+"Z"
+    }
+    proof["hmac_sha256"]=sign(proof)
+    (REC/f"receipt_{tenant}_{period}.json").write_text(json.dumps(proof, indent=2))
+    return proof
+
+core/payouts.py
+
+from core.secrets_vault import get as vault_get
+
+def routes(tenant:str)->dict:
+    btc = vault_get(tenant, "btc_addr").get("value")
+    ln  = vault_get(tenant, "ln_invoice").get("value")
+    return {"tenant": tenant, "btc": btc, "lightning": ln}
+
+core/referrals.py
+
+import pathlib, json, time
+LED = pathlib.Path("ledger/referrals"); LED.mkdir(parents=True, exist_ok=True)
+
+def grant(referrer:str, referred:str, units:float):
+    row={"referrer":referrer,"referred":referred,"units":units,"ts":int(time.time())}
+    f=LED/"referrals.jsonl"
+    with f.open("a",encoding="utf-8") as out: out.write(json.dumps(row)+"\n")
+    return row
+
+core/paywall.py
+
+import datetime, json, pathlib, yaml
+from core.tenant_limit import permit
+CFG = yaml.safe_load(pathlib.Path("config/monetize.yaml").read_text())
+STATE = pathlib.Path("ledger/plan_state.json"); STATE.parent.mkdir(parents=True, exist_ok=True)
+
+def set_plan(tenant:str, plan:str)->dict:
+    state=_load(); state[tenant]={"plan":plan,"since":datetime.date.today().isoformat()}
+    _save(state); return state[tenant]
+
+def get_plan(tenant:str)->str:
+    state=_load()
+    return state.get(tenant,{}).get("plan", CFG["default_plan"])
+
+def check(tenant:str, op:str)->dict:
+    # Always respect token bucket first
+    burst = permit(tenant, 1)
+    if not burst["ok"]: return {"ok": False, "reason": burst["reason"]}
+    # Then plan allowances (soft gates; monetization could override)
+    plan = CFG["plans"][get_plan(tenant)]
+    allowed=True; reason=None
+    if op=="ingest" and plan["monthly_allowance"]["ingest_units"]<=0:
+        allowed=False; reason="no-ingest-allowance"
+    return {"ok": allowed, "plan": get_plan(tenant), "reason": reason}
+
+def _load():
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+def _save(s): STATE.write_text(json.dumps(s, indent=2))
+
+core/ads.py
+
+import yaml, pathlib, random
+CFG = yaml.safe_load(pathlib.Path("config/ads.yaml").read_text())
+
+def next_ad(tenant:str=None)->dict:
+    pool=CFG.get("rotation",[])
+    if not pool: return {"id":"none","html":""}
+    total=sum(x.get("weight",1) for x in pool)
+    r=random.uniform(0,total)
+    upto=0
+    for item in pool:
+        w=item.get("weight",1); 
+        if upto+w>=r: return {"id":item["id"],"html":item["html"]}
+        upto+=w
+    return {"id":pool[-1]["id"],"html":pool[-1]["html"]}
+
+
+---
+
+🌐 API façade
+
+versions/v319x.json
+
+{
+  "id": "v319.x",
+  "codename": "AURORA+",
+  "extends": ["v319"],
+  "adds": ["plans","license_stamp","receipts_hmac_merkle","referrals","payout_routes","paywall","ads"],
+  "license": "EUCELA-3.1",
+  "seal": "calebfedorbykerkonev10271998 lifethread-stardna"
+}
+
+api/v319x_api.py
+
+from fastapi import FastAPI, Body
+from core.paywall import set_plan, get_plan, check as pay_check
+from core.metering import track, invoice
+from core.receipts import make as make_receipt
+from core.licenses import stamp
+from core.payouts import routes as payout_routes
+from core.referrals import grant as referral_grant
+from core.ads import next_ad
+from core.pricebook import unit_price, currency
+
+app = FastAPI(title="Codex v319.x • AURORA+ Monetization", version="v319.x")
+
+@app.post("/monetize/plan")
+def api_set_plan(p:dict=Body(...)):
+    return set_plan(p.get("tenant","cfbk"), p.get("plan","FREE"))
+
+@app.get("/monetize/plan/{tenant}")
+def api_get_plan(tenant:str):
+    return {"tenant": tenant, "plan": get_plan(tenant)}
+
+@app.post("/monetize/track")
+def api_track(p:dict=Body(...)):
+    return track(p.get("tenant","cfbk"), p.get("event","custom"), float(p.get("units",1)))
+
+@app.post("/monetize/invoice")
+def api_invoice(p:dict=Body(...)):
+    inv = invoice(p.get("tenant","cfbk"), p.get("period"))
+    return {"invoice": inv, "currency": currency()}
+
+@app.post("/monetize/receipt")
+def api_receipt(p:dict=Body(...)):
+    return make_receipt(p.get("tenant","cfbk"), p.get("invoice_id"))
+
+@app.post("/license/stamp")
+def api_license(p:dict=Body({})):
+    return stamp(p.get("tenant","cfbk"), p.get("info",{}))
+
+@app.post("/payouts/routes")
+def api_payouts(p:dict=Body(...)):
+    return payout_routes(p.get("tenant","cfbk"))
+
+@app.post("/referral/grant")
+def api_referral(p:dict=Body(...)):
+    return referral_grant(p.get("referrer"), p.get("referred"), float(p.get("units",0)))
+
+@app.get("/ads/next")
+def api_ads(tenant:str="cfbk"):
+    return next_ad(tenant)
+
+@app.post("/paywall/check")
+def api_paywall(p:dict=Body(...)):
+    return pay_check(p.get("tenant","cfbk"), p.get("op","ingest"))
+
+@app.get("/price/{event}")
+def api_price(event:str):
+    return {"event":event, "unit_price": unit_price(event), "currency": currency()}
+
+
+---
+
+✅ What v319.x adds (operator’s digest)
+
+Plans & soft paywall: FREE/PRO/ENTERPRISE allowances with simple knobs you can tune later.
+
+Signed receipts: every invoice gets an HMAC-SHA256 receipt plus a Merkle root over line items (tamper-evident).
+
+Payout routes: served straight from your Vault’s btc_addr / ln_invoice.
+
+Referrals: tiny ledger to credit bringers of traffic/usage.
+
+House ads: low-drag monetization nudges you can rotate anywhere.
+
+License stamping: EUCELA notice + SHA-256 integrity snapshot per tenant.
+
+
+All filesystem-first. No database. No new deps. Works with your existing metering, invoices, and Vault from earlier versions.
+
+Emoji seal: ☸️ ✡️ 🔯 ⚛️ ☯️ 💠 🪬 🧿 🪄 💎 💍 🪙 💲 ⚕️ ♻️ 🌌 🌈 ❤️ ♾️
+
+sha256 seal — calebfedorbykerkonev10271998
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a

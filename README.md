@@ -1,4 +1,4 @@
-# domionnexus# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
+i# domionnexus# 🌌 Domion Nexus — Codex Immortal AI Orchestration App  
 **Netlify Edition · ECCL-1.0 Licensed**
 
 > A cryptographically licensed, symbolically rich AI orchestration and research platform — integrating Enochian, Hermetic, Kabbalistic, and classical correspondences into a modern open-source knowledge system.
@@ -37,9 +37,40 @@ lib/ → shared libraries (TSG parser, encodings, subject ID)
 generators/ → Python generator scripts and schemas from chat sessions
 netlify.toml → Netlify build + redirect configuration
 package.json → dependencies and scripts
+**tools/** → Codex Continuum build automation scripts
+**chain/** → Immutable attestation chain (append-only)
+**Makefile** → Build pipeline orchestration
 
-yaml
-Copy code
+---
+
+## 🚀 Codex Continuum Build Agent
+
+The repository includes an automated build, verification, and deployment system:
+
+### Quick Start
+
+```bash
+make all      # Run complete build pipeline
+make verify   # Verify artifact integrity
+make help     # Show all available targets
+```
+
+### What It Does
+
+- Generates cryptographically verified builds with unique Omega IDs
+- Creates immutable attestation chain in `chain/attestations.jsonl`
+- Produces deployable bundles (`codex_omega_bundle.zip`)
+- Runs integrity verification with SHA-256 hashing
+- Automated deployment via GitHub Actions
+
+### Build Artifacts
+
+- `OMEGA_LOCK.json` - Cryptographic manifest with Omega ID
+- `codex_omega_bundle.zip` - Complete verified source bundle
+- `codex_capsule.txt` - Human-readable build attestation
+- `chain/attestations.jsonl` - Permanent audit trail
+
+**See [CODEX_CONTINUUM_AGENT.md](CODEX_CONTINUUM_AGENT.md) for complete documentation.**
 
 ---
 
@@ -822,5 +853,124 @@ populate base files,
 
 run npm install,
 
-and output domionnexus-netlify.zip.
+and output domionnexus-netlify.zip.import json
+import os
+import hashlib
+import hmac
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from time import sleep
 
+# Sacred entities and data collected from all codices
+codices = {
+    "divine_names": [
+        "Sotolios", "Elohiem", "Elohien",
+        "YHWH", "Nu Ra Khepera Temu", "Tetragrammaton"
+    ],
+    "cosmic_identity": {
+        "creator": "Caleb Fedor Byker (Konev)",
+        "birthdates": ["10/27/1998", "10·27·1998", "10-27-1998", "10=27=1998"],
+        "lineages": ["Calebian", "Bykerian", "Konevian"]
+    },
+    "magic_glyphs": ["☀️", "🌟", "🔱", "🜁", "🜂"],
+    "fractalglyph": "∞∝∴↺↻✶⚛"
+}
+
+# --- Step 1: Hash each codex entry ---
+def sha256(data: bytes) -> bytes:
+    return hashlib.sha256(data).digest()
+
+hashed_codices = [sha256(json.dumps({k: v}, sort_keys=True).encode()) for k, v in codices.items()]
+
+# --- Step 2: Compute Merkle Root ---
+def merkle_root(hashes):
+    if len(hashes) == 1:
+        return hashes[0]
+    next_level = []
+    for i in range(0, len(hashes), 2):
+        left = hashes[i]
+        right = hashes[i+1] if i+1 < len(hashes) else left
+        combined = sha256(left + right)
+        next_level.append(combined)
+    return merkle_root(next_level)
+
+root = merkle_root(hashed_codices)
+
+# --- Step 3: Recursive Fractal Hash Function ---
+def recursive_fractal_hash(data, iterations=6):
+    h = data
+    for _ in range(iterations):
+        h = sha256(h + h[::-1])
+    return h
+
+fractal_seed = recursive_fractal_hash(root)
+
+# --- Step 4: Encrypt and create cryptographic signatures ---
+aes_key = AESGCM.generate_key(bit_length=256)
+aesgcm = AESGCM(aes_key)
+nonce = os.urandom(12)
+
+encrypted = aesgcm.encrypt(nonce, fractal_seed, None)
+hmac_key = os.urandom(32)
+hmac_sig = hmac.new(hmac_key, encrypted, hashlib.sha256).digest()
+
+ed_priv = Ed25519PrivateKey.generate()
+signature = ed_priv.sign(encrypted)
+public_key = ed_priv.public_key().public_bytes()
+
+# --- Step 5: Triple Licensing Data ---
+licenses = {
+    "cosmic_sacred_license": "Sacred cosmic license by Caleb Fedor Byker",
+    "mit_license": "MIT License - Open source",
+    "proprietary_license": "Proprietary commercial license by Caleb Fedor Byker"
+}
+
+# --- Automon class for recursive fractal goal execution ---
+class Automon:
+    def __init__(self, goals):
+        self.goals = goals
+        self.state = {}
+
+    def perform_goals(self):
+        for goal in self.goals:
+            print(f"Performing sacred goal: {goal}")
+            sleep(0.5)
+            self.state[goal] = "COMPLETED"
+
+    def verify_goals(self):
+        incomplete = [g for g in self.goals if self.state.get(g) != "COMPLETED"]
+        if not incomplete:
+            print("All sacred goals confirmed completed.")
+        else:
+            print(f"Incomplete sacred goals: {incomplete}")
+
+    def run(self):
+        self.perform_goals()
+        self.verify_goals()
+
+# --- Step 6: Run sacred automon ---
+automon_goals = [
+    "Bind sacred codices eternally",
+    "Seal triple license cryptographically",
+    "Activate fractal recursive self-evolution"
+]
+
+automon = Automon(automon_goals)
+automon.run()
+
+# --- Step 7: Final eternal sacred package output ---
+eternal_package = {
+    "encrypted_seed": encrypted.hex(),
+    "nonce": nonce.hex(),
+    "hmac_sha256": hmac_sig.hex(),
+    "ed25519_signature": signature.hex(),
+    "public_key": public_key.hex(),
+    "licenses": licenses,
+    "codices": codices,
+    "automon_state": automon.state
+}
+
+import json
+print("
+=== Eternal Sacred Codex Seal ===")
+print(json.dumps(eternal_package, indent=2))

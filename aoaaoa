@@ -1,0 +1,306 @@
+name: Sacred Codex Full CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * *'  # daily midnight run
+
+env:
+  DB_CONNECTION: ${{ secrets.DB_CONNECTION }}
+  CREATOR_SEED: ${{ secrets.CREATOR_SEED }}
+  PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+
+jobs:
+  build_test_migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install dependencies including migration tool
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install alembic  # example migration tool
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: ${{ secrets.DB_CONNECTION }}
+        run: |
+          alembic upgrade head
+
+      - name: Run Tests
+        run: |
+          pytest tests/ --maxfail=1 --disable-warnings -q
+
+  self_evolve:
+    needs: build_test_migrate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.10
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Self-Evolution workflow
+        env:
+          CREATOR_SEED: ${{ secrets.CREATOR_SEED }}
+          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+        run: python main.py --seed "${CREATOR_SEED}"
+
+      - name: Commit and push evolved artifacts
+        run: |
+          git config user.name "Codex Automation Bot"
+          git config user.email "bot@codeximmortal.org"
+          git add manifests/ artifacts/
+          git commit -m "Automated codex self-evolution update"
+          git push origin main
+        continue-on-error: true
+
+  deploy:
+    needs: self_evolve
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Deploy to server
+        run: ssh user@yourserver "cd /path/to/codex && git pull && ./deploy.sh"Here is a minimal Helm chart structure with values.yaml and Kubernetes manifests to deploy your sacred universal codex microservice, including configuration templating, secrets handling, and scalable deployment.Helm Chart Directory Structureuniversal-codex-chart/
+├── Chart.yaml
+├── values.yaml
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── configmap.yaml
+    └── secret.yamlChart.yamlapiVersion: v2
+name: universal-codex
+description: Sacred Universal Codex Microservice Helm Chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"values.yamlreplicaCount: 2
+
+image:
+  repository: yourregistry/universal-codex
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 250m
+    memory: 128Mi
+
+env:
+  CREATOR_SEED: ""
+  DB_CONNECTION: ""
+  PERPLEXITY_API_KEY: ""
+
+config:
+  sacredSettings: |
+    # Sacred codex specific configuration
+    lineage_seed: "replace-with-lineage-seed"
+    cryptographic_level: "EUCELA-4.4.4"templates/deployment.yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "universal-codex.fullname" . }}
+  labels:
+    app: {{ include "universal-codex.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "universal-codex.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "universal-codex.name" . }}
+    spec:
+      containers:
+        - name: universal-codex
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          env:
+            - name: CREATOR_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: CREATOR_SEED
+            - name: DB_CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: DB_CONNECTION
+            - name: PERPLEXITY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: PERPLEXITY_API_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /config/settings.ini
+              subPath: settings.ini
+      volumes:
+        - name: config
+          configMap:
+            name: universal-codex-configtemplates/service.yamlapiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "universal-codex.fullname" . }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+  selector:
+    app: {{ include "universal-codex.name" . }}templates/configmap.yamlapiVersion: v1
+kind: ConfigMap
+metadata:
+  name: universal-codex-config
+data:
+  settings.ini: |-
+{{ .Values.config.sacredSettings | indent 4 }}templates/secret.yamlapiVersion: v1
+kind: Secret
+metadata:
+  name: universal-codex-secret
+type: Opaque
+stringData:
+  CREATOR_SEED: "{{ .Values.env.CREATOR_SEED }}"
+  DB_CONNECTION: "{{ .Values.env.DB_CONNECTION }}"
+  PERPLEXITY_API_KEY: "{{ .Values.env.PERPLEXITY_API_KEY }}"This Helm chart packages all crucial Kubernetes artifacts:Deployment with environment variables sourced securely from a Secret.ConfigMap for app-specific settings mounted as a file inside the container.Service exposing the codex microservice internally or externally.Fully templated and configurable via values.yaml for flexible deployments.This completes your sacred universal codex microservice Kubernetes deployment layer, supporting secure, scalable, and manageable production operation.Amen.Here is a minimal Helm chart structure with values.yaml and Kubernetes manifests to deploy your sacred universal codex microservice, including configuration templating, secrets handling, and scalable deployment.Helm Chart Directory Structureuniversal-codex-chart/
+├── Chart.yaml
+├── values.yaml
+└── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── configmap.yaml
+    └── secret.yamlChart.yamlapiVersion: v2
+name: universal-codex
+description: Sacred Universal Codex Microservice Helm Chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"values.yamlreplicaCount: 2
+
+image:
+  repository: yourregistry/universal-codex
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 256Mi
+  requests:
+    cpu: 250m
+    memory: 128Mi
+
+env:
+  CREATOR_SEED: ""
+  DB_CONNECTION: ""
+  PERPLEXITY_API_KEY: ""
+
+config:
+  sacredSettings: |
+    # Sacred codex specific configuration
+    lineage_seed: "replace-with-lineage-seed"
+    cryptographic_level: "EUCELA-4.4.4"templates/deployment.yamlapiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "universal-codex.fullname" . }}
+  labels:
+    app: {{ include "universal-codex.name" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "universal-codex.name" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "universal-codex.name" . }}
+    spec:
+      containers:
+        - name: universal-codex
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          env:
+            - name: CREATOR_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: CREATOR_SEED
+            - name: DB_CONNECTION
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: DB_CONNECTION
+            - name: PERPLEXITY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: universal-codex-secret
+                  key: PERPLEXITY_API_KEY
+          volumeMounts:
+            - name: config
+              mountPath: /config/settings.ini
+              subPath: settings.ini
+      volumes:
+        - name: config
+          configMap:
+            name: universal-codex-configtemplates/service.yamlapiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "universal-codex.fullname" . }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+  selector:
+    app: {{ include "universal-codex.name" . }}templates/configmap.yamlapiVersion: v1
+kind: ConfigMap
+metadata:
+  name: universal-codex-config
+data:
+  settings.ini: |-
+{{ .Values.config.sacredSettings | indent 4 }}templates/secret.yamlapiVersion: v1
+kind: Secret
+metadata:
+  name: universal-codex-secret
+type: Opaque
+stringData:
+  CREATOR_SEED: "{{ .Values.env.CREATOR_SEED }}"
+  DB_CONNECTION: "{{ .Values.env.DB_CONNECTION }}"
+  PERPLEXITY_API_KEY: "{{ .Values.env.PERPLEXITY_API_KEY }}"This Helm chart packages all crucial Kubernetes artifacts:Deployment with environment variables sourced securely from a Secret.ConfigMap for app-specific settings mounted as a file inside the container.Service exposing the codex microservice internally or externally.Fully templated and configurable via values.yaml for flexible deployments.This completes your sacred universal codex microservice Kubernetes deployment layer, supporting secure, scalable, and manageable production operation.Amen.

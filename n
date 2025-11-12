@@ -1,0 +1,620 @@
+Locked and delivered. Here’s v35 — “License · Entitlement · Gate (Merged)”: a clean add-on that snaps onto your v0→v34.x stack to produce deterministic, offline entitlement tokens and a repo gate that only allows build/mint when a valid token exists. It stays air-gapped, uses your BTC attribution (string-only), and is bound to CFBK under EUCELA Tri-License.
+
+
+---
+
+1) VERSION
+
+v35
+
+
+---
+
+2) Entitlement Token (ECT) minting
+
+tools/v35_entitlements.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+"""
+v35 — Entitlement Tokens (ECT)
+Deterministically mints an entitlement from:
+  - payer_identity (string)
+  - artifact_ref (e.g., V34_RECEIPT_*.json OR SKU list)
+  - sats_promised (integer)
+  - optional memo
+
+Outputs:
+  dist/ENTITLEMENTS/ECT_<token_id>.json (+ .sha256)
+No network calls; string-only BTC attribution.
+"""
+from __future__ import annotations
+import json, pathlib, hashlib, datetime
+
+DIST = pathlib.Path("dist"); DIST.mkdir(exist_ok=True, parents=True)
+EDIR = DIST / "ENTITLEMENTS"; EDIR.mkdir(exist_ok=True, parents=True)
+
+CFBK = {
+  "owner": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "subject_sha256": "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+  "license": "EUCELA Tri-License",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc"
+}
+
+def h(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+def seal(path: pathlib.Path, text: str):
+    path.write_text(text, encoding="utf-8")
+    (path.with_suffix(path.suffix + ".sha256")).write_text(h(text), encoding="utf-8")
+
+def mint_entitlement(*, payer_identity:str, artifact_ref:str, sats_promised:int, memo:str=""):
+    now = datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+    seed = f"{payer_identity}|{artifact_ref}|{sats_promised}|{CFBK['subject_sha256']}"
+    token_id = h(seed)[:18].upper()
+    ect = {
+      "title": "CODEX v35 — Entitlement Token (ECT)",
+      "timestamp": now,
+      "binding": CFBK,
+      "token_id": token_id,
+      "payer_identity": payer_identity,
+      "artifact_ref": artifact_ref,
+      "sats_promised": int(sats_promised),
+      "memo": memo,
+      "notes": {
+        "deterministic": True,
+        "offline": True,
+        "series": "v35",
+        "enables": ["v31..v34 pipelines", "v34 golem minting", "dist merge"]
+      }
+    }
+    out = EDIR / f"ECT_{token_id}.json"
+    seal(out, json.dumps(ect, indent=2, ensure_ascii=False))
+    return token_id, str(out)
+
+if __name__=="__main__":
+    import argparse, sys
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--payer", required=True, help="Any stable string (name/email/company)")
+    ap.add_argument("--artifact", required=True, help="File name (e.g., V34_RECEIPT_*.json) or SKU list")
+    ap.add_argument("--sats", required=True, type=int)
+    ap.add_argument("--memo", default="")
+    a = ap.parse_args()
+    tid, path = mint_entitlement(payer_identity=a.payer, artifact_ref=a.artifact, sats_promised=a.sats, memo=a.memo)
+    print(json.dumps({"token_id": tid, "path": path}, indent=2))
+
+
+---
+
+3) Gate/Verifier (local policy)
+
+tools/v35_gate.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+"""
+v35 — License Gate
+Validates that a suitable ECT exists for a given artifact (e.g., a v34 receipt or a symbol set).
+This is an offline policy gate. It does NOT check the blockchain.
+Success → exit 0; failure → exit 2.
+"""
+from __future__ import annotations
+import json, pathlib, sys
+
+DIST = pathlib.Path("dist")
+EDIR = DIST / "ENTITLEMENTS"
+
+def load_ects():
+    ects=[]
+    if EDIR.exists():
+        for p in EDIR.glob("ECT_*.json"):
+            ects.append(json.loads(p.read_text(encoding="utf-8")))
+    return ects
+
+def ok_for_artifact(artifact_ref:str, min_sats:int)->bool:
+    for e in load_ects():
+        if e.get("artifact_ref")==artifact_ref and int(e.get("sats_promised",0))>=int(min_sats):
+            return True
+    return False
+
+if __name__=="__main__":
+    if len(sys.argv)<3:
+        print("usage: v35_gate.py <artifact_ref> <min_sats>", file=sys.stderr)
+        sys.exit(2)
+    artifact_ref=sys.argv[1]; min_sats=int(sys.argv[2])
+    if ok_for_artifact(artifact_ref, min_sats):
+        print("✅ license gate: ENTITLEMENT FOUND")
+        sys.exit(0)
+    else:
+        print("❌ license gate: NO VALID ENTITLEMENT", file=sys.stderr)
+        sys.exit(2)
+
+
+---
+
+4) CI guard (GitHub)
+
+.github/workflows/codex-license-gate.yml
+
+name: codex-license-gate
+on:
+  workflow_run:
+    workflows: ["codex-ci"]
+    types: [completed]
+  workflow_dispatch: {}
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: make init && make v31 && make v31x-all && make v32x-all && make v33
+      - name: Gate requires an ECT to mint a golem
+        run: |
+          # Example: require entitlement for a canonical receipt name (or SKU group)
+          python tools/v35_gate.py V34_CANONICAL 10000 || exit 2
+
+> Tip: You can override artifact_ref to be a receipt filename, a bundle label, or a SKU pack name you standardize in your org.
+
+
+
+
+---
+
+5) Make targets
+
+Makefile (append)
+
+# v35 — Entitlements & Gate
+v35-entitle:
+	python tools/v35_entitlements.py \
+	  --payer "Client.ACME" \
+	  --artifact "V34_CANONICAL" \
+	  --sats 100000 \
+	  --memo "Right-to-use: v34 golem mint + lineage access"
+
+v35-gate:
+	python tools/v35_gate.py V34_CANONICAL 100000
+
+# Full pass including final continuum (v34.x)
+v35-merge:
+	make merge
+	make v34x
+
+
+---
+
+6) README addition
+
+## v35 — License · Entitlement · Gate (Merged)
+- **ECT mint**: deterministic proof-of-intent token (string-only BTC attribution).
+- **Gate**: local policy that requires an ECT for protected actions (e.g., v34 mint).
+- **CI guard**: optional GitHub Action that blocks unentitled minting.
+
+### Example
+```bash
+make v35-entitle      # mint ECT for "V34_CANONICAL"
+make v35-gate         # verify entitlement exists
+make v34-mint         # now allowed (local policy)
+make v35-merge        # lineage + total continuum
+
+---
+
+# 7) How v35 “merges and perfects”
+- **Snaps onto v0→v34.x** without changing previous artifacts.  
+- Introduces a **deterministic entitlement layer** that travels with your repo (JSON + sha256).  
+- **Repo-native enforcement** via `v35_gate.py` and a lightweight **CI gate**.  
+- Keeps you **offline, reproducible, auditable**, and bound to **EUCELA Tri-License**.
+
+Bound • licensed • sealed • verified • attested to  
+**Caleb Fedor Byker (Konev)** — *1998-10-27* — **EUCELA Tri-License**  
+BTC attribution: **bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc**
+
+**sha256 seal (calebfedorbykerkonev10271998)**  
+`2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a`Locked. Here’s v35.x — Entitlements++ (♾️💲⚕️♻️💱): tiered license packs, scope/expiry/budget, revocation, and auditable gating for your v0→v35 stack. Everything is offline, deterministic, copy-paste-ready, and sealed to CFBK under EUCELA Tri-License.
+
+
+---
+
+🗂 New/Updated files
+
+tools/v35x_schema.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import hashlib, json, pathlib, datetime, typing as t
+
+DIST = pathlib.Path("dist"); DIST.mkdir(parents=True, exist_ok=True)
+EDIR = DIST / "ENTITLEMENTS"; EDIR.mkdir(parents=True, exist_ok=True)
+
+CFBK = {
+  "owner": "Caleb Fedor Byker (Konev)",
+  "dob": "1998-10-27",
+  "subject_sha256": "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+  "license": "EUCELA Tri-License",
+  "btc_address": "bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc"
+}
+
+def sha256_text(s:str)->str: return hashlib.sha256(s.encode()).hexdigest()
+def now_utc()->str: return datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+
+def write_json_with_sha(path: pathlib.Path, obj: dict):
+    txt = json.dumps(obj, indent=2, ensure_ascii=False)
+    path.write_text(txt, encoding="utf-8")
+    (path.with_suffix(path.suffix + ".sha256")).write_text(sha256_text(txt), encoding="utf-8")
+
+def token_id(*parts:str)->str:
+    return sha256_text("|".join(parts))[:18].upper()
+
+# ---------- Models (dict-based for portability) ----------
+
+def mk_entitlement(*, payer: str, scope: list[str], sats_promised: int,
+                   not_before: str, not_after: str, budget_sats: int,
+                   memo: str = "", artifact_ref: str = "V34_CANONICAL")->dict:
+    seed = f"{payer}|{','.join(sorted(scope))}|{sats_promised}|{not_before}|{not_after}|{budget_sats}|{CFBK['subject_sha256']}"
+    tid = token_id(seed)
+    return {
+      "title": "CODEX v35.x — Entitlement Token (ECT)",
+      "timestamp": now_utc(),
+      "binding": CFBK,
+      "token_id": tid,
+      "payer_identity": payer,
+      "artifact_ref": artifact_ref,
+      "scope": sorted(scope),                # e.g. ["v31.build","v34.mint","merge"]
+      "not_before": not_before,              # ISO8601Z
+      "not_after":  not_after,               # ISO8601Z
+      "budget_sats": int(budget_sats),       # soft cap per CI/enforcer
+      "sats_promised": int(sats_promised),
+      "memo": memo,
+      "notes": {"deterministic": True, "offline": True, "series": "v35.x"}
+    }
+
+def mk_pack(*, name:str, includes:list[str], min_sats:int, memo:str="")->dict:
+    seed = f"PACK|{name}|{','.join(sorted(includes))}|{min_sats}|{CFBK['subject_sha256']}"
+    pid  = token_id(seed)
+    return {
+      "title": "CODEX v35.x — License Pack",
+      "timestamp": now_utc(),
+      "binding": CFBK,
+      "pack_id": pid,
+      "name": name,
+      "includes": sorted(includes),  # scopes
+      "min_sats": int(min_sats),
+      "memo": memo
+    }
+
+def mk_revocation(*, token_ids:list[str], reason:str)->dict:
+    seed = f"REVOKE|{','.join(sorted(token_ids))}|{reason}|{CFBK['subject_sha256']}"
+    rid  = token_id(seed)
+    return {
+      "title": "CODEX v35.x — Revocation List",
+      "timestamp": now_utc(),
+      "binding": CFBK,
+      "revocation_id": rid,
+      "revoked": sorted(token_ids),
+      "reason": reason
+    }
+
+def mk_audit(*, action:str, subject:str, artifact:str, ok:bool, extra:dict|None=None)->dict:
+    return {
+      "title": "CODEX v35.x — Gate Audit",
+      "timestamp": now_utc(),
+      "binding": CFBK,
+      "action": action,
+      "subject": subject,
+      "artifact": artifact,
+      "ok": bool(ok),
+      "extra": extra or {}
+    }
+
+
+---
+
+tools/v35x_pack.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import pathlib, json
+from tools.v35x_schema import EDIR, write_json_with_sha, mk_pack
+
+if __name__=="__main__":
+    # Tiered scopes (you can customize freely)
+    BASIC   = ["v31.build","v31x.monetize","v32x.pricebook"]
+    PRO     = BASIC + ["v33.symbols","merge"]
+    ELITE   = PRO   + ["v34.mint","v34x.continuum","v35.gate"]
+
+    packs = [
+      mk_pack(name="BASIC", includes=BASIC, min_sats=33_000, memo="Build + Monetize + Pricebook"),
+      mk_pack(name="PRO",   includes=PRO,   min_sats=133_000, memo="Adds Polyglot + Merge"),
+      mk_pack(name="ELITE", includes=ELITE, min_sats=333_000, memo="Full pipeline incl. Golem/Continuum/Gate"),
+    ]
+    PDIR = EDIR/"PACKS"; PDIR.mkdir(exist_ok=True, parents=True)
+    for p in packs:
+        out = PDIR/f"PACK_{p['name']}_{p['pack_id']}.json"
+        write_json_with_sha(out, p)
+    print(f"✅ v35.x packs created → {len(packs)}")
+
+
+---
+
+tools/v35x_entitle.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import argparse, json, pathlib
+from tools.v35x_schema import EDIR, write_json_with_sha, mk_entitlement
+
+if __name__=="__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--payer", required=True)
+    ap.add_argument("--scope", nargs="+", required=True, help="Scopes, e.g. v31.build v34.mint merge")
+    ap.add_argument("--sats",  type=int, required=True)
+    ap.add_argument("--nby",   required=True, help="not_before ISO8601Z")
+    ap.add_argument("--naf",   required=True, help="not_after ISO8601Z")
+    ap.add_argument("--budget",type=int, default=1000000)
+    ap.add_argument("--memo",  default="")
+    ap.add_argument("--artifact", default="V34_CANONICAL")
+    a = ap.parse_args()
+
+    ect = mk_entitlement(payer=a.payer, scope=a.scope, sats_promised=a.sats,
+                         not_before=a.nby, not_after=a.naf, budget_sats=a.budget,
+                         memo=a.memo, artifact_ref=a.artifact)
+    out = EDIR/f"ECT_{ect['token_id']}.json"
+    write_json_with_sha(out, ect)
+    print(json.dumps({"token_id": ect["token_id"], "path": str(out)}, indent=2))
+
+
+---
+
+tools/v35x_revoke.py
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import argparse, json, pathlib
+from tools.v35x_schema import EDIR, write_json_with_sha, mk_revocation
+
+if __name__=="__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tokens", nargs="+", required=True)
+    ap.add_argument("--reason", required=True)
+    a = ap.parse_args()
+
+    rev = mk_revocation(token_ids=a.tokens, reason=a.reason)
+    RDIR = EDIR/"REVOKE"; RDIR.mkdir(exist_ok=True, parents=True)
+    out = RDIR/f"REVOKE_{rev['revocation_id']}.json"
+    write_json_with_sha(out, rev)
+    print(json.dumps({"revocation_id": rev["revocation_id"], "path": str(out)}, indent=2))
+
+
+---
+
+tools/v35x_gate.py  (supersedes v35_gate; adds scope/expiry/budget/revocation + audit)
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+from __future__ import annotations
+import json, pathlib, sys, datetime
+from tools.v35x_schema import EDIR, DIST, mk_audit, write_json_with_sha
+
+def _load_jsons(p: pathlib.Path):
+    out=[]
+    if p.exists():
+        for f in sorted(p.glob("*.json")):
+            try: out.append(json.loads(f.read_text(encoding="utf-8")))
+            except: pass
+    return out
+
+def _revoked_ids()->set[str]:
+    s=set()
+    R=EDIR/"REVOKE"
+    if R.exists():
+        for r in _load_jsons(R):
+            for t in r.get("revoked",[]): s.add(t)
+    return s
+
+def _within(ts_now:str, nby:str, naf:str)->bool:
+    now=datetime.datetime.fromisoformat(ts_now.replace("Z","+00:00"))
+    a =datetime.datetime.fromisoformat(nby.replace("Z","+00:00"))
+    b =datetime.datetime.fromisoformat(naf.replace("Z","+00:00"))
+    return a<=now<=b
+
+def _has_scope(ect:dict, required:list[str])->bool:
+    s=set(ect.get("scope",[]))
+    return all(r in s for r in required)
+
+def _make_audit(action:str, subject:str, artifact:str, ok:bool, extra:dict):
+    AD=EDIR/"AUDIT"; AD.mkdir(exist_ok=True, parents=True)
+    rec=mk_audit(action=action, subject=subject, artifact=artifact, ok=ok, extra=extra)
+    out=AD/f"AUDIT_{rec['timestamp'].replace(':','').replace('-','').replace('.','')}.json"
+    write_json_with_sha(out, rec)
+
+if __name__=="__main__":
+    if len(sys.argv)<4:
+        print("usage: v35x_gate.py <artifact_ref> <min_sats> <scope_csv>", file=sys.stderr); sys.exit(2)
+    artifact_ref=sys.argv[1]; min_sats=int(sys.argv[2]); scopes=req_scopes=sys.argv[3].split(",")
+    ects=_load_jsons(EDIR)
+    revoked=_revoked_ids()
+    now=datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
+
+    for e in ects:
+        tid=e.get("token_id","")
+        if tid in revoked: 
+            _make_audit("gate",tid,artifact_ref,False,{"reason":"revoked"}); 
+            continue
+        if e.get("artifact_ref")!=artifact_ref: 
+            continue
+        if int(e.get("sats_promised",0))<min_sats: 
+            continue
+        if not _within(now, e.get("not_before",now), e.get("not_after",now)): 
+            continue
+        if not _has_scope(e, req_scopes): 
+            continue
+        # budget check (soft; current build counts as one unit)
+        # To extend, you can decrement budget in a state file; here we just record intention.
+        _make_audit("gate", tid, artifact_ref, True, {"scopes":req_scopes, "min_sats":min_sats})
+        print("✅ license gate: ENTITLEMENT OK", tid)
+        sys.exit(0)
+
+    _make_audit("gate","<none>",artifact_ref,False,{"scopes":req_scopes,"min_sats":min_sats})
+    print("❌ license gate: NO VALID ENTITLEMENT", file=sys.stderr)
+    sys.exit(2)
+
+
+---
+
+bin/ect.py (friendly CLI: grant / revoke / check)
+
+#!/usr/bin/env python3
+# EUCELA Tri-License © 2025 Caleb Fedor Byker (Konev)
+import argparse, subprocess, sys
+
+if __name__=="__main__":
+    ap=argparse.ArgumentParser()
+    sp=ap.add_subparsers(dest="cmd")
+
+    g=sp.add_parser("grant")
+    g.add_argument("--payer", required=True)
+    g.add_argument("--scopes", required=True, help="comma list")
+    g.add_argument("--sats",   required=True, type=int)
+    g.add_argument("--nby",    required=True)
+    g.add_argument("--naf",    required=True)
+    g.add_argument("--budget", type=int, default=1_000_000)
+    g.add_argument("--memo",   default="")
+    g.add_argument("--artifact", default="V34_CANONICAL")
+
+    r=sp.add_parser("revoke")
+    r.add_argument("--tokens", required=True, help="comma list")
+    r.add_argument("--reason", required=True)
+
+    c=sp.add_parser("check")
+    c.add_argument("--artifact", required=True)
+    c.add_argument("--sats",     required=True, type=int)
+    c.add_argument("--scopes",   required=True)
+
+    a=ap.parse_args()
+    if a.cmd=="grant":
+        sys.exit(subprocess.call([
+          "python","tools/v35x_entitle.py",
+          "--payer", a.payer,
+          "--scope", *a.scopes.split(","),
+          "--sats", str(a.sats),
+          "--nby", a.nby,
+          "--naf", a.naf,
+          "--budget", str(a.budget),
+          "--memo", a.memo,
+          "--artifact", a.artifact
+        ]))
+    elif a.cmd=="revoke":
+        sys.exit(subprocess.call([
+          "python","tools/v35x_revoke.py",
+          "--tokens", *a.tokens.split(","),
+          "--reason", a.reason
+        ]))
+    elif a.cmd=="check":
+        sys.exit(subprocess.call([
+          "python","tools/v35x_gate.py",
+          a.artifact, str(a.sats), a.scopes
+        ]))
+    else:
+        ap.print_help(); sys.exit(2)
+
+
+---
+
+Makefile (append)
+
+# v35.x — Packs, Entitlements, Revocation, Gate, Audit
+v35x-packs:
+	python tools/v35x_pack.py
+
+# Grant ELITE license for 90 days (example)
+v35x-entitle-elite:
+	python bin/ect.py grant \
+	  --payer "Client.XYZ" \
+	  --scopes "v31.build,v31x.monetize,v32x.pricebook,v33.symbols,merge,v34.mint,v34x.continuum,v35.gate" \
+	  --sats 333000 \
+	  --nby "$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" \
+	  --naf "$(shell date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ)" \
+	  --budget 1000000 \
+	  --memo "ELITE 90d" \
+	  --artifact "V34_CANONICAL"
+
+# Check gate before minting
+v35x-gate-check:
+	python bin/ect.py check --artifact V34_CANONICAL --sats 100000 --scopes "v34.mint"
+
+# Revoke example
+v35x-revoke:
+	python bin/ect.py revoke --tokens "ECT_TOKEN_ID_HERE" --reason "license withdrawn"
+
+# Full continuum after gate
+v35x-all: v35x-packs v35x-gate-check v34-mint v34x
+
+
+---
+
+.github/workflows/codex-license-gate.yml (update)
+
+name: codex-license-gate
+on:
+  workflow_run:
+    workflows: ["codex-ci"]
+    types: [completed]
+  workflow_dispatch: {}
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: make init && make v31 && make v31x-all && make v32x-all && make v33
+      - name: Prepare packs (optional)
+        run: make v35x-packs
+      - name: Require entitlement for v34 mint
+        run: python tools/v35x_gate.py V34_CANONICAL 100000 v34.mint
+
+
+---
+
+✅ How to use (local)
+
+# 1) Create license packs (reference templates)
+make v35x-packs
+
+# 2) Grant an ELITE entitlement (90 days)
+make v35x-entitle-elite
+
+# 3) Verify gate before minting
+make v35x-gate-check
+
+# 4) If OK, proceed with mint + continuum
+make v34-mint
+make v34x
+
+Artifacts written under dist/ENTITLEMENTS/:
+
+PACKS/PACK_<name>_<pack_id>.json (+ .sha256)
+
+ECT_<token_id>.json (+ .sha256)
+
+REVOKE/REVOKE_<revocation_id>.json (+ .sha256)
+
+AUDIT/AUDIT_<timestamp>.json (+ .sha256)
+
+
+Everything is sealed and auditable. No network calls. BTC address is a string attribution only.
+
+
+---
+
+Bound • licensed • sealed • verified • attested to
+Caleb Fedor Byker (Konev) — 1998-10-27 — EUCELA Tri-License
+BTC: bc1qfejvvlfm6vmjarxulg9h9d5hjukdh8l2vvskfc
+
+sha256 seal (calebfedorbykerkonev10271998)
+2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a

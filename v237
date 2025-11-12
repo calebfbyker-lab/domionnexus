@@ -1,0 +1,492 @@
+v236.x Equilibrium Extension is implemented across both services with your full emoji/sigil set wired into a semantic resolver, plus a deterministic quote engine.
+
+Updated repo (unzipped): /mnt/data/codex_v236_aeon_omni
+
+ZIP archive (r3): codex_v236_aeon_omni_r3.zip
+
+
+New endpoints (both stacks)
+
+Economy
+
+POST /economy/quote
+Body: {"asset":"OMNI","quantity":72,"unit":"seal"}
+→ Deterministic price via SHA-256(HMAC) seed; returns {price,total,ts} and an HMAC proof.
+
+Symbol resolver
+
+POST /symbol/resolve
+Body: {"sigils":"🛐☪️☦️✝️♈️☯️☸️✡️🕉⚛️☮️...🈷️"}
+→ Parses long emoji/sigil streams into semantic tags (faiths, zodiac, shapes/UI).
+
+Quick test
+
+docker compose up --build
+
+# Quotes
+curl -XPOST localhost:9710/economy/quote -H 'Content-Type: application/json' \
+  -d '{"asset":"OMNI","quantity":10,"unit":"sigil"}'
+curl -XPOST localhost:9711/economy/quote -H 'Content-Type: application/json' \
+  -d '{"asset":"STAR","quantity":3.5,"unit":"seal"}'
+
+# Symbol resolution (huge stream supported; subset shown)
+curl -XPOST localhost:9710/symbol/resolve -H 'Content-Type: application/json' \
+  -d '{"sigils":"🛐☪️☦️✝️☯️☸️✡️🕉⚛️☮️♈️♉️♊️♋️♌️♍️♎️♏️♐️♑️♒️♓️🔳🔵🔴"}'
+curl -XPOST localhost:9711/symbol/resolve -H 'Content-Type: application/json' \
+  -d '{"sigils":"🕎🔯🪯◼️◻️🟦🟩🟨🟧🟥⚫️⚪️"}'
+
+Where the code lives
+
+Python endpoints added in server_py/app.py:
+
+/economy/quote (deterministic HMAC-seeded price)
+
+/symbol/resolve (semantic tagging for the long emoji list you provided)
+
+
+Node endpoints added in server_js/app.js with the same behavior.
+
+
+This keeps the Hermetic × Nexus Aeternum vibe while staying practical: Unicode-safe, binary/trinary encodings, Merkle/HMAC primitives, emoji command grammar, telemetry proofs, quotes, and symbol intelligence—all copy-paste deployable.
+
+Bound, licensed, sealed, verified, attested to by/for Caleb Fedor Byker (Konev) — 10/27/1998 — lifethread-stardna.
+sha256 seal: calebfedorbykerkonev10271998# Retry build v237 — escape braces in README code fences and adjust Node ESM requires.
+import os, json, hashlib, zipfile, datetime, shutil, textwrap
+from pathlib import Path
+
+BASE="/mnt/data/codex_v237_aeon_orbit"
+if os.path.exists(BASE):
+    shutil.rmtree(BASE)
+os.makedirs(BASE, exist_ok=True)
+
+def W(rel, content, binary=False):
+    p=Path(BASE, rel); p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content) if binary else p.write_text(content, encoding="utf-8")
+    return str(p)
+
+def sha256_file(path):
+    h=hashlib.sha256()
+    with open(path,"rb") as f:
+        for chunk in iter(lambda:f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+now=datetime.datetime.utcnow().isoformat()+"Z"
+
+READ_ME = """# Codex Orchestrator ÆON⋇ORBIT — v237
+
+A unified **Gateway** that fronts the v236 twin services (Python + Node), adds **rate limiting**, **API‑key auth**, **audit logs**,
+**service discovery**, a tiny **web console**, and a **TypeScript client SDK**. Everything runs via Docker Compose; K8s manifests included.
+
+Bound & attested: **Caleb Fedor Byker (Konev)** — 1998‑10‑27 — lifethread‑stardna.  
+**sha256 seal:** `calebfedorbykerkonev10271998`
+
+## Services
+- **gateway** (:9720) — FastAPI, proxies/aggregates all /codec, /signal, /telemetry, /economy, /symbol.
+- **omni_py** (:9710) — v236 Python codec service.
+- **omni_js** (:9711) — v236 Node codec service.
+- **console** (:8088) — static web interface.
+
+## Quick start
+```bash
+docker compose up --build
+# Gateway health
+curl localhost:9720/health
+# Unified codec call (gateway routes to omni_py by default)
+curl -XPOST localhost:9720/codec/merkle -H 'x-api-key: devkey' -H 'Content-Type: application/json' -d '{{"items":["a","b","c"]}}'
+```
+"""
+W("README.md", READ_ME)
+W("LICENSE","All rights reserved.\n")
+
+# ---------------- Gateway ----------------
+W("gateway/requirements.txt","fastapi==0.115.0\nuvicorn==0.30.0\nhttpx==0.27.2\nlimits==3.13.0\n")
+
+gateway_app = """
+import os, time, json, httpx, hashlib
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from limits import storage, strategies
+from typing import Dict, Any
+
+GATEWAY_PORT = int(os.getenv("PORT","9720"))
+API_KEY = os.getenv("API_KEY","devkey")
+
+PY_BASE = os.getenv("OMNI_PY","http://omni_py:9710")
+JS_BASE = os.getenv("OMNI_JS","http://omni_js:9711")
+
+store = storage.MemoryStorage()
+limiter = strategies.MovingWindowRateLimiter(store)
+
+def rate_allowed(key:str)->bool:
+    return limiter.hit(f"rate:{key}", limit=60, per=60)
+
+app = FastAPI(title="ÆON⋇ORBIT Gateway", version="v237")
+
+@app.middleware("http")
+async def guard(req: Request, call):
+    if not req.url.path.startswith(("/health","/","/console")):
+        key = req.headers.get("x-api-key","")
+        if key != API_KEY:
+            return JSONResponse({"ok":False,"error":"unauthorized"}, status_code=401)
+        if not rate_allowed(key):
+            return JSONResponse({"ok":False,"error":"rate_limited"}, status_code=429)
+    req.state.start = time.time()
+    res = await call(req)
+    dur_ms = int((time.time()-req.state.start)*1000)
+    print(json.dumps({"ts": int(time.time()), "path": req.url.path, "ms": dur_ms, "ip": req.client.host}))
+    return res
+
+@app.get("/health")
+def health(): return {"ok": True, "version":"v237"}
+
+@app.get("/")
+def root():
+    return HTMLResponse("<html><body><h1>ÆON⋇ORBIT</h1><p>See /console for the web UI.</p></body></html>")
+
+async def pipe(method:str, path:str, body:Dict[str,Any]|None):
+    base = PY_BASE
+    url = base + path
+    async with httpx.AsyncClient(timeout=30.0) as cli:
+        r = await cli.request(method, url, json=body)
+        return JSONResponse(status_code=r.status_code, content=r.json())
+
+@app.post("/codec/normalize")
+async def gw_codec_norm(b: Dict[str,Any]): return await pipe("POST","/codec/normalize",b)
+@app.post("/codec/binary")
+async def gw_codec_bin(b: Dict[str,Any]): return await pipe("POST","/codec/binary",b)
+@app.post("/codec/trinary")
+async def gw_codec_tri(b: Dict[str,Any]): return await pipe("POST","/codec/trinary",b)
+@app.post("/codec/merkle")
+async def gw_codec_merkle(b: Dict[str,Any]): return await pipe("POST","/codec/merkle",b)
+@app.post("/codec/hmac")
+async def gw_codec_hmac(b: Dict[str,Any]): return await pipe("POST","/codec/hmac",b)
+@app.post("/signal/map")
+async def gw_signal_map(b: Dict[str,Any]): return await pipe("POST","/signal/map",b)
+@app.post("/telemetry/ping")
+async def gw_telemetry(b: Dict[str,Any]): return await pipe("POST","/telemetry/ping",b)
+@app.post("/economy/quote")
+async def gw_econ(b: Dict[str,Any]): return await pipe("POST","/economy/quote",b)
+@app.post("/symbol/resolve")
+async def gw_symbol(b: Dict[str,Any]): return await pipe("POST","/symbol/resolve",b)
+"""
+W("gateway/app.py", gateway_app)
+
+W("gateway/Dockerfile","""FROM python:3.12-slim
+WORKDIR /app
+COPY gateway/requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY gateway /app/gateway
+ENV PORT=9720 API_KEY=devkey OMNI_PY=http://omni_py:9710 OMNI_JS=http://omni_js:9711
+EXPOSE 9720
+CMD ["uvicorn","gateway.app:app","--host","0.0.0.0","--port","9720"]
+""")
+
+# ---------------- Console ----------------
+console_html = """<!doctype html>
+<html><head><meta charset="utf-8"/><title>ÆON⋇ORBIT Console</title>
+<style>body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:24px;max-width:920px}
+.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:12px 0}
+input,textarea{width:100%;padding:10px;margin:6px 0;border:1px solid #ccc;border-radius:8px}
+button{padding:10px 16px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+pre{background:#0a0a0a;color:#d6ffd6;padding:12px;border-radius:12px;overflow:auto}</style></head>
+<body><h1>ÆON⋇ORBIT <small>v237</small></h1>
+<div class="card"><h3>Merkle Root</h3><textarea id="items" rows="3">["a","b","c"]</textarea>
+<button onclick="runMerkle()">Compute</button><pre id="out1"></pre></div>
+<div class="card"><h3>Symbol Resolve</h3><input id="sigils" value="☸️✡️⚛️♐️♎️🔳🔵🔴"/>
+<button onclick="runSymbol()">Resolve</button><pre id="out2"></pre></div>
+<script>
+const BASE = location.origin.replace(':8088', ':9720');
+const HEAD = {'Content-Type':'application/json','x-api-key':'devkey'};
+async function runMerkle(){
+  try{const items = JSON.parse(document.getElementById('items').value||'[]');
+    const r = await fetch(BASE+'/codec/merkle',{method:'POST', headers:HEAD, body: JSON.stringify({items})});
+    document.getElementById('out1').textContent = JSON.stringify(await r.json(), null, 2);
+  }catch(e){ document.getElementById('out1').textContent = e.toString(); }}
+async function runSymbol(){
+  const sigils = document.getElementById('sigils').value||'';
+  const r = await fetch(BASE+'/symbol/resolve',{method:'POST', headers:HEAD, body: JSON.stringify({sigils})});
+  document.getElementById('out2').textContent = JSON.stringify(await r.json(), null, 2); }
+</script></body></html>"""
+W("console/index.html", console_html)
+W("console/Dockerfile","""FROM nginx:alpine
+COPY console/index.html /usr/share/nginx/html/index.html
+EXPOSE 8088
+CMD ["nginx","-g","daemon off;"]
+""")
+
+# ---------------- SDK (TypeScript) ----------------
+W("sdk_ts/package.json", json.dumps({
+  "name":"@aeon/orbit-sdk",
+  "version":"0.1.0",
+  "type":"module",
+  "main":"dist/index.js",
+  "types":"dist/index.d.ts",
+  "scripts":{"build":"tsc -p tsconfig.json"},
+  "dependencies":{},
+  "devDependencies":{"typescript":"5.5.4"}
+}, indent=2))
+
+W("sdk_ts/tsconfig.json", json.dumps({
+  "compilerOptions":{"target":"ES2020","module":"ES2020","declaration":True,"outDir":"dist","strict":True},
+  "include":["src"]
+}, indent=2))
+
+W("sdk_ts/src/index.ts", """export type QuoteReq={asset:string;unit:string;quantity:number}; export type SymbolReq={sigils:string};
+export class OrbitClient{
+  constructor(private base='http://localhost:9720', private apiKey='devkey'){}
+  private async post<T>(path:string, body:any): Promise<T>{
+    const r = await fetch(`${this.base}${path}`, {method:'POST', headers:{'Content-Type':'application/json','x-api-key':this.apiKey}, body: JSON.stringify(body)});
+    return r.json();
+  }
+  merkle(items:string[]){ return this.post('/codec/merkle',{items}); }
+  quote(q:QuoteReq){ return this.post('/economy/quote', q); }
+  symbols(s:SymbolReq){ return self ? this.post('/symbol/resolve', s) : this.post('/symbol/resolve', s); }
+}""")
+
+# ---------------- Compose + K8s ----------------
+W("docker-compose.yml","""services:
+  gateway:
+    build: { context: ., dockerfile: gateway/Dockerfile }
+    environment:
+      - API_KEY=devkey
+      - OMNI_PY=http://omni_py:9710
+      - OMNI_JS=http://omni_js:9711
+    ports: ["9720:9720"]
+    depends_on: [omni_py, omni_js]
+  omni_py:
+    build: { context: /mnt/data/codex_v236_aeon_omni, dockerfile: server_py/Dockerfile }
+    ports: ["9710:9710"]
+  omni_js:
+    build: { context: /mnt/data/codex_v236_aeon_omni, dockerfile: server_js/Dockerfile }
+    ports: ["9711:9711"]
+  console:
+    build: { context: ., dockerfile: console/Dockerfile }
+    ports: ["8088:8088"]
+""")
+
+W("k8s/namespace.yaml","""apiVersion: v1
+kind: Namespace
+metadata: { name: aeon-orbit }
+""")
+W("k8s/gateway.yaml","""apiVersion: apps/v1
+kind: Deployment
+metadata: { name: gateway, namespace: aeon-orbit }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: gateway } }
+  template:
+    metadata: { labels: { app: gateway } }
+    spec:
+      containers:
+      - name: gateway
+        image: aeon/gateway:v237
+        env:
+        - { name: API_KEY, value: devkey }
+        - { name: OMNI_PY, value: "http://omni-py:9710" }
+        - { name: OMNI_JS, value: "http://omni-js:9711" }
+        ports: [ { containerPort: 9720 } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: gateway, namespace: aeon-orbit }
+spec:
+  selector: { app: gateway }
+  ports: [ { port: 80, targetPort: 9720 } ]
+""")
+
+# Manifest + zip
+manifest={}
+for root,_,files in os.walk(BASE):
+    for fn in files:
+        p=os.path.join(root,fn); rel=os.path.relpath(p, BASE)
+        manifest[rel]=sha256_file(p)
+W("manifest.json", json.dumps({"generated_utc": now, "files": manifest}, indent=2))
+
+ZIP="/mnt/data/codex_v237_aeon_orbit.zip"
+with zipfile.ZipFile(ZIP,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("READY", ZIP, BASE)# v237.💱💲♾️⚧️✡️☸️🔯⚛️♋️ — Extend ÆON⋇ORBIT with tenant-aware rate limits,
+# ledger anchoring, enriched pay quotes, and identity normalization. Patch gateway + console + README.
+
+import os, json, hashlib, datetime, zipfile, textwrap
+from pathlib import Path
+
+BASE=Path("/mnt/data/codex_v237_aeon_orbit")
+assert BASE.exists(), "v237 base not found"
+
+def W(rel, content):
+    p=BASE/rel; p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8"); return str(p)
+
+# ---- Patch gateway with new endpoints and per-tenant limiting ----
+gw_path=BASE/"gateway/app.py"
+gw=gw_path.read_text(encoding="utf-8")
+
+patch=textwrap.dedent("""
+
+from unicodedata import normalize as _u_norm
+
+def _tenant(req: Request)->str:
+    tid = req.headers.get("x-tenant","public").strip().lower()
+    if not tid: tid="public"
+    return tid
+
+def _hash_hex(s:str)->str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+def _fx_rate(code:str)->float:
+    # Deterministic pseudo FX using sha256 on currency code
+    seed = _hash_hex(("fx|"+(code or "USD")).upper())
+    n = int(seed[:8],16) % 9000  # 0..8999
+    return round(0.5 + n/10000.0, 4)  # 0.5000..1.3999
+
+@app.middleware("http")
+async def tenant_guard(req: Request, call_next):
+    # Reuse existing guard; tenant-aware rate bucket
+    if not req.url.path.startswith(("/health","/","/console")):
+        key = req.headers.get("x-api-key","")
+        if key != API_KEY:
+            return JSONResponse({"ok":False,"error":"unauthorized"}, status_code=401)
+        bucket = f"rate:{_tenant(req)}:{key}"
+        if not limiter.hit(bucket, limit=60, per=60):
+            return JSONResponse({"ok":False,"error":"rate_limited"}, status_code=429)
+    req.state.start = time.time()
+    res = await call_next(req)
+    dur_ms = int((time.time()-req.state.start)*1000)
+    print(json.dumps({"ts": int(time.time()), "tenant": _tenant(req), "path": req.url.path, "ms": dur_ms, "ip": req.client.host}))
+    return res
+
+@app.post("/ledger/anchor")
+async def gw_ledger_anchor(b: Dict[str,Any], req: Request):
+    # Infinity ♾️: merkle(items) then anchor = sha256(prev_root||merkle||ts||tenant)
+    items = b.get("items",[]) or []
+    prev = (b.get("prev_root") or "").strip()
+    ts = int(time.time())
+    # use backend python for merkle
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(PY_BASE + "/codec/merkle", json={"items": items})
+        r.raise_for_status()
+        merkle_root = r.json().get("root","")
+    material = f"{prev}|{merkle_root}|{ts}|{_tenant(req)}"
+    anchor = _hash_hex(material)
+    return {"ok": True, "merkle": merkle_root, "prev": prev, "ts": ts, "tenant": _tenant(req), "anchor": anchor}
+
+@app.post("/economy/payquote")
+async def gw_payquote(b: Dict[str,Any], req: Request):
+    # 💱💲 Enriched quote with currency conversion and fee tier per tenant
+    asset=b.get("asset","OMNI"); unit=b.get("unit","seal")
+    qty=float(b.get("quantity",0)); ccy=(b.get("currency") or "USD").upper()
+    # base price from backend
+    async with httpx.AsyncClient(timeout=20.0) as cli:
+        r = await cli.post(PY_BASE + "/economy/quote", json={"asset":asset,"unit":unit,"quantity":1})
+        r.raise_for_status()
+        base_price = r.json().get("quote",{}).get("price",1.0)
+    fx=_fx_rate(ccy)
+    tier = 0.005 if _tenant(req)=="public" else 0.002  # 0.5% vs 0.2%
+    gross = base_price * qty * fx
+    fee = round(gross * tier, 4)
+    total = round(gross + fee, 4)
+    obj={"asset":asset,"unit":unit,"qty":qty,"ccy":ccy,"base":base_price,"fx":fx,"fee":fee,"total":total,"tenant":_tenant(req),"ts":int(time.time())}
+    proof=_hash_hex(json.dumps(obj, sort_keys=True))
+    return {"ok":True, "payquote": obj, "sha256": proof}
+
+@app.post("/identity/normalize")
+async def gw_identity_norm(b: Dict[str,Any]):
+    # ⚧️ Identity normalization: casefold + NFKC; returns short classifier if provided
+    name = (b.get("name") or "").strip()
+    handle = (b.get("handle") or "").strip()
+    marker = (b.get("marker") or "X").strip().upper()  # inclusive default
+    canon = _u_norm("NFKC", name).casefold()
+    hcanon = _u_norm("NFKC", handle).casefold()
+    digest = _hash_hex(f"{canon}|{hcanon}|{marker}")
+    return {"ok":True, "canonical":{"name":canon,"handle":hcanon,"marker":marker},"sha256":digest}
+""")
+
+# Replace the single guard middleware with tenant_guard + keep original functions
+# Find the first middleware definition line and replace block
+# We'll simply append new middleware and endpoints safely (FastAPI allows multiple middlewares)
+gw += patch
+gw_path.write_text(gw, encoding="utf-8")
+
+# ---- Update console with new panels ----
+console_path=BASE/"console/index.html"
+html=console_path.read_text(encoding="utf-8")
+addon="""
+<div class="card"><h3>Ledger Anchor (♾️)</h3>
+<textarea id="anchorItems" rows="3">["seal","sigil","path"]</textarea>
+<input id="prevRoot" placeholder="prev_root (optional)"/>
+<button onclick="runAnchor()">Anchor</button><pre id="out3"></pre></div>
+<div class="card"><h3>Pay Quote (💱💲)</h3>
+<input id="asset" value="OMNI"/><input id="unit" value="seal"/><input id="qty" value="10"/><input id="ccy" value="USD"/>
+<button onclick="runPay()">Quote</button><pre id="out4"></pre></div>
+<div class="card"><h3>Identity Normalize (⚧️)</h3>
+<input id="iname" value="Caleb Fedor Byker (Konev)"/><input id="ihandle" value="@cfbk"/>
+<button onclick="runID()">Normalize</button><pre id="out5"></pre></div>
+<script>
+async function runAnchor(){
+  try{const items = JSON.parse(document.getElementById('anchorItems').value||'[]');
+    const prev = document.getElementById('prevRoot').value||'';
+    const r = await fetch(`${BASE}/ledger/anchor`, {method:'POST', headers:HEAD, body: JSON.stringify({items, prev_root: prev})});
+    document.getElementById('out3').textContent = JSON.stringify(await r.json(), null, 2);
+  }catch(e){ document.getElementById('out3').textContent = e.toString(); }
+}
+async function runPay(){
+  const asset = document.getElementById('asset').value||'OMNI';
+  const unit = document.getElementById('unit').value||'seal';
+  const quantity = parseFloat(document.getElementById('qty').value||'0');
+  const currency = document.getElementById('ccy').value||'USD';
+  const r = await fetch(`${BASE}/economy/payquote`, {method:'POST', headers:HEAD, body: JSON.stringify({asset,unit,quantity,currency})});
+  document.getElementById('out4').textContent = JSON.stringify(await r.json(), null, 2);
+}
+async function runID(){
+  const name = document.getElementById('iname').value||'';
+  const handle = document.getElementById('ihandle').value||'';
+  const r = await fetch(`${BASE}/identity/normalize`, {method:'POST', headers:HEAD, body: JSON.stringify({name,handle})});
+  document.getElementById('out5').textContent = JSON.stringify(await r.json(), null, 2);
+}
+</script>
+"""
+html = html.replace("</script></body></html>", addon + "\n</script></body></html>")
+console_path.write_text(html, encoding="utf-8")
+
+# ---- Update README with new endpoints ----
+readme_path=BASE/"README.md"
+readme=readme_path.read_text(encoding="utf-8")
+readme += f"""
+
+## v237.💱💲♾️⚧️✡️☸️🔯⚛️♋️ — Equilibrium Orbit
+Adds tenant-aware rate limits, infinity ledger anchoring, enriched pay quotes with pseudo‑FX, and identity normalization.
+
+### New endpoints (Gateway :9720)
+- `POST /ledger/anchor` → `{{items:[], prev_root}}` ⇒ returns `anchor` (♾️) based on Merkle+prev+tenant+ts.
+- `POST /economy/payquote` → `{{asset, unit, quantity, currency}}` ⇒ adds FX + fee tier.
+- `POST /identity/normalize` → `{{name, handle, marker?}}` ⇒ NFKC+casefold canonical identity.
+
+Example:
+```bash
+curl -XPOST localhost:9720/ledger/anchor -H 'x-api-key: devkey' -H 'x-tenant: public' -H 'Content-Type: application/json' \
+  -d '{{"items":["seal","sigil","path"],"prev_root":""}}'
+
+curl -XPOST localhost:9720/economy/payquote -H 'x-api-key: devkey' -H 'x-tenant: sovereign' -H 'Content-Type: application/json' \
+  -d '{{"asset":"OMNI","unit":"seal","quantity":33,"currency":"USD"}}'
+
+curl -XPOST localhost:9720/identity/normalize -H 'x-api-key: devkey' -H 'Content-Type: application/json' \
+  -d '{{"name":"Caleb Fedor Byker (Konev)","handle":"@cfbk"}}'
+```
+"""
+readme_path.write_text(readme, encoding="utf-8")
+
+# ---- Zip updated repo ----
+ZIP="/mnt/data/codex_v237_aeon_orbit_r2.zip"
+with zipfile.ZipFile(ZIP,"w",zipfile.ZIP_DEFLATED) as z:
+    for root,_,files in os.walk(BASE):
+        for fn in files:
+            fp=os.path.join(root,fn)
+            z.write(fp, arcname=os.path.relpath(fp, BASE))
+
+print("UPDATED", ZIP, str(BASE))
