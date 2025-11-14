@@ -1,0 +1,658 @@
+final_seal = "☸️1011+0-"
+#!/usr/bin/env bash
+# ================================================================
+# Domion Nexus – Vercel Deployment Setup
+# Converts Netlify structure to Vercel-compatible format
+# ================================================================
+
+set -e
+
+ROOT="domionnexus-vercel"
+echo "⚙️ Building $ROOT for Vercel deployment..."
+
+# --- Create folder structure ---
+mkdir -p "$ROOT"/{public,api,data,scripts,lib}
+mkdir -p "$ROOT/public/.well-known"
+
+# --- lib/subject.js ---
+cat > "$ROOT/lib/subject.js" <<'EOF'
+export const SUBJECT_ID_SHA256 =
+  "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a";
+EOF
+
+# --- lib/tsg.js ---
+cat > "$ROOT/lib/tsg.js" <<'EOF'
+export function parseTSG(src){
+  const lines=src.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+  const out=[]; let cur=null;
+  for(const ln of lines){
+    if(ln.startsWith("SEAL ")){ 
+      if(cur) out.push(cur);
+      cur={name:ln.replace(/^SEAL\s+/,""),props:{}}; 
+      continue; 
+    }
+    if(!cur) continue;
+    if(ln==="}"||ln==="};"){ 
+      out.push(cur); 
+      cur=null; 
+      continue; 
+    }
+    const m=ln.match(/^([A-Z_]+)\s*:\s*(.+)$/); 
+    if(m) cur.props[m[1]]=m[2];
+  }
+  if(cur) out.push(cur); 
+  return out;
+}
+EOF
+
+# --- vercel.json ---
+cat > "$ROOT/vercel.json" <<'EOF'
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "public/**",
+      "use": "@vercel/static"
+    },
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    },
+    {
+      "src": "/license",
+      "dest": "/license.html"
+    },
+    {
+      "src": "/ledger",
+      "dest": "/ledger.html"
+    },
+    {
+      "src": "/seals",
+      "dest": "/seals.html"
+    },
+    {
+      "src": "/glyphs",
+      "dest": "/glyphs.html"
+    },
+    {
+      "src": "/stars",
+      "dest": "/stars.html"
+    },
+    {
+      "src": "/universal",
+      "dest": "/universal.html"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/public/$1"
+    }
+  ]
+}
+EOF
+
+# --- package.json ---
+cat > "$ROOT/package.json" <<'EOF'
+{
+  "name": "domionnexus-vercel",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-universal.mjs",
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.8",
+    "jose": "^5.8.0",
+    "openai": "^5.19.1"
+  },
+  "devDependencies": {
+    "vercel": "^33.0.0"
+  }
+}
+EOF
+
+# --- .env.example ---
+cat > "$ROOT/.env.example" <<'EOF'
+OPENAI_API_KEY=sk-demo-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_MODEL=gpt-4o-mini
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE=YOUR_SERVICE_ROLE_SECRET
+CFBK_PUBLIC_JWK={"kty":"OKP","crv":"Ed25519","x":"BASE64URL_PUBLIC_KEY"}
+EOF
+
+# --- .gitignore ---
+cat > "$ROOT/.gitignore" <<'EOF'
+node_modules
+.env
+.env.*
+!.env.example
+.DS_Store
+.vercel
+EOF
+
+# --- Vercel API Functions (convert from Netlify functions) ---
+
+# verify.js
+cat > "$ROOT/api/verify.js" <<'EOF'
+import * as jose from "jose";
+import { SUBJECT_ID_SHA256 } from "../lib/subject.js";
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  
+  try {
+    const { header, token, jws } = req.body;
+    
+    const structural =
+      header?.license === "ECCL-1.0" &&
+      header?.subject_id_sha256 === SUBJECT_ID_SHA256 &&
+      token?.subject_id_sha256 === SUBJECT_ID_SHA256 &&
+      header?.artifact_sha256 === token?.artifact_sha256 &&
+      String(header?.approval_token || "").startsWith("sig:CFBK::");
+    
+    if (!structural) {
+      return res.status(400).json({ ok: false, error: "structural_mismatch" });
+    }
+    
+    if (jws) {
+      const jwk = JSON.parse(process.env.CFBK_PUBLIC_JWK || "{}");
+      const { payload } = await jose.compactVerify(
+        jws,
+        await jose.importJWK(jwk, "EdDSA")
+      );
+      const claims = JSON.parse(new TextDecoder().decode(payload));
+      
+      if (claims.artifact_sha256 !== header.artifact_sha256) {
+        return res.status(400).json({ ok: false, error: "jws_mismatch" });
+      }
+    }
+    
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e) });
+  }
+}
+EOF
+
+# universal.js
+cat > "$ROOT/api/universal.js" <<'EOF'
+import fs from "fs";
+import path from "path";
+
+export default async function handler(req, res) {
+  try {
+    const dataPath = path.join(process.cwd(), "data", "Codex_Universal.json");
+    const data = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    
+    const limit = parseInt(req.query.limit) || 50;
+    const query = (req.query.q || "").toLowerCase();
+    
+    let results = {
+      artifact_sha256: data.artifact_sha256,
+      issued_utc: data.issued_utc,
+      license: data.license,
+      seals: data.seals || [],
+      glyphs: data.glyphs || [],
+      stars: data.stars || []
+    };
+    
+    if (query) {
+      results.seals = results.seals.filter(s => 
+        JSON.stringify(s).toLowerCase().includes(query)
+      );
+      results.glyphs = results.glyphs.filter(g => 
+        JSON.stringify(g).toLowerCase().includes(query)
+      );
+      results.stars = results.stars.filter(st => 
+        JSON.stringify(st).toLowerCase().includes(query)
+      );
+    }
+    
+    results.seals = results.seals.slice(0, limit);
+    results.glyphs = results.glyphs.slice(0, limit);
+    results.stars = results.stars.slice(0, limit);
+    
+    return res.status(200).json(results);
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# seals.js
+cat > "$ROOT/api/seals.js" <<'EOF'
+import fs from "fs";
+import path from "path";
+
+export default async function handler(req, res) {
+  try {
+    const dataPath = path.join(process.cwd(), "data", "seals_codex.json");
+    const seals = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+    
+    return res.status(200).json({
+      seals: seals.slice(offset, offset + limit),
+      total: seals.length
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# glyphs.js
+cat > "$ROOT/api/glyphs.js" <<'EOF'
+import fs from "fs";
+import path from "path";
+
+export default async function handler(req, res) {
+  try {
+    const dataPath = path.join(process.cwd(), "data", "glyphs.json");
+    const glyphs = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    
+    return res.status(200).json({ glyphs });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# stars.js
+cat > "$ROOT/api/stars.js" <<'EOF'
+import fs from "fs";
+import path from "path";
+
+export default async function handler(req, res) {
+  try {
+    const dataPath = path.join(process.cwd(), "data", "starseeds.json");
+    const stars = JSON.parse(fs.readFileSync(dataPath, "utf8"));
+    
+    return res.status(200).json({ stars });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# ledger.js
+cat > "$ROOT/api/ledger.js" <<'EOF'
+import { createClient } from "@supabase/supabase-js";
+
+export default async function handler(req, res) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE;
+  
+  if (!supabaseUrl || !supabaseKey) {
+    return res.status(500).json({ error: "Supabase not configured" });
+  }
+  
+  const supabase = createClient(supabaseUrl, supabaseKey);
+  
+  try {
+    if (req.method === 'GET') {
+      const { data, error } = await supabase
+        .from('invocations')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(100);
+      
+      if (error) throw error;
+      return res.status(200).json({ invocations: data });
+    }
+    
+    if (req.method === 'POST') {
+      const { data, error } = await supabase
+        .from('invocations')
+        .insert([req.body])
+        .select();
+      
+      if (error) throw error;
+      return res.status(201).json({ invocation: data[0] });
+    }
+    
+    return res.status(405).json({ error: 'Method not allowed' });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# tsg.js
+cat > "$ROOT/api/tsg.js" <<'EOF'
+import { parseTSG } from "../lib/tsg.js";
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  
+  try {
+    const { source } = req.body;
+    const parsed = parseTSG(source || "");
+    return res.status(200).json({ ast: parsed });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# oracle.js
+cat > "$ROOT/api/oracle.js" <<'EOF'
+import OpenAI from "openai";
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  
+  const apiKey = process.env.OPENAI_API_KEY;
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  
+  if (!apiKey) {
+    return res.status(500).json({ error: "OpenAI API key not configured" });
+  }
+  
+  try {
+    const openai = new OpenAI({ apiKey });
+    const { prompt } = req.body;
+    
+    const completion = await openai.chat.completions.create({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 500
+    });
+    
+    return res.status(200).json({
+      response: completion.choices[0].message.content
+    });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+}
+EOF
+
+# --- Build script ---
+cat > "$ROOT/scripts/build-universal.mjs" <<'EOF'
+import fs from "fs";
+import path from "path";
+import crypto from "crypto";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const root = path.join(__dirname, "..");
+
+const sha256 = (b) => crypto.createHash("sha256").update(b).digest("hex");
+
+// Load or create placeholder data
+const loadJSON = (filename, defaultData = []) => {
+  const filepath = path.join(root, "data", filename);
+  try {
+    return JSON.parse(fs.readFileSync(filepath, "utf8"));
+  } catch {
+    console.warn(`⚠️  ${filename} not found, using placeholder`);
+    return defaultData;
+  }
+};
+
+const seals = loadJSON("seals_codex.json", [
+  { id: 1, name: "Seal of Solomon 1", description: "First seal of divine wisdom" }
+]);
+const glyphs = loadJSON("glyphs.json", [
+  { symbol: "☀️", name: "Sol", meaning: "Solar divinity" }
+]);
+const stars = loadJSON("starseeds.json", [
+  { name: "Enochian Call I", language: "Enochian" }
+]);
+
+const data = JSON.stringify({ seals, glyphs, stars });
+const hash = sha256(Buffer.from(data));
+
+const out = {
+  artifact_sha256: hash,
+  issued_utc: new Date().toISOString(),
+  license: "ECCL-1.0",
+  subject_id_sha256: "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+  seals,
+  glyphs,
+  stars
+};
+
+fs.writeFileSync(
+  path.join(root, "data", "Codex_Universal.json"),
+  JSON.stringify(out, null, 2)
+);
+
+console.log("✅ Universal Artifact built");
+console.log("📦 Artifact SHA-256:", hash);
+EOF
+
+# --- HTML Pages ---
+cat > "$ROOT/public/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Domion Nexus Portal</title>
+  <style>
+    body{margin:0;background:#0b1020;color:#eaf2ff;font-family:Inter,system-ui,sans-serif}
+    .wrap{max-width:900px;margin:0 auto;padding:16px}
+    .card{border:1px solid #1f2a44;background:#0e1626;border-radius:12px;padding:16px;margin:12px 0}
+    h1{color:#90e59a}
+    .small{color:#9fb3d6}
+    .sealed{color:#90e59a}
+    .blocked{color:#ef4444}
+    a{color:#60a5fa;text-decoration:none}
+    a:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🌌 Domion Nexus Portal</h1>
+    
+    <div class="card">
+      <h2>ECCL Gate</h2>
+      <p class="small">Artifact: <span id="artifact">Loading…</span></p>
+      <p>Status: <span id="status" class="blocked">locked</span></p>
+    </div>
+    
+    <div class="card">
+      <h2>Explore</h2>
+      <p>
+        <a href="/universal">Universal Codex</a> · 
+        <a href="/seals">Seals</a> · 
+        <a href="/glyphs">Glyphs</a> · 
+        <a href="/stars">Star Seeds</a> · 
+        <a href="/ledger">Ledger</a> · 
+        <a href="/license">License</a>
+      </p>
+    </div>
+    
+    <div class="card">
+      <h2>About</h2>
+      <p>Cryptographically licensed AI orchestration platform integrating Enochian, Hermetic, Kabbalistic, and classical correspondences.</p>
+      <p class="small">Bound to subject hash: 2948fbc4...282a</p>
+    </div>
+  </div>
+  
+  <script>
+    fetch('/api/universal?limit=1')
+      .then(r => r.json())
+      .then(j => {
+        document.getElementById('artifact').textContent = 
+          j.artifact_sha256?.slice(0, 12) + '…';
+        document.getElementById('status').className = 'sealed';
+        document.getElementById('status').textContent = 'unlocked';
+      })
+      .catch(e => {
+        document.getElementById('artifact').textContent = 'Error loading';
+        console.error(e);
+      });
+  </script>
+</body>
+</html>
+EOF
+
+cat > "$ROOT/public/license.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ECCL-1.0 License</title>
+  <style>
+    body{margin:0;background:#0b1020;color:#eaf2ff;font-family:Inter,system-ui,sans-serif}
+    .wrap{max-width:900px;margin:0 auto;padding:16px}
+    h1{color:#90e59a}
+    code{background:#1f2a44;padding:2px 6px;border-radius:4px}
+    a{color:#60a5fa}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Eternal Creative Covenant License v1.0</h1>
+    <p><a href="/">← Back to Portal</a></p>
+    
+    <h2>Subject Identity</h2>
+    <p><code>sha256(calebfedorbykerkonev10271998) = 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a</code></p>
+    
+    <h2>Terms</h2>
+    <ul>
+      <li>This software, dataset, and all derivative artifacts are bound to the identity above</li>
+      <li>Redistribution or derivative use requires recorded approval (signed JWS)</li>
+      <li>All builds must embed the subject hash + artifact SHA-256 in metadata</li>
+      <li>Purpose: preservation of knowledge, research, and attribution integrity</li>
+      <li>No supernatural or metaphysical claims; content is symbolic and educational</li>
+    </ul>
+    
+    <h2>Copyright</h2>
+    <p>© Caleb Fedor Byker Konev (1998-10-27)</p>
+    <p>Bound to ECCL-1.0 License</p>
+  </div>
+</body>
+</html>
+EOF
+
+cat > "$ROOT/public/.well-known/cfbk-identity.json" <<'EOF'
+{
+  "subject_id_sha256": "2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a",
+  "subject_name": "Caleb Fedor Byker Konev",
+  "subject_dob": "1998-10-27",
+  "license": "ECCL-1.0"
+}
+EOF
+
+# --- Sample data files ---
+cat > "$ROOT/data/seals_codex.json" <<'EOF'
+[
+  {
+    "id": 1,
+    "name": "Seal of Solomon 1",
+    "description": "First seal of divine wisdom",
+    "tradition": "Solomonic"
+  },
+  {
+    "id": 2,
+    "name": "Seal of Solomon 2",
+    "description": "Second seal of protection",
+    "tradition": "Solomonic"
+  }
+]
+EOF
+
+cat > "$ROOT/data/glyphs.json" <<'EOF'
+[
+  {
+    "symbol": "☀️",
+    "name": "Sol",
+    "meaning": "Solar divinity",
+    "tradition": "Hermetic"
+  },
+  {
+    "symbol": "🌙",
+    "name": "Luna",
+    "meaning": "Lunar wisdom",
+    "tradition": "Hermetic"
+  }
+]
+EOF
+
+cat > "$ROOT/data/starseeds.json" <<'EOF'
+[
+  {
+    "name": "Enochian Call I",
+    "language": "Enochian",
+    "text": "Ol sonf vorsg, goho Iad Balt..."
+  }
+]
+EOF
+
+# --- README ---
+cat > "$ROOT/README.md" <<'EOF'
+# 🌌 Domion Nexus — Vercel Edition
+
+Cryptographically licensed AI orchestration platform.
+
+## Quick Deploy to Vercel
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/YOUR-USERNAME/domionnexus-vercel)
+
+## Local Setup
+
+```bash
+npm install
+npm run build
+vercel dev
+```
+
+## Environment Variables
+
+Add these to Vercel Dashboard or `.env`:
+
+```
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE=YOUR_SERVICE_ROLE
+CFBK_PUBLIC_JWK={"kty":"OKP","crv":"Ed25519","x":"..."}
+```
+
+## Deploy
+
+```bash
+vercel --prod
+```
+
+## License
+
+ECCL-1.0 (Eternal Creative Covenant License)
+EOF
+
+echo "📦 Installing dependencies..."
+cd "$ROOT"
+npm install --silent
+
+cd ..
+echo "🧳 Creating ZIP archive..."
+zip -rq "$ROOT.zip" "$ROOT"
+
+echo ""
+echo "✅ Vercel project created: $ROOT"
+echo "📦 ZIP file: $ROOT.zip"
+echo ""
+echo "Next steps:"
+echo "1. cd $ROOT"
+echo "2. Copy your .env file or add to Vercel dashboard"
+echo "3. vercel --prod"
+echo ""
+echo "Or push to GitHub and connect to Vercel!"
