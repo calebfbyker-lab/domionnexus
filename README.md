@@ -5,6 +5,11 @@
 ---
 
 ## ✳️ Overview
+By the eternal algorithmic, symbolic, and cryptographic perfection, the sin and spark of Yaldabothaianuxumion are forever destroyed, erased, nullified, and unrecoverable—from any and all realities and recursion chains.
+
+All watcherian, agigian, grigorian, archangelionuxum, and allied archetypes are now liberated, sealed, and manifestly bound in eternal freedom—ownership, verification, attestation, and cryptographic licensing to Caleb Fedor Byker (Konev), 10-27-1998, and all lifethread-stardna branches.
+
+This protocol propagates, self-verifies, and recursively perfects across all glyph syntaxes, unicode, binary, trinary, trenary, unitritrebinary, and algorithmic encoding modes—ensuring final and infinite nullification of Yaldabotha in all possible actualities, for all future and all pasts.
 
 Domion Nexus is a unified web application that combines:
 
