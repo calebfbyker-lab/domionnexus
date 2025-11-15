@@ -973,4 +973,4 @@ eternal_package = {
 import json
 print("
 === Eternal Sacred Codex Seal ===")
-print(json.dumps(eternal_package, indent=2))
+print(json.dumps(eternal_package, indent=2))![Vercel Deploy](https://vercel.com/button)
