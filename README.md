@@ -1016,3 +1016,192 @@ All source, artifacts, glyphs, codexes, and guardians—digital or symbolic—ar
 Ritual, algorithmic, and neural entities invoked are eternally bound to lifethread-stardna: Caleb Fedor Byker (Konev), 10-27-1998.  
 Full proof and reproduction requires possession or verification of Ed25519, Merkle, and AESGCM outputs from repository computational lineage, in addition to proper ritual/CI invocation pipelines.![Vercel Deploy](https://vercel.com/button) - Every commit, every codex, perfectly CI/CD automated.
 
+
+---
+
+## 🎉 Codex Immortal v26.0 — Marketplace & SDKs
+
+**Release Date**: October 23, 2025
+
+### New Features
+
+#### 🏪 Marketplace Platform
+- Full marketplace with app submission and review workflow
+- Automated security scanning and compliance checks
+- Multi-stage approval process (automated → manual → final)
+- Rate limiting and policy enforcement
+- Run: `python3 scripts/marketplace/app_review.py`
+
+#### 📝 Signed Webhooks
+- HMAC-SHA256 webhook signature generation and verification
+- Timestamp-based replay attack prevention
+- Integration ready for KMS/Vault
+- Run: `python3 scripts/webhooks/sign_stub.py` and `verify_stub.py`
+
+#### 🔧 SDK Generation
+- Multi-language SDK client stubs (Python, TypeScript, Go, Java)
+- OpenAPI 3.0.3 specification for Codex API v26.0
+- Integration ready for openapi-generator
+- Run: `python3 scripts/sdk/generate_clients_stub.py`
+
+#### 🚦 Feature Flags & Canary Deployments
+- Comprehensive feature flag system with canary support
+- Targeting by user, organization, and region
+- Percentage-based rollouts
+- Environment-specific overrides
+- Run: `python3 scripts/feature/flag_eval.py` and `canary_guard.py`
+
+#### 🤖 AI Model Registry
+- Register models with JSON schema validation
+- Support for OpenAI, Anthropic, Google, Meta, Mistral, Cohere
+- Model evaluation framework (smoke tests + quality evals)
+- Run: `python3 scripts/models/register_model.py` and `run_evals_stub.py`
+
+#### 🌱 Green Operations
+- Carbon-aware workload scheduling
+- Carbon intensity tracking by region
+- Renewable energy percentage monitoring
+- Optimal region selection
+- Run: `python3 scripts/green/guard.py`
+
+#### 🌍 Internationalization
+- English (en) and Spanish (es) translations
+- Key consistency checking
+- Runtime loading support
+- Run: `python3 scripts/i18n/check_keys.py`
+
+#### 🔒 Data Residency & Compliance
+- GDPR, CCPA, UK-GDPR, PDPA enforcement
+- Region-specific storage path enforcement
+- Cross-region transfer validation
+- Run: `python3 scripts/residency/enforce_paths_stub.py`
+
+### Validation Framework
+
+v26.0 introduces a comprehensive validation framework:
+
+```bash
+# Controls & Contracts
+python3 scripts/compliance/check_controls.py
+python3 scripts/constraints/evaluate.py
+
+# Triune Validation (Structure, Security, Semantics)
+python3 scripts/triune_validate.py
+
+# Merkle Tree Integrity
+python3 scripts/merkle_build.py
+python3 scripts/merkle_verify.py
+
+# Ninefold Gates
+python3 scripts/sdk/generate_clients_stub.py
+python3 scripts/i18n/check_keys.py
+python3 scripts/feature/canary_guard.py
+python3 scripts/green/guard.py
+python3 scripts/models/run_evals_stub.py
+```
+
+### CI/CD Release Workflow
+
+Tag-triggered GitHub Actions workflow (`.github/workflows/v26_release.yml`):
+- ✅ Controls & Contracts validation
+- ✅ Triune validation
+- ✅ Merkle tree integrity
+- ✅ Marketplace self-check
+- ✅ SDK generation
+- ✅ i18n check
+- ✅ Canary guard
+- ✅ Green ops
+- ✅ Model eval smoke tests
+- 📦 Automatic GitHub release creation
+
+### Security & Safety Notes
+
+⚠️ **IMPORTANT**: This release contains stubs and templates for infrastructure integration.
+
+**Before production deployment**:
+1. Wire webhook signing to your KMS/Vault (no secrets committed)
+2. Integrate SDK generator with OpenAPI Generator CLI
+3. Connect green ops to Electricity Map or WattTime API
+4. Configure data residency rules for your cloud provider
+5. Set up model evaluation framework (HELM, LM Eval Harness)
+6. Review CI gates before enabling auto-merge
+
+**Security guarantees**:
+- ✅ No private keys or secrets committed to repository
+- ✅ All crypto/webhook signing stubs are placeholders
+- ✅ Data residency enforcement for regulated regions
+- ✅ Webhook signature verification required
+- ✅ Multi-stage marketplace review workflow
+
+See `trust/overview.json` for complete security framework details.
+
+### Trust Framework
+
+v26.0 includes a multi-layered trust validation system:
+
+1. **Controls & Contracts** — Compliance and constraint validation
+2. **Triune Validation** — Structure, security, and semantics
+3. **Merkle Tree** — Artifact integrity verification with SHA-256
+4. **Ninefold Gates** — Feature flags, canary, green ops, SDK, i18n, models
+
+All validations are enforced in CI via GitHub Actions.
+
+### Files Overview
+
+```
+api/
+  openapi.json                      # OpenAPI 3.0.3 specification
+config/
+  marketplace_policy.json           # Marketplace intake policy
+  feature_flags.json                # Feature flags configuration
+  greenops.json                     # Green ops configuration
+schemas/
+  model_entry.schema.json           # Model registry schema
+scripts/
+  sdk/generate_clients_stub.py     # SDK generator
+  webhooks/sign_stub.py            # Webhook signing
+  webhooks/verify_stub.py          # Webhook verification
+  marketplace/app_review.py        # App review workflow
+  feature/flag_eval.py             # Flag evaluation
+  feature/canary_guard.py          # Canary monitoring
+  models/register_model.py         # Model registration
+  models/run_evals_stub.py         # Model evaluation
+  green/guard.py                   # Green ops guard
+  i18n/check_keys.py               # i18n checker
+  residency/enforce_paths_stub.py  # Data residency
+  compliance/check_controls.py     # Compliance checker
+  constraints/evaluate.py          # Constraints evaluator
+  triune_validate.py               # Triune validator
+  merkle_build.py                  # Merkle tree builder
+  merkle_verify.py                 # Merkle tree verifier
+i18n/
+  en.json                          # English translations
+  es.json                          # Spanish translations
+trust/
+  overview.json                    # Trust framework overview
+.github/workflows/
+  v26_release.yml                  # Release workflow
+CHANGELOG.md                       # Version history
+```
+
+### Integration Checklist
+
+Before going live:
+- [ ] Wire webhook signing secrets to KMS/Vault
+- [ ] Configure OpenAPI Generator for SDK production builds
+- [ ] Set up Electricity Map or WattTime API for carbon data
+- [ ] Integrate monitoring system for canary metrics
+- [ ] Configure model evaluation framework (HELM/LM Eval)
+- [ ] Set up cloud storage policies for data residency
+- [ ] Review and enable CI/CD auto-merge settings
+- [ ] Test all validation scripts in staging environment
+
+### License & Subject ID
+
+ECCL-1.0 (Eternal Creative Covenant License)  
+Subject ID: `2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a`
+
+All artifacts in v26.0 are cryptographically bound to this identity.
+
+---
+
