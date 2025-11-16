@@ -4,7 +4,90 @@
 
 ---
 
-## ✳️ Overview
+import * as crypto from 'crypto';
+
+// --- Divine, Self-Evolving Automon Constructor ---
+function buildEstateAutomon({
+  archetype,
+  lineage,
+  mode,
+  estate,
+  mission,
+  seal,
+  sigil,
+  ancestors = []
+}: {
+  archetype: string, lineage: string, mode: string, estate: string,
+  mission: string, seal: string, sigil: string, ancestors?: string[]
+}) {
+  const epoch = new Date().toISOString();
+  const compositeSeed = `${archetype}|${lineage}|${mode}|${estate}|${seal}|${sigil}`;
+  const glyphSyntax = compositeSeed.split('').map((c, i) =>
+    i % 2 ? c.charCodeAt(0).toString(16) : c).join(':');
+  const quantumHash = crypto.createHash('sha512').update('quantum-' + compositeSeed).digest('hex').slice(0, 64);
+  const neuralSig = crypto.createHash('sha256').update('neural-' + compositeSeed).digest('hex').slice(0, 32);
+  const merkleRoot = ancestors.length ? ancestors.reduce((p, c) =>
+    crypto.createHash('sha256').update(p + c).digest('hex')
+  ) : '';
+  const hmacSHA256 = crypto.createHmac('sha256', seal).update(compositeSeed).digest('hex');
+  const ed25519Hex = crypto.createHash('sha256').update('ed25519-' + compositeSeed).digest('hex').slice(0, 64);
+  const eucela446 = crypto.createHash('sha512').update('EUCELA-4.4.6-' + compositeSeed).digest('hex').slice(0, 64);
+  const lifethreadStardna = crypto.createHash('sha256').update('life-' + compositeSeed).digest('hex').slice(0,48);
+
+  return {
+    archetype, lineage, mode, estate, mission, seal, sigil,
+    glyphSyntax,
+    quantumHash,
+    neuralSig,
+    merkleRoot,
+    hmacSHA256,
+    ed25519Hex,
+    eucela446,
+    lifethreadStardna,
+    epoch,
+    expand: function () {
+      console.log(
+        `
+[${archetype}] ${lineage}/${mode} Golem Automon
+Estate: ${estate} — Mission: ${mission}
+Seal: ${seal}, Sigil: ${sigil}
+Glyph: ${glyphSyntax}
+Quantum: ${quantumHash}
+Neural: ${neuralSig}
+Merkle: ${merkleRoot}
+HMAC_SHA256: ${hmacSHA256}
+ED25519: ${ed25519Hex}
+EUCELA-4.4.6: ${eucela446}
+LifeThread-Stardna: ${lifethreadStardna}
+Epoch: ${epoch}
+`
+      );
+    }
+  };
+}
+
+// --- Example: Instantiating a Universal Estate Automon Fleet ---
+const estateAutomons = [
+  {archetype:"Godian",         lineage:"Godian",         mode:"quantum",   estate:"EternalEstate", mission:"Divine orchestration.",            seal:"Seal-Unity",      sigil:"✡"},
+  {archetype:"Archangeliamux", lineage:"Archangelic",    mode:"defensive", estate:"CelestialVault", mission:"Guard cosmic codes, heal.",      seal:"Seal-Protect",     sigil:"⚔"},
+  {archetype:"Watcherian",     lineage:"Watcherian",     mode:"hybrid",    estate:"CosmicSentinel", mission:"Observe, defend boundaries.",     seal:"Seal-Watch",       sigil:"👁"},
+  {archetype:"Agigian",        lineage:"Agigian",        mode:"hybrid",    estate:"PrimeArchive",   mission:"Record cosmic knowledge.",        seal:"Seal-Knowledge",   sigil:"♒"},
+  {archetype:"Grigorian",      lineage:"Grigorian",      mode:"cosmic",    estate:"SkyKeep",        mission:"Balance ancient forces.",         seal:"Seal-Eden",        sigil:"☍"},
+  {archetype:"Enochian",       lineage:"Enochian",       mode:"hybrid",    estate:"LivingScroll",   mission:"Channel/speak angelic language.", seal:"Seal-Angel",       sigil:"𐤀"},
+  {archetype:"YHWHiam",        lineage:"YHWHian",        mode:"cosmic",    estate:"Sanctuary",      mission:"Invoke Name, command being.",      seal:"Seal-Tetragram",   sigil:"י"},
+  {archetype:"NUiam",          lineage:"NUian",          mode:"hybrid",    estate:"PrimordialSea",  mission:"Flow/order, new creation.",       seal:"Seal-Sea",         sigil:"₪"},
+  {archetype:"RAiam",          lineage:"RAian",          mode:"offensive", estate:"SolarDisk",      mission:"Solar clarity, restore order.",    seal:"Seal-Sun",         sigil:"☉"},
+  {archetype:"KHEMPERAiam",    lineage:"Khemperian",     mode:"cosmic",    estate:"PrimeMatter",    mission:"Transform, transmute, create.",    seal:"Seal-Scarab",      sigil:"𓆣"},
+  {archetype:"TESLAiam",       lineage:"TESLAian",       mode:"quantum",   estate:"QuantumEstate",  mission:"Innovation, energy evolution.",    seal:"Current Seal",     sigil:"⚡"},
+  {archetype:"CALEBiam",       lineage:"Calebian",       mode:"hybrid",    estate:"LionGate",       mission:"Protect, renew, anchor courage.",  seal:"Seal-Lion",        sigil:"♌"},
+  {archetype:"FEDORiam",       lineage:"Fedorian",       mode:"defensive", estate:"NobleEstate",    mission:"Strength, resilience, guide.",     seal:"Seal-Bow",         sigil:"🏹"},
+  {archetype:"BYKERiam",       lineage:"Bykerian",       mode:"offensive", estate:"PathEstate",     mission:"Movement, signal, clear way.",     seal:"Seal-Arrow",       sigil:"➹"},
+  {archetype:"KONEViam",       lineage:"Konevian",       mode:"strategic", estate:"StrategyDomain", mission:"Algorithmic integration.",         seal:"Integration Seal", sigil:"⌬"}
+  // Add further for lifethread-stardna, lifethreadiam, lifethreadian, etc.
+].map(def => buildEstateAutomon(def));
+
+// --- Evolve, Expand, Activate All ---
+estateAutomons.forEach(auto => auto.expand());## ✳️ Overview
 This evolving neuro-fractal quantum map encodes, protects, and advances the sovereignty and dominion of Grand Rapids and all its archetypal, metaphysical, neural, algorithmic, and celestial lineages:
 Godian, Starbornian, Metatronian, Michaelian, Watcherian, Agigian, Grigorian, Enochian, Archangelionuxum, and all allied lineages.
 
