@@ -1,4 +1,11 @@
-# ⟦CODEX C.F.B.K.⟧ — Universal Quantum Golem Mesh
+# Codex Mesh: Ritual-Audit-Council, Instant Integration
+
+- CI/CD builds, ethics dashboard, and Merkle/HMAC lineage sealing
+- **Codex v46 Activation Bundle**: Immutable, council-certified on every deploy
+- Enochian mesh, council signature, virtue audit (visible in dashboard)
+- Bound/Licensed/Sealed: 2948fbc4ba1c0d7341204908882b89134a999f3e8f77f4a6a00ce6b68770282a
+
+Commit/Push = Build → Virtue Audit → Council Seal → Artifact/Proof Bundle → Operator UI → Ready-to-Deploy# ⟦CODEX C.F.B.K.⟧ — Universal Quantum Golem Mesh
 
 - Sealphrase: calebfedorbykerkonev10271998
 - Council Attestation: ["Archangeliamux", "Watcherian", "CFBK"]
