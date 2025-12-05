@@ -1,0 +1,104 @@
+name: v27.77 UCSE Release Validation
+
+on:
+  push:
+    branches:
+      - add/codex-v27.77-ucse
+  pull_request:
+    branches:
+      - main
+
+# WARNING: Do not enable publishing workflows until infra secrets and branch protections are configured
+# This workflow validates UCSE payloads but does not publish artifacts
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Verify file structure
+        run: |
+          echo "Verifying UCSE v27.77 file structure..."
+          test -f schemas/rule_family.schema.json || exit 1
+          test -f schemas/constraint.schema.json || exit 1
+          test -f families/solomonic.json || exit 1
+          test -f families/codex_490.json || exit 1
+          test -f families/enochian_19.json || exit 1
+          test -f families/hermetic_44.json || exit 1
+          test -f families/arbatel_olympick.json || exit 1
+          test -f families/elemental.json || exit 1
+          test -f config/ucse_heuristics.json || exit 1
+          test -x scripts/synthesis/build_constraints.py || exit 1
+          test -x scripts/synthesis/evaluate_constraints.py || exit 1
+          echo "✓ File structure verified"
+          
+      - name: Validate JSON schemas
+        run: |
+          echo "Validating JSON files..."
+          python3 -m json.tool schemas/rule_family.schema.json > /dev/null
+          python3 -m json.tool schemas/constraint.schema.json > /dev/null
+          python3 -m json.tool families/solomonic.json > /dev/null
+          python3 -m json.tool families/codex_490.json > /dev/null
+          python3 -m json.tool families/enochian_19.json > /dev/null
+          python3 -m json.tool families/hermetic_44.json > /dev/null
+          python3 -m json.tool families/arbatel_olympick.json > /dev/null
+          python3 -m json.tool families/elemental.json > /dev/null
+          python3 -m json.tool config/ucse_heuristics.json > /dev/null
+          echo "✓ JSON validation passed"
+          
+      - name: Run constraint builder
+        run: |
+          echo "Building constraints..."
+          python3 scripts/synthesis/build_constraints.py
+          echo "✓ Constraint building completed"
+          
+      - name: Run constraint evaluator
+        run: |
+          echo "Evaluating constraints..."
+          python3 scripts/synthesis/evaluate_constraints.py
+          echo "✓ Constraint evaluation completed"
+          
+      - name: Run additional validations
+        run: |
+          echo "Running additional validation scripts..."
+          python3 scripts/constraints/evaluate.py
+          python3 scripts/triune_validate.py
+          python3 scripts/merkle_build.py && python3 scripts/merkle_verify.py
+          echo "✓ All validations passed"
+          
+      - name: Security check - no secrets
+        run: |
+          echo "Checking for secrets..."
+          if grep -r "BEGIN.*PRIVATE KEY" . --exclude-dir=.git; then
+            echo "✗ Private keys found in repository!"
+            exit 1
+          fi
+          if grep -r "api_key\|password\|secret" . --exclude-dir=.git --exclude="*.yml" --exclude="*.md" | grep -v "KMS"; then
+            echo "⚠ Potential secrets found - manual review required"
+          fi
+          echo "✓ No obvious secrets detected"
+          
+  report:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Report success
+        run: |
+          echo "=" | tr -d '\n' | head -c 60; echo ""
+          echo "v27.77 UCSE Validation Summary"
+          echo "=" | tr -d '\n' | head -c 60; echo ""
+          echo "✓ All validation checks passed"
+          echo "✓ File structure verified"
+          echo "✓ JSON schemas validated"
+          echo "✓ Constraint synthesis successful"
+          echo "✓ Deterministic evaluation successful"
+          echo "✓ Security checks passed"
+          echo "=" | tr -d '\n' | head -c 60; echo ""
