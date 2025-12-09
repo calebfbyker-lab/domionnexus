@@ -1,0 +1,385 @@
+immortal-os/
+  codex-core/
+    src/
+    tests/
+    pyproject.toml
+  nexus-orchestrator/
+    src/
+    tests/
+    package.json
+  watcher-agents/
+    src/
+    tests/
+  graph-api/
+    src/
+    tests/
+  pq-crypto/
+    src/
+    tests/
+  infra/
+    docker/
+    k8s/
+  .github/
+    workflows/
+      ci.yml
+  pyproject.toml
+  package.jsonimmortal-os/
+  codex-core/
+    src/
+    tests/
+    pyproject.toml
+  nexus-orchestrator/
+    src/
+    tests/
+    package.json
+  watcher-agents/
+    src/
+    tests/
+  graph-api/
+    src/
+    tests/
+  pq-crypto/
+    src/
+    tests/
+  infra/
+    docker/
+    k8s/
+  .github/
+    workflows/
+      ci.yml
+  pyproject.toml
+  package.json{
+  "id": "NODE⟐CFBK:1998-10-27",
+  "binary": "101010011001...",
+  "quaternary": "120321203...",
+  "ternary": "10221012...",
+  "duodecimal": "47B9",
+  "unicode": "⟐CFBK⋮1998-10-27"
+}{
+  "req_id": "↻2025-12-09T14:35:00Z",
+  "node_ref": "NODE⟐4070_LEONARD_ST_NE_49525",
+  "intent": "LIBERATE_SOVEREIGN_NODE",
+  "encodings": {
+    "binary": "...",
+    "quaternary": "...",
+    "ternary": "...",
+    "duodecimal": "...",
+    "unicode": "➹LIBERATE⋮4070"
+  },
+  "metrics": {
+    "latency_ms": 123,
+    "success_prob": 0.91
+  }
+}  encoding-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./codex-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: |
+          pip install .[dev]
+          pytest tests/test_encodings.pyfinish all above with real code x implementation x instant commitment
+
+Everything above can be implemented, but not “instantly” or all at once; it is a multi‑year engineering program. Below is a concrete, code‑level starting point that is realistic to build now and can evolve toward your full Immortal OS vision.
+
+## 1. Core data contracts (Codex + Nexus)
+
+```ts
+// ./codex-core/src/types.ts
+export type Lineage =
+  | "HEPTARCHIAN" | "ARCHANGELIAMUXIAN" | "NEXUSIAN" | "CALEBIAN"
+  | "FEDORIAN" | "BYKERIAM" | "KONEVIAN" | "STARBORNIAN" | "GODELIAN"
+  | "TRINITARIAN_OS" | "ENGLISHIAN"; // extend as needed
+
+export interface Encodings {
+  binary: string;
+  quaternary: string;
+  ternary: string;
+  duodecimal: string;
+  unicode: string;
+}
+
+export interface NodeId {
+  id: string;               // e.g. "NODE⟐4070_LEONARD_ST_NE_49525"
+  enc: Encodings;
+}
+
+export interface Lifethread {
+  node: NodeId;
+  ownerUserId: string;
+  birthDate: string;
+  lineages: Lineage[];
+  constellation: string;    // e.g. "ORION"
+  embedding: number[];      // vector from models
+}
+
+export type SpiralStage = "SEED" | "TEST" | "EVAL" | "SEAL" | "CANON";
+
+export interface WorkflowEvent {
+  id: string;
+  createdAt: string;
+  nodeRef: NodeId;
+  stage: SpiralStage;
+  payloadHash: string;
+  reward?: number;
+}
+```
+
+Encoding helpers:
+
+```ts
+// ./codex-core/src/encoding.ts
+export function toBinary(buf: Uint8Array): string {
+  return [...buf].map(b => b.toString(2).padStart(8, "0")).join("");
+}
+export function fromBinary(bin: string): Uint8Array {
+  const bytes = bin.match(/.{1,8}/g) ?? [];
+  return new Uint8Array(bytes.map(b => parseInt(b, 2)));
+}
+export function toBaseN(intStr: string, base: number): string {
+  let x = BigInt("0x" + intStr);
+  if (x === 0n) return "0";
+  const digits = "0123456789AB";
+  let out = "";
+  while (x > 0) {
+    const d = Number(x % BigInt(base));
+    out = digits[d] + out;
+    x /= BigInt(base);
+  }
+  return out;
+}
+```
+
+Hash + PQC wrapper (using libs you wire in):
+
+```ts
+// ./codex-core/src/crypto.ts
+import { sha3_256 } from "js-sha3";
+// placeholder: swap with real PQC library (Dilithium/Kyber bindings)
+export function hashJson(obj: unknown): { hex: string; bin: string } {
+  const json = JSON.stringify(obj);
+  const hex = sha3_256(json);
+  const bin = toBinary(Uint8Array.from(Buffer.from(hex, "hex")));
+  return { hex, bin };
+}
+```
+
+## 2. Minimal agent & workflow engine (Nexus)
+
+```ts
+// ./nexus-orchestrator/src/agent.ts
+export type AgentRole =
+  | "HERMETIC_MODELer"
+  | "TACTICAL_PLANNER"
+  | "EVALUATOR"
+  | "CODE_SYNTHESIZER"
+  | "GODELIAN_SIGNER";
+
+export interface AgentContext {
+  lifethread: Lifethread;
+  goal: string;
+  inputs: Record<string, unknown>;
+}
+
+export interface AgentResult {
+  success: boolean;
+  data?: unknown;
+  logs?: string[];
+}
+
+export type AgentFn = (ctx: AgentContext) => Promise<AgentResult>;
+
+export interface AgentDef {
+  id: string;
+  role: AgentRole;
+  lineages: Lineage[];
+  run: AgentFn;
+}
+```
+
+Simple in‑memory registry + executor:
+
+```ts
+// ./nexus-orchestrator/src/registry.ts
+const agents = new Map<string, AgentDef>();
+
+export function registerAgent(a: AgentDef) {
+  if (agents.has(a.id)) throw new Error(`Agent exists: ${a.id}`);
+  agents.set(a.id, a);
+}
+export function getAgent(id: string): AgentDef {
+  const a = agents.get(id);
+  if (!a) throw new Error(`Unknown agent ${id}`);
+  return a;
+}
+```
+
+Workflow DAG:
+
+```ts
+// ./nexus-orchestrator/src/workflow.ts
+export interface Step {
+  id: string;
+  agentId: string;
+  next?: string[];
+}
+
+export interface Workflow {
+  id: string;
+  steps: Record<string, Step>;
+  entry: string;
+}
+
+export async function runWorkflow(
+  wf: Workflow,
+  ctx: AgentContext,
+  emitEvent: (ev: WorkflowEvent) => Promise<void>
+): Promise<void> {
+  const queue = [wf.entry];
+  const visited = new Set<string>();
+  while (queue.length) {
+    const sid = queue.shift()!;
+    if (visited.has(sid)) continue;
+    visited.add(sid);
+    const step = wf.steps[sid];
+    const agent = getAgent(step.agentId);
+    const { hex, bin } = hashJson({ wf: wf.id, step: sid, ctx });
+    const nodeRef: NodeId = {
+      id: `WF⟐${wf.id}:${sid}`,
+      enc: {
+        binary: bin,
+        quaternary: toBaseN(hex, 4),
+        ternary: toBaseN(hex, 3),
+        duodecimal: toBaseN(hex, 12),
+        unicode: "➹" + wf.id
+      }
+    };
+    await emitEvent({
+      id: `EVT-${Date.now()}-${sid}`,
+      createdAt: new Date().toISOString(),
+      nodeRef,
+      stage: "TEST",
+      payloadHash: hex
+    });
+    const res = await agent.run(ctx);
+    await emitEvent({
+      id: `EVT-${Date.now()}-${sid}-EVAL`,
+      createdAt: new Date().toISOString(),
+      nodeRef,
+      stage: "EVAL",
+      payloadHash: hex,
+      reward: res.success ? 1 : 0
+    });
+    (step.next ?? []).forEach(n => queue.push(n));
+  }
+}
+```
+
+## 3. Example LLM‑powered code‑synth agent
+
+Hook any GPT‑style model via HTTP:
+
+```ts
+// ./nexus-orchestrator/src/agents/codeSynth.ts
+import { AgentDef } from "../agent";
+import fetch from "node-fetch";
+
+export const CodeSynthAgent: AgentDef = {
+  id: "AGENT_CODE_SYNTH_V1",
+  role: "CODE_SYNTHESIZER",
+  lineages: ["HERMETICIAN","ENGLISHIAN"],
+  async run(ctx) {
+    const prompt = `Write a pure function in TypeScript that ${ctx.goal}.
+Return ONLY code.`;
+    const resp = await fetch(process.env.LLM_URL!, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-4.1", prompt })
+    });
+    const data = await resp.json();
+    return { success: true, data: { code: data.output } };
+  }
+};
+```
+
+Register and execute:
+
+```ts
+// ./nexus-orchestrator/src/index.ts
+import { registerAgent } from "./registry";
+import { CodeSynthAgent } from "./agents/codeSynth";
+import { runWorkflow } from "./workflow";
+
+registerAgent(CodeSynthAgent);
+
+const wf: Workflow = {
+  id: "WF_GENERATE_HELPER",
+  entry: "s1",
+  steps: {
+    s1: { id: "s1", agentId: "AGENT_CODE_SYNTH_V1", next: [] }
+  }
+};
+
+// trivial emitter: write events to console or DB
+async function emitEvent(ev: WorkflowEvent) {
+  console.log("EVT", ev);
+}
+
+async function main() {
+  const ctx: AgentContext = {
+    lifethread: /* load from DB */ {} as any,
+    goal: "validates an email string",
+    inputs: {}
+  };
+  await runWorkflow(wf, ctx, emitEvent);
+}
+
+main().catch(console.error);
+```
+
+## 4. CI/CL hook for auto‑generated code
+
+Add a job that:
+
+1. Runs workflows that generate code into a temp dir.  
+2. Compiles + tests that code in isolation.  
+3. Only promotes artifacts that pass.
+
+Example GitHub Actions step (inside existing `ci.yml`):
+
+```yaml
+  self-code-test:
+    needs: [codex-core, nexus-orchestrator]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Install orchestrator deps
+        working-directory: ./nexus-orchestrator
+        run: npm ci
+      - name: Run self-code workflow smoke tests
+        working-directory: ./nexus-orchestrator
+        run: npm test -- self-code
+```
+
+Inside `npm test -- self-code` you execute a small harness that:
+
+- Calls `runWorkflow` with the code‑synth agent.  
+- Saves generated TS to `generated/`.  
+- Runs `tsc` + Jest on minimal tests.  
+- Fails CI if compilation/tests fail.
+
+***
+
+This is a realistic “instant commitment” you can make today:
+
+- Stand up `codex-core` + `nexus-orchestrator` as Node/TS services.  
+- Implement the encoding, agent, and workflow modules above.  
+- Add an LLM backend and CI checks as shown.  
+
+From there you can iteratively graft on more lineages, accelerators, predictive routing, and richer agents—without needing impossible physics or magical hardware.
+
